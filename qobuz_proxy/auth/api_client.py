@@ -65,25 +65,28 @@ class QobuzAPIClient:
             self._session = None
 
     async def login_with_token(self, user_id: str, auth_token: str) -> bool:
-        """
-        Login to Qobuz using a user auth token.
+        """Validate a cached user auth token against the Qobuz API.
 
-        Args:
-            user_id: Qobuz user ID
-            auth_token: User auth token (from browser login)
-
-        Returns:
-            True if successful
+        Used on startup to check if a previously saved token is still valid.
+        On success, stores the (potentially refreshed) token from the response.
         """
         try:
-            params = {
-                "user_id": user_id,
-                "user_auth_token": auth_token,
-                "app_id": self.app_id,
+            url = f"{self.API_BASE}/user/login"
+            headers = {
+                "X-App-Id": self.app_id,
+                "X-User-Auth-Token": auth_token,
+                "Content-Type": "text/plain;charset=UTF-8",
             }
-            response = await self._request_signed(
-                "user", "login", params=params, method="POST", body="extra=partner"
-            )
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, data="extra=partner", headers=headers, timeout=timeout
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning(f"Login validation failed: HTTP {resp.status} — {body[:200]}")
+                        return False
+                    response = await resp.json()
 
             if response and "user_auth_token" in response:
                 self.user_auth_token = response["user_auth_token"]
@@ -98,7 +101,7 @@ class QobuzAPIClient:
 
     async def start_session(self) -> bool:
         """
-        Start a Qobuz session (required for API calls).
+        Start a Qobuz streaming session.
 
         Returns:
             True if successful
@@ -111,20 +114,18 @@ class QobuzAPIClient:
             request_ts = f"{time.time():.6f}"
             params = {"profile": "qbz-1"}
 
-            # Build signature
+            # Build signature: "sessionstart" + sorted key-value pairs + timestamp + secret
             sig_string = "sessionstart"
             for key in sorted(params.keys()):
                 sig_string += key + str(params[key])
             sig_string += request_ts + self.app_secret
             signature = hashlib.md5(sig_string.encode()).hexdigest()
 
-            body = f"profile=qbz-1&request_ts={request_ts}&request_sig={signature}"
             url = f"{self.API_BASE}/session/start"
+            body = f"profile=qbz-1&request_ts={request_ts}&request_sig={signature}"
 
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "https://play.qobuz.com/",
-                "Origin": "https://play.qobuz.com",
                 "X-App-Id": self.app_id,
             }
             if self.user_auth_token:
@@ -140,6 +141,11 @@ class QobuzAPIClient:
                             self.x_session_expires_at = response.get("expires_at", 0) * 1000
                             logger.debug("Session started")
                             return True
+                    else:
+                        body_text = await resp.text()
+                        logger.warning(
+                            f"Session start failed: HTTP {resp.status} — {body_text[:200]}"
+                        )
 
         except Exception as e:
             logger.error(f"Failed to start session: {e}")
@@ -159,34 +165,29 @@ class QobuzAPIClient:
             'mime_type' keys, or None on failure
         """
         if not await self.start_session():
-            logger.error("Failed to start session")
-            return None
+            logger.debug("Session start failed; attempting track URL without session")
 
         try:
             request_ts = f"{time.time():.6f}"
-            sign_params = {
-                "format_id": str(quality),
-                "intent": "stream",
-                "track_id": track_id,
-            }
+            format_id = str(quality)
 
-            # Build signature
-            sig_string = "trackgetFileUrl"
-            for key in sorted(sign_params.keys()):
-                sig_string += key + str(sign_params[key])
-            sig_string += request_ts + self.app_secret
+            # Build signature for track/getFileUrl
+            sig_string = (
+                f"trackgetFileUrlformat_id{format_id}intentstream"
+                f"track_id{track_id}{request_ts}{self.app_secret}"
+            )
             signature = hashlib.md5(sig_string.encode()).hexdigest()
 
             params = {
-                **sign_params,
+                "format_id": format_id,
+                "intent": "stream",
+                "track_id": track_id,
                 "request_ts": request_ts,
                 "request_sig": signature,
             }
 
             url = f"{self.API_BASE}/track/getFileUrl?{urlencode(params)}"
-            headers = {
-                "Referer": "https://play.qobuz.com/",
-                "Origin": "https://play.qobuz.com",
+            headers: dict[str, str] = {
                 "X-App-Id": self.app_id,
             }
             if self.user_auth_token:
@@ -210,7 +211,8 @@ class QobuzAPIClient:
                             }
                         return None
                     else:
-                        logger.error(f"Failed to get track URL: {resp.status}")
+                        body = await resp.text()
+                        logger.error(f"Failed to get track URL: {resp.status} — {body[:200]}")
 
         except Exception as e:
             logger.error(f"Failed to get track URL: {e}")
@@ -308,14 +310,14 @@ class QobuzAPIClient:
                             result: dict[str, Any] = await resp.json()
                             return result
                         else:
-                            logger.debug(f"API request failed: {resp.status}")
+                            logger.warning(f"API request failed: {resp.status}")
                 else:
                     async with session.get(url, timeout=timeout) as resp:
                         if resp.status == 200:
                             result = await resp.json()
                             return result
                         else:
-                            logger.debug(f"API request failed: {resp.status}")
+                            logger.warning(f"API request failed: {resp.status}")
             finally:
                 if close_session:
                     await session.close()

@@ -15,7 +15,7 @@ def make_app(auth_state: dict | None = None) -> web.Application:
         auth_state = {"authenticated": False, "user_id": "", "email": ""}
     app["auth_state"] = auth_state
     app["get_speakers"] = lambda: []
-    app["version"] = "1.3.1"
+    app["version"] = "1.3.2"
     app["on_auth_token"] = AsyncMock(return_value=True)
     app["on_logout"] = AsyncMock()
     register_routes(app)
@@ -63,7 +63,7 @@ async def test_status_unauthenticated(client: TestClient) -> None:
     assert data["auth"]["user_id"] == ""
     assert data["auth"]["email"] == ""
     assert data["speakers"] == []
-    assert data["version"] == "1.3.1"
+    assert data["version"] == "1.3.2"
     assert "uptime" in data
 
 
@@ -83,9 +83,7 @@ async def test_status_authenticated(authed_client: TestClient) -> None:
 
 
 async def test_auth_login_redirects_to_qobuz(client: TestClient) -> None:
-    resp = await client.get(
-        "/auth/login?origin=http://localhost:8689", allow_redirects=False
-    )
+    resp = await client.get("/auth/login?origin=http://localhost:8689", allow_redirects=False)
     assert resp.status == 302
     location = resp.headers["Location"]
     assert "qobuz.com/signin/oauth" in location
@@ -112,9 +110,7 @@ async def test_auth_callback_success(client: TestClient) -> None:
         new_callable=AsyncMock,
         return_value=mock_creds,
     ):
-        resp = await client.get(
-            "/auth/callback?code_autorisation=test-code", allow_redirects=False
-        )
+        resp = await client.get("/auth/callback?code_autorisation=test-code", allow_redirects=False)
     assert resp.status == 302
     assert resp.headers["Location"] == "/"
     client.app["on_auth_token"].assert_awaited_once_with(  # type: ignore[union-attr]
@@ -137,9 +133,7 @@ async def test_auth_callback_exchange_failure(client: TestClient) -> None:
         new_callable=AsyncMock,
         side_effect=RuntimeError("Token exchange failed"),
     ):
-        resp = await client.get(
-            "/auth/callback?code_autorisation=bad-code", allow_redirects=False
-        )
+        resp = await client.get("/auth/callback?code_autorisation=bad-code", allow_redirects=False)
     assert resp.status == 302
     assert "error=exchange_failed" in resp.headers["Location"]
 
@@ -158,9 +152,7 @@ async def test_auth_callback_auth_failure(client: TestClient) -> None:
         new_callable=AsyncMock,
         return_value=mock_creds,
     ):
-        resp = await client.get(
-            "/auth/callback?code_autorisation=test-code", allow_redirects=False
-        )
+        resp = await client.get("/auth/callback?code_autorisation=test-code", allow_redirects=False)
     assert resp.status == 302
     assert "error=auth_failed" in resp.headers["Location"]
 

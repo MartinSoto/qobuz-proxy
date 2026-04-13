@@ -52,10 +52,6 @@ class TestMultiSpeakerOrchestration:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
             patch("qobuz_proxy.app.Speaker", side_effect=mock_speaker_instances) as MockSpeaker,
         ):
@@ -88,10 +84,6 @@ class TestMultiSpeakerOrchestration:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
             patch("qobuz_proxy.app.Speaker", side_effect=[good, bad]),
         ):
@@ -117,10 +109,6 @@ class TestMultiSpeakerOrchestration:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
             patch("qobuz_proxy.app.Speaker", side_effect=[bad]),
         ):
@@ -150,10 +138,6 @@ class TestMultiSpeakerOrchestration:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
             patch("qobuz_proxy.app.Speaker", side_effect=mock_instances),
         ):
@@ -179,10 +163,6 @@ class TestGracefulStartup:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch("qobuz_proxy.app.load_user_token", return_value=None),
         ):
             app = QobuzProxy(config)
@@ -205,10 +185,6 @@ class TestGracefulStartup:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch(
                 "qobuz_proxy.app.load_user_token",
                 return_value={
@@ -241,10 +217,6 @@ class TestGracefulStartup:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch("qobuz_proxy.app.load_user_token") as mock_load_cache,
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
             patch("qobuz_proxy.app.Speaker", return_value=mock_speaker),
@@ -267,10 +239,6 @@ class TestGracefulStartup:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch(
                 "qobuz_proxy.app.load_user_token",
                 return_value={
@@ -295,7 +263,7 @@ class TestWebUICallbacks:
     """Tests for auth token submission and logout callbacks."""
 
     async def test_on_auth_token_success(self):
-        """Successful token submission authenticates and starts speakers."""
+        """Successful token submission sets up client and starts speakers."""
         config = Config()
         config.speakers = [_make_speaker_config()]
 
@@ -307,17 +275,11 @@ class TestWebUICallbacks:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch("qobuz_proxy.app.load_user_token", return_value=None),
-            patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
+            patch("qobuz_proxy.app.QobuzAPIClient"),
             patch("qobuz_proxy.app.Speaker", return_value=mock_speaker),
             patch("qobuz_proxy.app.save_user_token", return_value=True),
         ):
-            MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
-
             app = QobuzProxy(config)
             await app.start()
             assert not app._auth_state["authenticated"]
@@ -328,32 +290,6 @@ class TestWebUICallbacks:
             assert app._auth_state["authenticated"] is True
             assert app._auth_state["user_id"] == "42"
             assert len(app._speakers) == 1
-
-    async def test_on_auth_token_failure(self):
-        """Failed token submission returns False and stays unauthenticated."""
-        config = Config()
-        config.speakers = [_make_speaker_config()]
-
-        with (
-            patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
-            patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
-            patch("qobuz_proxy.app.load_user_token", return_value=None),
-            patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-        ):
-            MockAPIClient.return_value.login_with_token = AsyncMock(return_value=False)
-
-            app = QobuzProxy(config)
-            await app.start()
-
-            result = await app._on_auth_token("42", "bad_token")
-
-            assert result is False
-            assert app._auth_state["authenticated"] is False
-            assert len(app._speakers) == 0
 
     async def test_on_logout_stops_speakers_and_clears_state(self):
         """Logout stops speakers and resets auth state."""
@@ -367,10 +303,6 @@ class TestWebUICallbacks:
         with (
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new=AsyncMock(return_value={"app_id": "id", "app_secret": "secret"}),
-            ),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
             patch("qobuz_proxy.app.Speaker", return_value=mock_speaker),
             patch("qobuz_proxy.app.clear_user_token") as mock_clear,

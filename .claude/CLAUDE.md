@@ -52,7 +52,7 @@ Proto files in `protos/`: `qconnect_common.proto`, `qconnect_envelope.proto`, `q
 
 `QobuzProxy` in `app.py` is the main orchestrator. It wires together:
 
-1. **Auth** (`auth/`): Scrapes Qobuz web player for app credentials (`credentials.py`), signs API requests with MD5 (`api_client.py`), manages session/JWT tokens (`tokens.py`). User auth is token-based (OAuth) via the web UI at `localhost:8689` or config fields `auth_token`/`user_id`.
+1. **Auth** (`auth/`): OAuth login via Qobuz desktop app credentials (`oauth.py`), MD5-signed API requests (`api_client.py`), token persistence (`credentials.py`), session/JWT tokens (`tokens.py`). See `docs/authentication.md` for details.
 2. **Connect** (`connect/`): Registers as mDNS device + HTTP discovery endpoints (`discovery.py`), manages WebSocket connection to Qobuz servers (`ws_manager.py`), encodes/decodes protobuf messages (`protocol.py`)
 3. **Playback** (`playback/`): State machine player (`player.py`), queue management (`queue.py`), track metadata from Qobuz API (`metadata.py`), command handlers (`command_handler.py`, `queue_handler.py`, `volume_handler.py`), periodic state reporting to Qobuz app (`state_reporter.py`)
 4. **Backend** (`backends/`): Abstract `AudioBackend` interface (`base.py`), factory/registry pattern (`factory.py`). Two implementations:

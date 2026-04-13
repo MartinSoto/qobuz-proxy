@@ -11,7 +11,7 @@ def make_app() -> web.Application:
     app = web.Application()
     app["auth_state"] = {"authenticated": True, "user_id": "12345", "email": "user@example.com"}
     app["get_speakers"] = lambda: []
-    app["version"] = "1.3.1"
+    app["version"] = "1.3.2"
     app["on_auth_token"] = AsyncMock(return_value=True)
     app["on_logout"] = AsyncMock()
     app["on_add_speaker"] = AsyncMock(return_value={"id": "test", "name": "Test"})

@@ -13,9 +13,10 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Qobuz desktop app credentials (public, used by all OAuth clients)
+# Qobuz desktop app credentials
 OAUTH_APP_ID = "304027809"
 OAUTH_PRIVATE_KEY = "6lz8C03UDIC7"
+OAUTH_APP_SECRET = "96c4538ca81015a5be0c1d5bd9573844"
 QOBUZ_API_BASE = "https://www.qobuz.com/api.json/0.2"
 QOBUZ_OAUTH_URL = "https://www.qobuz.com/signin/oauth"
 
@@ -39,15 +40,16 @@ def extract_code(url: str) -> str:
     return codes[0]
 
 
-async def exchange_code(code: str) -> dict[str, str]:
+async def exchange_code(code: str, **_kwargs: object) -> dict[str, str]:
     """Exchange an OAuth authorization code for user credentials.
 
     Returns a dict with ``user_id``, ``user_auth_token``, ``display_name``,
     and ``email`` keys.
     """
+
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # Step 1: exchange code for token
+        # Step 1: exchange code for token (always uses OAuth app credentials)
         async with session.get(
             f"{QOBUZ_API_BASE}/oauth/callback",
             params={"code": code, "private_key": OAUTH_PRIVATE_KEY},

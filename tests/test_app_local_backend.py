@@ -45,11 +45,6 @@ class TestAppLocalBackend:
 
         # Mock everything before backend creation
         with (
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new_callable=AsyncMock,
-                return_value={"app_id": "test-id", "app_secret": "test-secret"},
-            ),
             patch("qobuz_proxy.app.QobuzAPIClient") as mock_api_class,
             patch(_SD_PATCH, return_value=_mock_sounddevice()),
         ):
@@ -75,11 +70,6 @@ class TestAppLocalBackend:
         app = QobuzProxy(config)
 
         with (
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new_callable=AsyncMock,
-                return_value={"app_id": "test-id", "app_secret": "test-secret"},
-            ),
             patch("qobuz_proxy.app.QobuzAPIClient") as mock_api_class,
             patch(_SD_PATCH, return_value=_mock_sounddevice()),
         ):
@@ -103,11 +93,6 @@ class TestAppLocalBackend:
         app = QobuzProxy(config)
 
         with (
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new_callable=AsyncMock,
-                return_value={"app_id": "test-id", "app_secret": "test-secret"},
-            ),
             patch("qobuz_proxy.app.QobuzAPIClient") as mock_api_class,
             patch(_SD_PATCH, return_value=_mock_sounddevice()),
         ):
@@ -131,11 +116,6 @@ class TestAppLocalBackend:
         app = QobuzProxy(config)
 
         with (
-            patch(
-                "qobuz_proxy.app.auto_fetch_credentials",
-                new_callable=AsyncMock,
-                return_value={"app_id": "test-id", "app_secret": "test-secret"},
-            ),
             patch("qobuz_proxy.app.QobuzAPIClient") as mock_api_class,
             patch(_SD_PATCH, return_value=_mock_sounddevice()),
             patch("qobuz_proxy.app.QobuzPlayer") as mock_player_class,
