@@ -55,6 +55,16 @@
         return div.innerHTML;
     }
 
+    // Escape a value for embedding inside an HTML attribute. Text-node
+    // escaping doesn't cover " and ', but those terminate attribute values
+    // and break inline onclick handlers.
+    function escapeAttr(text) {
+        return String(text)
+            .replace(/&/g, "&amp;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
     function showError(msg) {
         var el = document.getElementById("speaker-error");
         el.textContent = msg;
@@ -124,8 +134,9 @@
 
     function renderActions(s) {
         var html = '<div class="speaker-actions">';
-        html += '<button onclick="editSpeaker(' + JSON.stringify(s.id) + ')">Edit</button>';
-        html += '<button onclick="removeSpeaker(' + JSON.stringify(s.id) + ')" style="color:#ef9a9a;">Remove</button>';
+        var idArg = escapeAttr(JSON.stringify(s.id));
+        html += '<button onclick="editSpeaker(' + idArg + ')">Edit</button>';
+        html += '<button onclick="removeSpeaker(' + idArg + ')" style="color:#ef9a9a;">Remove</button>';
         html += '</div>';
         return html;
     }
@@ -223,7 +234,7 @@
         html += '</div>';
 
         html += '<div class="button-group">';
-        html += '<button onclick="submitEditSpeaker(' + JSON.stringify(s.id) + ', ' + JSON.stringify(s.backend) + ')">Save</button>';
+        html += '<button onclick="submitEditSpeaker(' + escapeAttr(JSON.stringify(s.id)) + ', ' + escapeAttr(JSON.stringify(s.backend)) + ')">Save</button>';
         html += '<button class="button-secondary" onclick="cancelEdit()">Cancel</button>';
         html += '</div>';
 
