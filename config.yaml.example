@@ -1,10 +1,15 @@
 # QobuzProxy Configuration
 # Copy to config.yaml and fill in your details
+#
+# Authentication: open http://localhost:8689 and click "Log in to Qobuz".
+# The token is cached automatically — no credentials live in this file.
 
 qobuz:
-  email: "user@example.com"
-  password: "password"          # Or use QOBUZ_PASSWORD env var
   max_quality: auto             # auto, 5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k
+
+  # Power-user alternative: skip the web UI by pasting a pre-obtained token.
+  # user_id: "12345678"
+  # auth_token: "your-auth-token"
 
 device:
   name: "QobuzProxy"            # Name shown in Qobuz app
