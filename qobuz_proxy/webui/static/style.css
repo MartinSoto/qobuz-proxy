@@ -615,3 +615,15 @@ p {
     text-decoration: underline;
     background: none;
 }
+
+.manual-entry-link:disabled {
+    color: #555;
+    cursor: not-allowed;
+    text-decoration: none;
+}
+
+.scan-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+}

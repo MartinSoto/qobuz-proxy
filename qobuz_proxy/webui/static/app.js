@@ -326,7 +326,10 @@
 
         html += '<div class="scan-status">';
         html += '<span id="scan-status-text">Scanning...</span>';
+        html += '<div class="scan-actions">';
+        html += '<button id="rescan-btn" class="manual-entry-link" onclick="startDLNADiscovery()" disabled>Rescan</button>';
         html += '<button class="manual-entry-link" onclick="selectManualDevice()">Enter URL manually</button>';
+        html += '</div>';
         html += '</div>';
 
         html += '<div id="device-list" class="device-list"></div>';
@@ -357,6 +360,16 @@
     }
 
     function startDLNADiscovery() {
+        var statusEl = document.getElementById("scan-status-text");
+        var listEl = document.getElementById("device-list");
+        var rescanBtn = document.getElementById("rescan-btn");
+        if (statusEl) statusEl.textContent = "Scanning...";
+        if (listEl) {
+            listEl.innerHTML = "";
+            listEl.removeAttribute("data-devices");
+        }
+        if (rescanBtn) rescanBtn.disabled = true;
+
         fetch("/api/discover/dlna", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -366,6 +379,7 @@
             .then(function (data) {
                 var statusEl = document.getElementById("scan-status-text");
                 var listEl = document.getElementById("device-list");
+                var rescanBtn = document.getElementById("rescan-btn");
                 if (!statusEl || !listEl) return;
 
                 var devices = data.devices || [];
@@ -373,26 +387,28 @@
 
                 if (devices.length === 0) {
                     listEl.innerHTML = '<p class="muted" style="margin:0;">No DLNA devices found. Try entering the URL manually.</p>';
-                    return;
-                }
-
-                var html = "";
-                for (var i = 0; i < devices.length; i++) {
-                    var d = devices[i];
-                    var encoded = escapeHtml(JSON.stringify(d).replace(/'/g, "&#39;"));
-                    html += '<div class="device-item" id="di-' + i + '" onclick="selectDLNADevice(' + i + ')">';
-                    html += '<div class="device-item-name">' + escapeHtml(d.friendly_name || d.name || "Unknown") + '</div>';
-                    if (d.location || d.url) {
-                        html += '<div class="device-item-detail">' + escapeHtml(d.location || d.url) + '</div>';
+                } else {
+                    var html = "";
+                    for (var i = 0; i < devices.length; i++) {
+                        var d = devices[i];
+                        var encoded = escapeHtml(JSON.stringify(d).replace(/'/g, "&#39;"));
+                        html += '<div class="device-item" id="di-' + i + '" onclick="selectDLNADevice(' + i + ')">';
+                        html += '<div class="device-item-name">' + escapeHtml(d.friendly_name || d.name || "Unknown") + '</div>';
+                        if (d.location || d.url) {
+                            html += '<div class="device-item-detail">' + escapeHtml(d.location || d.url) + '</div>';
+                        }
+                        html += '</div>';
                     }
-                    html += '</div>';
+                    listEl.innerHTML = html;
+                    listEl.setAttribute("data-devices", JSON.stringify(devices));
                 }
-                listEl.innerHTML = html;
-                listEl.setAttribute("data-devices", JSON.stringify(devices));
+                if (rescanBtn) rescanBtn.disabled = false;
             })
             .catch(function (err) {
                 var statusEl = document.getElementById("scan-status-text");
+                var rescanBtn = document.getElementById("rescan-btn");
                 if (statusEl) statusEl.textContent = "Discovery failed";
+                if (rescanBtn) rescanBtn.disabled = false;
             });
     }
 
@@ -734,6 +750,7 @@
     window.selectDLNADevice = selectDLNADevice;
     window.selectLocalDevice = selectLocalDevice;
     window.selectManualDevice = selectManualDevice;
+    window.startDLNADiscovery = startDLNADiscovery;
     window.submitAddSpeaker = submitAddSpeaker;
     window.editSpeaker = editSpeaker;
     window.cancelEdit = cancelEdit;
