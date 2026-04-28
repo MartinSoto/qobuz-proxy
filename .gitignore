@@ -56,6 +56,9 @@ config.yaml
 # Credentials cache
 .qobuz-proxy/
 
+# Docker volume mount: holds credentials.json and config.yaml at runtime
+/data/
+
 # macOS
 .DS_Store
 

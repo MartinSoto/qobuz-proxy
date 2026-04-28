@@ -26,6 +26,8 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
           tags: |
             ghcr.io/leolobato/qobuz-proxy:latest
             ghcr.io/leolobato/qobuz-proxy:${{ github.ref_name }}

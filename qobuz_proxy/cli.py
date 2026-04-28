@@ -12,7 +12,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from qobuz_proxy import __version__
+from qobuz_proxy import __commit__, __version__
+
+
+def _version_string() -> str:
+    """Format version string with optional commit suffix."""
+    return f"v{__version__} ({__commit__})" if __commit__ else f"v{__version__}"
 from qobuz_proxy.config import Config, ConfigError, load_config, AUTO_QUALITY
 from qobuz_proxy.app import QobuzProxy
 from qobuz_proxy.backends import BackendNotFoundError
@@ -74,7 +79,7 @@ Environment Variables:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"%(prog)s {__version__}",
+        version=f"%(prog)s {_version_string()}",
     )
 
     # Discovery mode
@@ -392,7 +397,7 @@ def run_serve(args: argparse.Namespace) -> int:
     # Setup basic logging first (will be reconfigured after config load)
     setup_logging("info")
 
-    logger.info(f"qobuz-proxy v{__version__}")
+    logger.info(f"qobuz-proxy {_version_string()}")
 
     try:
         # Load configuration

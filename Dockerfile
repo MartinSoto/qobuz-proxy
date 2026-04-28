@@ -37,6 +37,11 @@ USER qobuzproxy
 # Credential cache and config live under /data
 ENV QOBUZPROXY_DATA_DIR=/data
 
+# Optional: short git commit hash baked in at build time so the running app
+# can show which build is deployed. Pass with `--build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`.
+ARG GIT_COMMIT=""
+ENV QOBUZPROXY_COMMIT=$GIT_COMMIT
+
 # Expose ports (documentation only - host networking bypasses this)
 # 8689: HTTP server for mDNS discovery endpoints
 # 7120: Audio proxy server for DLNA streaming

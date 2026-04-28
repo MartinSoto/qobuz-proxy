@@ -18,12 +18,14 @@ _STATIC_DIR = Path(__file__).parent / "static"
 
 
 def _format_uptime(seconds: float) -> str:
-    """Format uptime as 'Xh Ym' or 'Xm'."""
+    """Format uptime as 'Xd Yh Zm', 'Xh Ym', or 'Xm'."""
     minutes = int(seconds // 60)
-    hours = minutes // 60
-    remaining_minutes = minutes % 60
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
     if hours > 0:
-        return f"{hours}h {remaining_minutes}m"
+        return f"{hours}h {minutes}m"
     return f"{minutes}m"
 
 
@@ -42,6 +44,7 @@ async def _handle_status(request: web.Request) -> web.Response:
         "auth": app["auth_state"],
         "speakers": app["get_speakers"](),
         "version": app["version"],
+        "commit": app.get("commit", ""),
         "uptime": _format_uptime(uptime_seconds),
     }
     return web.json_response(data)

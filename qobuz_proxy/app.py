@@ -14,7 +14,7 @@ from typing import Optional
 
 from aiohttp import web
 
-from qobuz_proxy import __version__
+from qobuz_proxy import __commit__, __version__
 from qobuz_proxy.auth import (
     QobuzAPIClient,
     clear_user_token,
@@ -382,6 +382,7 @@ class QobuzProxy:
         self._web_app["auth_state"] = self._auth_state
         self._web_app["get_speakers"] = lambda: [s.get_status() for s in self._speakers]
         self._web_app["version"] = __version__
+        self._web_app["commit"] = __commit__
         self._web_app["on_auth_token"] = self._on_auth_token
         self._web_app["on_logout"] = self._on_logout
         self._web_app["on_add_speaker"] = self._on_add_speaker

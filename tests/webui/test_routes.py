@@ -172,3 +172,14 @@ async def test_status_uptime_format(client: TestClient) -> None:
     uptime = data["uptime"]
     # Should match "Xm" or "Xh Ym" pattern
     assert "m" in uptime
+
+
+def test_format_uptime_breakdown() -> None:
+    """Uptime formatting should pick the right unit set for the duration."""
+    from qobuz_proxy.webui.routes import _format_uptime
+
+    assert _format_uptime(0) == "0m"
+    assert _format_uptime(60 * 5) == "5m"
+    assert _format_uptime(60 * 65) == "1h 5m"
+    assert _format_uptime(60 * 60 * 25) == "1d 1h 0m"
+    assert _format_uptime(60 * 60 * 24 * 3 + 60 * 60 * 4 + 60 * 30) == "3d 4h 30m"

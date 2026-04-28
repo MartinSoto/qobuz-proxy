@@ -724,7 +724,11 @@
 
     function updateSystemInfo(system) {
         if (!system) return;
-        document.getElementById("system-version").textContent = system.version || "--";
+        var versionLabel = system.version ? "v" + system.version : "--";
+        if (system.version && system.commit) {
+            versionLabel += " (" + system.commit + ")";
+        }
+        document.getElementById("system-version").textContent = versionLabel;
         document.getElementById("system-uptime").textContent = system.uptime || "--";
     }
 
@@ -765,7 +769,7 @@
                         '<p class="muted">Waiting for authentication...</p>';
                 }
 
-                updateSystemInfo({ version: data.version, uptime: data.uptime });
+                updateSystemInfo({ version: data.version, commit: data.commit, uptime: data.uptime });
             })
             .catch(function () {
                 // Silently ignore fetch errors (server may be restarting)
