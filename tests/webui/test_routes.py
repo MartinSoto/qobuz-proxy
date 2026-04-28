@@ -15,7 +15,7 @@ def make_app(auth_state: dict | None = None) -> web.Application:
         auth_state = {"authenticated": False, "user_id": "", "email": ""}
     app["auth_state"] = auth_state
     app["get_speakers"] = lambda: []
-    app["version"] = "1.3.2"
+    app["version"] = "1.3.3"
     app["on_auth_token"] = AsyncMock(return_value=True)
     app["on_logout"] = AsyncMock()
     register_routes(app)
@@ -63,7 +63,7 @@ async def test_status_unauthenticated(client: TestClient) -> None:
     assert data["auth"]["user_id"] == ""
     assert data["auth"]["email"] == ""
     assert data["speakers"] == []
-    assert data["version"] == "1.3.2"
+    assert data["version"] == "1.3.3"
     assert "uptime" in data
 
 
