@@ -234,7 +234,7 @@
         html += '</div>';
 
         html += '<div class="button-group">';
-        html += '<button onclick="submitEditSpeaker(' + escapeAttr(JSON.stringify(s.id)) + ', ' + escapeAttr(JSON.stringify(s.backend)) + ')">Save</button>';
+        html += '<button id="edit-speaker-submit" onclick="submitEditSpeaker(' + escapeAttr(JSON.stringify(s.id)) + ', ' + escapeAttr(JSON.stringify(s.backend)) + ')">Save</button>';
         html += '<button class="button-secondary" onclick="cancelEdit()">Cancel</button>';
         html += '</div>';
 
@@ -555,7 +555,7 @@
         html += '</div>';
 
         html += '<div class="button-group">';
-        html += '<button onclick="submitAddSpeaker()">Add Speaker</button>';
+        html += '<button id="add-speaker-submit" onclick="submitAddSpeaker()">Add Speaker</button>';
         html += '<button class="button-secondary" onclick="' + (backend === "dlna" ? "selectBackend(\'dlna\')" : "selectBackend(\'local\')") + '">Back</button>';
         html += '<button class="button-secondary" onclick="hideAddSpeaker()">Cancel</button>';
         html += '</div>';
@@ -596,6 +596,12 @@
             payload.audio_device = devEl ? devEl.value.trim() : "";
         }
 
+        var submitBtn = document.getElementById("add-speaker-submit");
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "Adding…";
+        }
+
         fetch("/api/speakers", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -613,6 +619,10 @@
                 fetchStatus();
             })
             .catch(function (err) {
+                if (submitBtn) {
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = "Add Speaker";
+                }
                 showError(err.message);
             });
     }
@@ -655,6 +665,12 @@
             payload.audio_device = devEl ? devEl.value.trim() : "";
         }
 
+        var submitBtn = document.getElementById("edit-speaker-submit");
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "Saving…";
+        }
+
         fetch("/api/speakers/" + encodeURIComponent(id), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -672,6 +688,10 @@
                 fetchStatus();
             })
             .catch(function (err) {
+                if (submitBtn) {
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = "Save";
+                }
                 showError(err.message);
             });
     }
