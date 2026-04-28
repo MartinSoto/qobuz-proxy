@@ -107,7 +107,16 @@ class DLNAClient:
         Raises:
             DLNAClientError: If connection fails
         """
-        self._session = aiohttp.ClientSession(timeout=ClientTimeout(total=REQUEST_TIMEOUT_SECONDS))
+        # force_close=True opens a fresh TCP connection for every request and
+        # closes it after the response. DLNA renderers (gmediarender in
+        # particular) tend to drop idle keep-alive sockets on their own, which
+        # surfaces as `[Errno None] Can not write request body` when aiohttp
+        # picks the half-closed socket out of its pool.
+        connector = aiohttp.TCPConnector(force_close=True)
+        self._session = aiohttp.ClientSession(
+            timeout=ClientTimeout(total=REQUEST_TIMEOUT_SECONDS),
+            connector=connector,
+        )
 
         # Try to fetch device description
         self.device_info = await self._fetch_device_description()
