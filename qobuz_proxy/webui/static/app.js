@@ -232,8 +232,11 @@
     }
 
     function updateSpeakers(speakers) {
-        // Don't re-render while add or edit panel is open — avoids clobbering user input
-        if (addPanelOpen || editingSpeakerId) return;
+        if (addPanelOpen) return;
+
+        // While editing, skip re-render only after the form is in the DOM —
+        // otherwise the initial click-to-edit never gets a chance to render it.
+        if (editingSpeakerId && document.querySelector(".speaker-edit-card")) return;
 
         var json = JSON.stringify(speakers);
         if (json === lastSpeakersJson) return;

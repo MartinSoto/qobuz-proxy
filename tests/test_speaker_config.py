@@ -1,6 +1,7 @@
 """Tests for SpeakerConfig and multi-speaker config normalization."""
 
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -398,3 +399,37 @@ backend:
         speakers = build_speaker_configs(config)
         assert len(speakers) == 1
         assert speakers[0].name == "Flat Speaker"
+
+
+class TestConfigPathFallback:
+    """When no config file exists, the writable fallback path must respect
+    QOBUZPROXY_DATA_DIR. Otherwise Docker users (CWD=/app, /data mounted)
+    silently lose every speaker change made via the web UI.
+    """
+
+    def test_data_dir_used_when_no_config_file(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        monkeypatch.setenv("QOBUZPROXY_DATA_DIR", str(data_dir))
+
+        config = load_config()
+
+        assert config.config_path == data_dir / "config.yaml"
+
+    def test_local_cwd_used_when_no_data_dir(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("QOBUZPROXY_DATA_DIR", raising=False)
+
+        config = load_config()
+
+        assert config.config_path == Path("./config.yaml")
+
+    def test_explicit_path_overrides_data_dir(self, monkeypatch, tmp_path):
+        explicit = tmp_path / "custom.yaml"
+        explicit.write_text("server:\n  http_port: 9000\n")
+        monkeypatch.setenv("QOBUZPROXY_DATA_DIR", str(tmp_path / "data"))
+
+        config = load_config(config_path=explicit)
+
+        assert config.config_path == explicit
