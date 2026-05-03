@@ -186,25 +186,28 @@ class AudioProxyServer:
 
     async def _handle_audio(self, request: web.Request) -> web.StreamResponse:
         """Handle audio stream requests from DLNA devices."""
-        # Extract track ID (remove extension if present)
-        track_id = request.match_info["track_id"]
-        track_id = track_id.rsplit(".", 1)[0]  # Remove .flac/.mp3
+        # Extract proxy key (remove extension if present). Note: this is the
+        # registration key, not necessarily the Qobuz track ID — gapless
+        # registers tracks with composite keys like "{track_id}_{queue_item_id}"
+        # so duplicates in a queue get distinct proxy URLs.
+        proxy_key = request.match_info["track_id"]
+        proxy_key = proxy_key.rsplit(".", 1)[0]  # Remove .flac/.mp3
 
         # Check if track is registered
-        track = self._tracks.get(track_id)
+        track = self._tracks.get(proxy_key)
         if not track:
-            logger.warning(f"Unknown track requested: {track_id}")
+            logger.warning(f"Unknown track requested: {proxy_key}")
             return web.Response(status=404, text="Track not found")
 
         # Check if URL needs refresh
         if track.is_url_expired(self._url_max_age):
-            logger.info(f"Refreshing expired URL for track {track_id}")
+            logger.info(f"Refreshing expired URL for track {track.track_id}")
             try:
-                fresh_url = await self._url_provider.get_streaming_url(track_id)
+                fresh_url = await self._url_provider.get_streaming_url(track.track_id)
                 track.qobuz_url = fresh_url
                 track.url_fetched_at = time.time()
             except Exception as e:
-                logger.error(f"Failed to refresh URL for track {track_id}: {e}")
+                logger.error(f"Failed to refresh URL for track {track.track_id}: {e}")
                 return web.Response(status=502, text="Failed to refresh streaming URL")
 
         # Forward request to Qobuz CDN
