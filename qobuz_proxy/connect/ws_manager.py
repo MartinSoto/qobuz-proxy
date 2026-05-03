@@ -205,6 +205,7 @@ class WsManager:
         queue_item_id: int,
         queue_version_major: int,
         queue_version_minor: int,
+        position_timestamp_ms: Optional[int] = None,
     ) -> bool:
         """
         Send renderer state update.
@@ -220,6 +221,7 @@ class WsManager:
             queue_item_id=queue_item_id,
             queue_version_major=queue_version_major,
             queue_version_minor=queue_version_minor,
+            position_timestamp_ms=position_timestamp_ms,
         )
         return await self.send_message(data)
 

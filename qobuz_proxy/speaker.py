@@ -518,6 +518,7 @@ class Speaker:
             playing_state=int(playing_state),
             buffer_state=int(report.buffer_state),
             position_ms=report.position_value_ms,
+            position_timestamp_ms=report.position_timestamp_ms,
             duration_ms=report.duration_ms,
             queue_item_id=report.current_queue_item_id,
             queue_version_major=report.queue_version_major,

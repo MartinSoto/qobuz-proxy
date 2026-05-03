@@ -188,9 +188,16 @@ class ProtocolCodec:
         queue_item_id: int,
         queue_version_major: int,
         queue_version_minor: int,
+        position_timestamp_ms: Optional[int] = None,
     ) -> bytes:
         """
         Encode renderer state update message.
+
+        The app interpolates current playback position as
+        ``value + (now - timestamp)``. Pass ``position_timestamp_ms`` as the
+        real-time at which ``position_ms`` was actually measured so the bar
+        advances smoothly between heartbeats. If omitted, falls back to "now",
+        which under-counts by the polling lag.
 
         Returns:
             Encoded frame bytes ready to send
@@ -201,7 +208,9 @@ class ProtocolCodec:
         state.bufferState = buffer_state
 
         position = common_pb2.Position()
-        position.timestamp = self._now_ms()
+        position.timestamp = (
+            position_timestamp_ms if position_timestamp_ms is not None else self._now_ms()
+        )
         position.value = position_ms
         state.currentPosition.CopyFrom(position)
 
