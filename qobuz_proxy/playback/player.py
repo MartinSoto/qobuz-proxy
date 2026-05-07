@@ -265,6 +265,21 @@ class QobuzPlayer:
         except Exception as e:
             logger.error(f"Failed to report volume change: {e}")
 
+    async def broadcast_current_volume(self) -> None:
+        """Refresh volume from the backend and re-emit it to the controller.
+
+        Used when a controller (re)attaches — e.g. on `SrvrRndrSetActive(active=true)`
+        — because the Qobuz cloud does not seem to replay our last
+        `RndrSrvrVolumeChanged` to a freshly-subscribed controller, leaving the
+        device picker without a volume bar until we send it again.
+        """
+        try:
+            volume = await self.get_volume()
+            await self._report_volume_change()
+            logger.info(f"Re-broadcast current volume to app: {volume}%")
+        except Exception as e:
+            logger.warning(f"Failed to re-broadcast volume: {e}")
+
     # =========================================================================
     # Seek Control
     # =========================================================================

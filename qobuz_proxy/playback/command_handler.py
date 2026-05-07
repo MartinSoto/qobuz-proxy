@@ -7,6 +7,8 @@ Processes playback commands from the Qobuz app via WsManager.
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
+from ..backends.types import PlaybackState
+
 if TYPE_CHECKING:
     from .player import QobuzPlayer
     from .queue import QobuzQueue
@@ -23,6 +25,13 @@ MSG_TYPE_SET_MAX_AUDIO_QUALITY = 44  # SrvrRndrSetMaxAudioQuality
 MSG_TYPE_SET_LOOP_MODE = 45  # SrvrRndrSetLoopMode
 MSG_TYPE_SET_SHUFFLE_MODE = 46  # SrvrRndrSetShuffleMode
 MSG_TYPE_SET_AUTOPLAY_MODE = 47  # SrvrRndrSetAutoplayMode
+
+# After a WebSocket reconnect, the Qobuz server replays its last-known session
+# snapshot via SET_STATE — typically PAUSED with a position from before the drop.
+# If the renderer is actually still playing further along the same track, treat
+# that as a stale replay and ignore the pause/seek. Threshold is the minimum
+# gap (renderer ahead of server) at which we suppress.
+_STALE_SNAPSHOT_THRESHOLD_MS = 5000
 
 
 class PlaybackCommandHandler:
@@ -157,15 +166,26 @@ class PlaybackCommandHandler:
                 track_id=str(current_track_id),
             )
 
+        # Detect stale session-restore snapshot from server (e.g. right after a
+        # WebSocket reconnect): server says PAUSED at an old position, but the
+        # renderer is still playing the same track further along. Honouring it
+        # would yank playback backwards and pause for no user-visible reason.
+        stale_snapshot = self._is_stale_pause_snapshot(
+            state=state,
+            current_track_id=current_track_id,
+            player_track_id=player_track_id,
+        )
+
         # Extract position
         position_ms = 0
         if state.HasField("currentPosition"):
             position_ms = state.currentPosition
             logger.debug(f"Position: {position_ms}ms")
-            await self.player.seek(position_ms=position_ms)
+            if not stale_snapshot:
+                await self.player.seek(position_ms=position_ms)
 
         # Handle playing state - apply AFTER track is loaded
-        if state.HasField("playingState"):
+        if state.HasField("playingState") and not stale_snapshot:
             proto_state = state.playingState
             logger.debug(f"Playing state: {proto_state}")
 
@@ -180,6 +200,48 @@ class PlaybackCommandHandler:
         # Notify gapless system about next track change (after state handling)
         if next_track_changed and self._on_next_track_changed:
             await self._on_next_track_changed()
+
+    def _is_stale_pause_snapshot(
+        self,
+        state: Any,
+        current_track_id: Optional[int],
+        player_track_id: Optional[str],
+    ) -> bool:
+        """Decide whether an inbound SET_STATE is a stale session-restore replay.
+
+        Returns True when ALL of:
+          - server says PAUSED
+          - renderer is still PLAYING
+          - it's the same track the renderer is on
+          - server's currentPosition is more than _STALE_SNAPSHOT_THRESHOLD_MS
+            behind the renderer's actual position
+        """
+        if not state.HasField("playingState") or state.playingState != 3:
+            return False
+        if self.player.state != PlaybackState.PLAYING:
+            return False
+        if not state.HasField("currentPosition"):
+            return False
+        # If the server is pointing us at a different track, it's a real
+        # command (track change), not a stale replay.
+        if current_track_id is not None and str(current_track_id) != player_track_id:
+            return False
+
+        actual_pos = self.player.current_position_ms
+        server_pos = state.currentPosition
+        gap_ms = actual_pos - server_pos
+        if gap_ms <= _STALE_SNAPSHOT_THRESHOLD_MS:
+            return False
+
+        logger.info(
+            "Ignoring stale SET_STATE: server says PAUSED at %dms, renderer is "
+            "PLAYING at %dms (%.1fs ahead) on same track — likely a session-"
+            "restore replay after WebSocket reconnect; keeping playback.",
+            server_pos,
+            actual_pos,
+            gap_ms / 1000.0,
+        )
+        return True
 
     def get_next_track_info(self) -> Optional[dict]:
         """Get the stored next track info for auto-advance."""
@@ -206,7 +268,12 @@ class PlaybackCommandHandler:
         active = message.srvrRndrSetActive.active
         logger.info(f"Renderer set active: {active}")
 
-        if not active:
+        if active:
+            # A controller just attached. The Qobuz cloud does not seem to replay
+            # our last RndrSrvrVolumeChanged to it, so the device picker can show
+            # an empty volume bar until we re-emit. Push current volume now.
+            await self.player.broadcast_current_volume()
+        else:
             # We're no longer the active renderer - stop playback
             await self.player.stop_playback()
 
