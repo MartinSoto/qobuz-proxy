@@ -1,23 +1,28 @@
-"""Tests for app.py local backend integration (QPROXY-023)."""
+"""Tests for Speaker local backend integration (QPROXY-023)."""
 
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from qobuz_proxy.app import QobuzProxy
 from qobuz_proxy.backends.local.backend import LocalAudioBackend
+from qobuz_proxy.config import AUTO_QUALITY, SpeakerConfig
 from qobuz_proxy.connect.types import ConnectTokens, JWTConnectToken
-from qobuz_proxy.config import Config, AUTO_QUALITY
+from qobuz_proxy.speaker import Speaker
 
 
-def _make_local_config() -> Config:
-    """Create a config with local backend."""
-    config = Config()
-    config.qobuz.email = "test@example.com"
-    config.qobuz.auth_token = "testpass"
-    config.backend.type = "local"
-    config.backend.local.device = "default"
-    config.backend.local.buffer_size = 2048
-    return config
+def _make_local_speaker_config(**overrides) -> SpeakerConfig:
+    """Create a SpeakerConfig configured for the local backend."""
+    cfg = SpeakerConfig(
+        name="TestSpeaker",
+        uuid=str(uuid.uuid4()),
+        backend_type="local",
+        audio_device="default",
+        audio_buffer_size=2048,
+        http_port=0,
+        proxy_port=0,
+    )
+    for key, value in overrides.items():
+        setattr(cfg, key, value)
+    return cfg
 
 
 def _mock_sounddevice():
@@ -37,112 +42,73 @@ def _mock_sounddevice():
 _SD_PATCH = "qobuz_proxy.backends.local.device._import_sounddevice"
 
 
-class TestAppLocalBackend:
-    async def test_app_creates_local_backend(self) -> None:
-        """App should create LocalAudioBackend when config type is 'local'."""
-        config = _make_local_config()
-        app = QobuzProxy(config)
+def _make_speaker(config: SpeakerConfig) -> Speaker:
+    return Speaker(config=config, api_client=MagicMock(), app_id="test-app-id")
 
-        # Mock everything before backend creation
-        with (
-            patch("qobuz_proxy.app.QobuzAPIClient") as mock_api_class,
-            patch(_SD_PATCH, return_value=_mock_sounddevice()),
-        ):
-            mock_api = mock_api_class.return_value
-            mock_api.login_with_token = AsyncMock(return_value=True)
 
-            # Start will create backend and continue... we need to stop it
-            # after backend creation. We'll patch DiscoveryService to raise
-            # and catch that.
-            with patch("qobuz_proxy.app.DiscoveryService") as mock_disc:
-                mock_disc.return_value.start = AsyncMock(side_effect=Exception("stop here"))
-
-                try:
-                    await app.start()
-                except Exception:
-                    pass
-
-        assert isinstance(app._backend, LocalAudioBackend)
-
-    async def test_app_skips_proxy_for_local(self) -> None:
-        """No proxy server should be created for local backend."""
-        config = _make_local_config()
-        app = QobuzProxy(config)
+class TestSpeakerLocalBackend:
+    async def test_speaker_creates_local_backend(self) -> None:
+        """Speaker should create LocalAudioBackend when config.backend_type is 'local'."""
+        speaker = _make_speaker(_make_local_speaker_config())
 
         with (
-            patch("qobuz_proxy.app.QobuzAPIClient") as mock_api_class,
             patch(_SD_PATCH, return_value=_mock_sounddevice()),
+            # Stop start() right after backend/player are created but before networking.
+            patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc,
         ):
-            mock_api = mock_api_class.return_value
-            mock_api.login_with_token = AsyncMock(return_value=True)
+            mock_disc.return_value.start = AsyncMock(side_effect=Exception("stop here"))
+            await speaker.start()
 
-            with patch("qobuz_proxy.app.DiscoveryService") as mock_disc:
-                mock_disc.return_value.start = AsyncMock(side_effect=Exception("stop here"))
+        assert isinstance(speaker._backend, LocalAudioBackend)
 
-                try:
-                    await app.start()
-                except Exception:
-                    pass
-
-        assert app._proxy_server is None
-
-    async def test_app_quality_defaults_hires_for_local(self) -> None:
-        """Auto quality with local backend should default to 27 (Hi-Res 192k)."""
-        config = _make_local_config()
-        config.qobuz.max_quality = AUTO_QUALITY
-        app = QobuzProxy(config)
+    async def test_speaker_skips_proxy_for_local(self) -> None:
+        """No DLNA proxy server should be created for the local backend."""
+        speaker = _make_speaker(_make_local_speaker_config())
 
         with (
-            patch("qobuz_proxy.app.QobuzAPIClient") as mock_api_class,
             patch(_SD_PATCH, return_value=_mock_sounddevice()),
+            patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc,
         ):
-            mock_api = mock_api_class.return_value
-            mock_api.login_with_token = AsyncMock(return_value=True)
+            mock_disc.return_value.start = AsyncMock(side_effect=Exception("stop here"))
+            await speaker.start()
 
-            with patch("qobuz_proxy.app.DiscoveryService") as mock_disc:
-                mock_disc.return_value.start = AsyncMock(side_effect=Exception("stop here"))
+        assert speaker._proxy_server is None
 
-                try:
-                    await app.start()
-                except Exception:
-                    pass
-
-        assert app._effective_quality == 27
-
-    async def test_app_skips_fixed_volume_for_local(self) -> None:
-        """Fixed volume should not be applied for local backend."""
-        config = _make_local_config()
-        config.backend.dlna.fixed_volume = True  # Set but shouldn't be applied
-        app = QobuzProxy(config)
+    async def test_speaker_quality_defaults_hires_for_local(self) -> None:
+        """Auto quality with the local backend should resolve to 27 (Hi-Res 192k)."""
+        speaker = _make_speaker(_make_local_speaker_config(max_quality=AUTO_QUALITY))
 
         with (
-            patch("qobuz_proxy.app.QobuzAPIClient") as mock_api_class,
             patch(_SD_PATCH, return_value=_mock_sounddevice()),
-            patch("qobuz_proxy.app.QobuzPlayer") as mock_player_class,
+            patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc,
         ):
-            mock_api = mock_api_class.return_value
-            mock_api.login_with_token = AsyncMock(return_value=True)
+            mock_disc.return_value.start = AsyncMock(side_effect=Exception("stop here"))
+            await speaker.start()
 
+        assert speaker._effective_quality == 27
+
+    async def test_speaker_skips_fixed_volume_for_local(self) -> None:
+        """Fixed volume mode should not be applied for the local backend."""
+        # dlna_fixed_volume is set, but local backend must ignore it.
+        speaker = _make_speaker(_make_local_speaker_config(dlna_fixed_volume=True))
+
+        with (
+            patch(_SD_PATCH, return_value=_mock_sounddevice()),
+            patch("qobuz_proxy.speaker.QobuzPlayer") as mock_player_class,
+            patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc,
+        ):
+            mock_disc.return_value.start = AsyncMock(side_effect=Exception("stop here"))
             mock_player = mock_player_class.return_value
+            await speaker.start()
 
-            with patch("qobuz_proxy.app.DiscoveryService") as mock_disc:
-                mock_disc.return_value.start = AsyncMock(side_effect=Exception("stop here"))
-
-                try:
-                    await app.start()
-                except Exception:
-                    pass
-
-        # set_fixed_volume_mode should NOT have been called
         mock_player.set_fixed_volume_mode.assert_not_called()
 
     async def test_setup_websocket_reuses_existing_manager(self) -> None:
-        """Fresh handshakes should update the existing manager instead of rebuilding it."""
-        config = _make_local_config()
-        app = QobuzProxy(config)
-        app._queue = MagicMock()
-        app._player = MagicMock()
-        app._ws_manager = MagicMock()
+        """Fresh handshakes should refresh tokens on the existing manager, not rebuild it."""
+        speaker = _make_speaker(_make_local_speaker_config())
+        speaker._queue = MagicMock()
+        speaker._player = MagicMock()
+        speaker._ws_manager = MagicMock()
 
         tokens = ConnectTokens(
             session_id=str(uuid.uuid4()),
@@ -153,9 +119,9 @@ class TestAppLocalBackend:
             ),
         )
 
-        with patch("qobuz_proxy.app.WsManager") as mock_ws_manager_class:
-            await app._setup_websocket(tokens)
+        with patch("qobuz_proxy.speaker.WsManager") as mock_ws_manager_class:
+            await speaker._setup_websocket(tokens)
 
-        app._ws_manager.set_tokens.assert_called_once_with(tokens)
-        assert app._ws_connected_event.is_set() is True
+        speaker._ws_manager.set_tokens.assert_called_once_with(tokens)
+        assert speaker._ws_connected_event.is_set() is True
         mock_ws_manager_class.assert_not_called()
