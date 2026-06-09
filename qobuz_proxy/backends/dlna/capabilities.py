@@ -21,6 +21,14 @@ QOBUZ_QUALITY_CD = 6
 QOBUZ_QUALITY_96K = 7
 QOBUZ_QUALITY_192K = 27
 
+# MIME types that indicate FLAC support. Devices are inconsistent: the DLNA
+# registered type is "audio/flac", but GStreamer-based renderers (e.g.
+# gmediarender) and many others advertise the older "audio/x-flac".
+FLAC_MIME_TYPES = frozenset({"audio/flac", "audio/x-flac"})
+
+# MIME types that indicate MP3 support.
+MP3_MIME_TYPES = frozenset({"audio/mpeg", "audio/mp3", "audio/x-mp3"})
+
 
 @dataclass(frozen=True)
 class DlnaProtocolInfoEntry:
@@ -61,7 +69,14 @@ class DLNACapabilities:
         return QOBUZ_QUALITY_CD
 
     def by_mime(self, mime: str) -> list[DlnaProtocolInfoEntry]:
-        """Get all entries matching a mime type."""
+        """Get all entries matching a mime type.
+
+        FLAC MIME types are treated as interchangeable so that a request for
+        "audio/flac" still matches a device that only advertises "audio/x-flac".
+        """
+        mime = mime.lower()
+        if mime in FLAC_MIME_TYPES:
+            return [e for e in self.entries if e.mime in FLAC_MIME_TYPES]
         return [e for e in self.entries if e.mime == mime]
 
     def best_entry_for_media(
@@ -157,11 +172,11 @@ def parse_protocol_info_sink(sink: str) -> DLNACapabilities:
         caps.entries.append(entry)
 
         # Update capability flags
-        if mime == "audio/flac":
+        if mime in FLAC_MIME_TYPES:
             caps.supports_flac = True
             caps.max_sample_rate = max(caps.max_sample_rate, sr or 44100)
             caps.max_bit_depth = max(caps.max_bit_depth, bd or 16)
-        elif mime == "audio/mpeg":
+        elif mime in MP3_MIME_TYPES:
             caps.supports_mp3 = True
 
     logger.info(
