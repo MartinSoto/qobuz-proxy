@@ -179,6 +179,28 @@ def parse_protocol_info_sink(sink: str) -> DLNACapabilities:
         elif mime in MP3_MIME_TYPES:
             caps.supports_mp3 = True
 
+    # Log the audio formats we actually recognized, so capability-detection
+    # issues (e.g. a FLAC device advertised under an unexpected MIME type) are
+    # diagnosable from the logs without needing the full raw Sink string.
+    audio_entries = [
+        e
+        for e in caps.entries
+        if e.mime.startswith("audio/") or e.mime in FLAC_MIME_TYPES | MP3_MIME_TYPES
+    ]
+    if audio_entries:
+        formats = ", ".join(
+            f"{e.mime}"
+            + (f"@{e.sample_rate}Hz" if e.sample_rate else "")
+            + (f"/{e.bit_depth}bit" if e.bit_depth else "")
+            for e in audio_entries
+        )
+        logger.info(f"Discovered audio formats: {formats}")
+    else:
+        logger.warning(
+            "No audio/* formats found in GetProtocolInfo Sink "
+            f"({len(caps.entries)} total entries); defaulting to MP3"
+        )
+
     logger.info(
         f"Parsed capabilities: FLAC={caps.supports_flac}, "
         f"max_sr={caps.max_sample_rate}Hz, max_bd={caps.max_bit_depth}bit, "

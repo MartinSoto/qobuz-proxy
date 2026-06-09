@@ -566,7 +566,9 @@ class DLNAClient:
         if response:
             sink = self._parse_xml_value(response, "Sink")
             if sink:
-                logger.debug(f"GetProtocolInfo Sink: {sink[:200]}...")
+                # Log the full Sink (not truncated): capability-detection bugs
+                # are impossible to diagnose without the exact advertised types.
+                logger.debug(f"GetProtocolInfo Sink ({len(sink)} chars): {sink}")
                 return sink
         return None
 
