@@ -6,9 +6,13 @@ A Qobuz Connect renderer that streams to DLNA devices.
 
 import os
 import subprocess
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-__version__ = "1.3.5"
+try:
+    __version__ = version("qobuz-proxy")
+except PackageNotFoundError:
+    __version__ = "0.0.0+dev"
 
 
 def _detect_commit() -> str:
