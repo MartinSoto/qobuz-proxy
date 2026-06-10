@@ -50,6 +50,8 @@ class TestTrackMetadata:
         assert metadata.streaming_url == ""
         assert metadata.streaming_url_expires_at == 0
         assert metadata.actual_quality == 0
+        assert metadata.sample_rate == 0
+        assert metadata.bit_depth == 0
 
     def test_to_dict(self) -> None:
         """Test conversion to dictionary."""
@@ -463,6 +465,83 @@ class TestMetadataService:
         """Test quality fallback with invalid max_quality returns full list."""
         service = MetadataService(MockAPIClient(), max_quality=99)  # type: ignore[arg-type]
         assert service._get_quality_fallback_order() == [27, 7, 6, 5]
+
+    @pytest.mark.asyncio
+    async def test_streaming_url_stores_sample_rate_and_bit_depth(
+        self, metadata_service: MetadataService, mock_api: MockAPIClient
+    ) -> None:
+        """Test that sample_rate and bit_depth from the API are stored on TrackMetadata."""
+        mock_api.get_track_metadata.return_value = {
+            "title": "Test Track",
+            "artist": "Test Artist",
+            "album": "Test Album",
+            "duration_ms": 180000,
+            "album_art_url": "",
+        }
+        mock_api.get_track_url.return_value = {
+            "url": "https://streaming.example.com/track.flac",
+            "format_id": 27,
+            "bit_depth": 24,
+            "sampling_rate": 96.0,  # kHz as returned by Qobuz API
+            "mime_type": "audio/flac",
+        }
+
+        result = await metadata_service.get_metadata("12345", fetch_url=True)
+
+        assert result is not None
+        assert result.sample_rate == 96000
+        assert result.bit_depth == 24
+
+    @pytest.mark.asyncio
+    async def test_streaming_url_stores_cd_quality_format(
+        self, metadata_service: MetadataService, mock_api: MockAPIClient
+    ) -> None:
+        """Test sample_rate and bit_depth for CD quality (16-bit/44.1kHz)."""
+        mock_api.get_track_metadata.return_value = {
+            "title": "Test Track",
+            "artist": "Test Artist",
+            "album": "Test Album",
+            "duration_ms": 180000,
+            "album_art_url": "",
+        }
+        mock_api.get_track_url.return_value = {
+            "url": "https://streaming.example.com/track.flac",
+            "format_id": 6,
+            "bit_depth": 16,
+            "sampling_rate": 44.1,
+            "mime_type": "audio/flac",
+        }
+
+        result = await metadata_service.get_metadata("12345", fetch_url=True)
+
+        assert result is not None
+        assert result.sample_rate == 44100
+        assert result.bit_depth == 16
+
+    def test_get_track_format_returns_values_after_url_fetch(
+        self, metadata_service: MetadataService
+    ) -> None:
+        """Test get_track_format returns cached quality, sample_rate, and bit_depth."""
+        from qobuz_proxy.playback.metadata import TrackMetadata
+
+        cached = TrackMetadata(track_id="12345", actual_quality=7, sample_rate=96000, bit_depth=24)
+        metadata_service._cache.set("12345", cached)
+
+        quality, sample_rate, bit_depth = metadata_service.get_track_format("12345")
+
+        assert quality == 7
+        assert sample_rate == 96000
+        assert bit_depth == 24
+
+    def test_get_track_format_returns_zeros_for_unknown_track(
+        self, metadata_service: MetadataService
+    ) -> None:
+        """Test get_track_format returns (0, 0, 0) for a track not in cache."""
+        quality, sample_rate, bit_depth = metadata_service.get_track_format("unknown")
+
+        assert quality == 0
+        assert sample_rate == 0
+        assert bit_depth == 0
 
     def test_log_now_playing(
         self, metadata_service: MetadataService, caplog: pytest.LogCaptureFixture

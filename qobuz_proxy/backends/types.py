@@ -49,6 +49,8 @@ class BackendTrackMetadata:
     album: str = ""
     duration_ms: int = 0
     artwork_url: str = ""
+    sample_rate: int = 0  # Hz, e.g. 44100, 96000, 192000
+    bit_depth: int = 0  # e.g. 16, 24
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""

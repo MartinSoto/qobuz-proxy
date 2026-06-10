@@ -50,6 +50,8 @@ class TrackMetadata:
     streaming_url: str = ""
     streaming_url_expires_at: int = 0  # Timestamp in seconds
     actual_quality: int = 0  # Quality ID of the streaming URL
+    sample_rate: int = 0  # Hz, e.g. 44100, 96000, 192000
+    bit_depth: int = 0  # e.g. 16, 24
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -198,6 +200,13 @@ class MetadataService:
         metadata = await self.get_metadata(track_id, fetch_url=True)
         return metadata.streaming_url if metadata else None
 
+    def get_track_format(self, track_id: str) -> tuple[int, int, int]:
+        """Return (actual_quality, sample_rate_hz, bit_depth) for a cached track, or (0, 0, 0)."""
+        cached = self._cache.get(track_id)
+        if cached:
+            return (cached.actual_quality, cached.sample_rate, cached.bit_depth)
+        return (0, 0, 0)
+
     def get_track_actual_quality(self, track_id: str) -> Optional[int]:
         """
         Get the actual streaming quality for a cached track.
@@ -278,6 +287,10 @@ class MetadataService:
                     # Use the actual format_id from API response (may differ from requested)
                     actual_quality = result.get("format_id", quality)
                     metadata.actual_quality = actual_quality
+                    # sampling_rate from Qobuz API is in kHz (e.g. 44.1, 96.0, 192.0)
+                    sr = result.get("sampling_rate", 0)
+                    metadata.sample_rate = int(float(sr) * 1000) if sr else 0
+                    metadata.bit_depth = int(result.get("bit_depth", 0))
 
                     if actual_quality != self._max_quality:
                         logger.info(

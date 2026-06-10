@@ -622,8 +622,14 @@ class DLNABackend(AudioBackend):
         if metadata.artwork_url:
             didl += f"\n        <upnp:albumArtURI>{escape(metadata.artwork_url)}</upnp:albumArtURI>"
 
+        audio_attrs = ""
+        if metadata.sample_rate:
+            audio_attrs += f' sampleFrequency="{metadata.sample_rate}"'
+        if metadata.bit_depth:
+            audio_attrs += f' bitsPerSample="{metadata.bit_depth}"'
+
         didl += f"""
-        <res protocolInfo="{escape(protocol_info)}"{duration_attr}>{escape(url)}</res>
+        <res protocolInfo="{escape(protocol_info)}"{duration_attr}{audio_attrs}>{escape(url)}</res>
     </item>
 </DIDL-Lite>"""
 

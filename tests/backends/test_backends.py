@@ -67,6 +67,14 @@ class TestBackendTrackMetadata:
         assert metadata.album == ""
         assert metadata.duration_ms == 0
         assert metadata.artwork_url == ""
+        assert metadata.sample_rate == 0
+        assert metadata.bit_depth == 0
+
+    def test_audio_format_fields(self) -> None:
+        """Test sample_rate and bit_depth are stored correctly."""
+        metadata = BackendTrackMetadata(track_id="12345", sample_rate=96000, bit_depth=24)
+        assert metadata.sample_rate == 96000
+        assert metadata.bit_depth == 24
 
     def test_to_dict(self) -> None:
         """Test conversion to dictionary."""
