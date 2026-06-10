@@ -1,9 +1,5 @@
 """Tests for DLNABackend._build_didl metadata generation."""
 
-from unittest.mock import MagicMock
-
-import pytest
-
 from qobuz_proxy.backends.types import BackendTrackMetadata
 from qobuz_proxy.backends.dlna.backend import DLNABackend
 

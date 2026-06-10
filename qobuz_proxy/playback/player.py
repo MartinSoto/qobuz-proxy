@@ -739,9 +739,7 @@ class QobuzPlayer:
                     track.duration_ms = meta.get("duration_ms", 0)
 
             # Get actual quality and format info from cache (set during URL fetch)
-            actual_quality, sample_rate, bit_depth = self.metadata.get_track_format(
-                track.track_id
-            )
+            actual_quality, sample_rate, bit_depth = self.metadata.get_track_format(track.track_id)
 
             # Build backend metadata
             backend_meta = BackendTrackMetadata(
@@ -759,8 +757,8 @@ class QobuzPlayer:
                 bit_depth=bit_depth,
             )
 
-            # Log now playing with actual quality
-            self.metadata.log_now_playing_info(backend_meta, actual_quality)
+            # Log now playing with actual quality (0 = cache miss, fall back to max quality)
+            self.metadata.log_now_playing_info(backend_meta, actual_quality or None)
 
             # Report file quality if callback is set
             if self._file_quality_report_callback:
