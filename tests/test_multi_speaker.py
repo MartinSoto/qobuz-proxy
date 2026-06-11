@@ -321,3 +321,102 @@ class TestWebUICallbacks:
             assert len(app._speakers) == 0
             mock_speaker.stop.assert_called_once()
             mock_clear.assert_called_once()
+
+
+class TestSpeakerEditCallbacks:
+    """Tests for runtime add/edit speaker callbacks from the web UI."""
+
+    async def test_edit_persists_config_when_restart_fails(self):
+        """Edits must be saved even if the speaker can't start (e.g. device offline)."""
+        import pytest  # noqa: F401
+
+        config = _make_config(_make_speaker_config(name="Wyse", max_quality=6))
+        old_speaker = MagicMock()
+        old_speaker.name = "Wyse"
+        old_speaker.stop = AsyncMock()
+        old_speaker.start = AsyncMock(return_value=True)
+
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = [old_speaker]
+
+        new_speaker = MagicMock()
+        new_speaker.name = "Wyse"
+        new_speaker.start = AsyncMock(return_value=False)  # device unreachable
+        new_speaker.get_status.return_value = {"id": "wyse", "status": "disconnected"}
+
+        with (
+            patch("qobuz_proxy.app.Speaker", return_value=new_speaker),
+            patch.object(app, "_save_config") as mock_save,
+        ):
+            result = await app._on_edit_speaker(
+                "wyse", {"max_quality": 27, "dlna_ip": "192.168.1.60"}
+            )
+
+        assert config.speakers[0].max_quality == 27
+        assert config.speakers[0].dlna_ip == "192.168.1.60"
+        mock_save.assert_called_once()
+        assert app._speakers[0] is new_speaker
+        assert result["status"] == "disconnected"
+
+    async def test_add_rejects_duplicate_name_from_config(self):
+        """A config entry whose speaker isn't running must still block the name."""
+        import pytest
+
+        config = _make_config(_make_speaker_config(name="Living Room"))
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = []  # speaker failed to start, so it's not running
+
+        with pytest.raises(ValueError, match="already exists"):
+            await app._on_add_speaker(
+                {"name": "Living Room", "backend": "dlna", "dlna_ip": "1.2.3.4"}
+            )
+
+    async def test_edit_rejects_rename_to_existing_name(self):
+        import pytest
+
+        config = _make_config(
+            _make_speaker_config(name="Speaker A", http_port=8689),
+            _make_speaker_config(name="Speaker B", http_port=8690),
+        )
+        speaker_a = MagicMock()
+        speaker_a.name = "Speaker A"
+        speaker_b = MagicMock()
+        speaker_b.name = "Speaker B"
+
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = [speaker_a, speaker_b]
+
+        with pytest.raises(ValueError, match="already exists"):
+            await app._on_edit_speaker("speaker-b", {"name": "Speaker A"})
+
+    async def test_edit_uses_config_entry_matched_by_name(self):
+        """Config entry must be matched by name, not by running-list index."""
+        config = _make_config(
+            _make_speaker_config(name="Speaker A", http_port=8689, max_quality=6),
+            _make_speaker_config(name="Speaker B", http_port=8690, max_quality=6),
+        )
+        # Speaker A failed to start, so only B is running (index misalignment)
+        speaker_b = MagicMock()
+        speaker_b.name = "Speaker B"
+        speaker_b.stop = AsyncMock()
+
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = [speaker_b]
+
+        new_speaker = MagicMock()
+        new_speaker.name = "Speaker B"
+        new_speaker.start = AsyncMock(return_value=True)
+        new_speaker.get_status.return_value = {"id": "speaker-b", "status": "idle"}
+
+        with (
+            patch("qobuz_proxy.app.Speaker", return_value=new_speaker),
+            patch.object(app, "_save_config"),
+        ):
+            await app._on_edit_speaker("speaker-b", {"max_quality": 27})
+
+        assert config.speakers[1].max_quality == 27  # B updated
+        assert config.speakers[0].max_quality == 6  # A untouched

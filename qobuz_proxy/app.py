@@ -252,9 +252,12 @@ class QobuzProxy:
         name = body["name"].strip()
         backend_type = body.get("backend", "dlna")
 
-        # Check for duplicate names
-        for s in self._speakers:
-            if slugify_name(s.name) == slugify_name(name):
+        # Check for duplicate names against the config — a speaker can exist in
+        # config without running (e.g. its device is offline), and a duplicate
+        # name in the saved config prevents the app from booting.
+        new_id = slugify_name(name)
+        for sc_existing in self._config.speakers:
+            if slugify_name(sc_existing.name) == new_id:
                 raise ValueError(f"Speaker '{name}' already exists")
 
         # Build SpeakerConfig
@@ -297,17 +300,35 @@ class QobuzProxy:
         return speaker.get_status()
 
     async def _on_edit_speaker(self, speaker_id: str, body: dict) -> dict:
-        """Edit a speaker at runtime (stop, reconfigure, restart)."""
-        idx = None
-        for i, s in enumerate(self._speakers):
-            if slugify_name(s.name) == speaker_id:
-                idx = i
+        """Edit a speaker at runtime (stop, reconfigure, restart).
+
+        The new config is persisted even when the speaker fails to restart —
+        edits are often the fix for connectivity (e.g. a changed device IP),
+        so refusing to save them would lock the user out of recovering.
+        """
+        # Match the config entry by name: the running list and the config list
+        # can be misaligned when some speakers failed to start.
+        config_idx = None
+        for i, sc in enumerate(self._config.speakers):
+            if slugify_name(sc.name) == speaker_id:
+                config_idx = i
                 break
-        if idx is None:
+        if config_idx is None:
             raise KeyError(speaker_id)
 
-        old_speaker = self._speakers[idx]
-        old_config = self._config.speakers[idx]
+        speaker_idx = None
+        for i, s in enumerate(self._speakers):
+            if slugify_name(s.name) == speaker_id:
+                speaker_idx = i
+                break
+
+        old_config = self._config.speakers[config_idx]
+
+        new_name = body.get("name", old_config.name).strip()
+        if slugify_name(new_name) != speaker_id:
+            for i, sc in enumerate(self._config.speakers):
+                if i != config_idx and slugify_name(sc.name) == slugify_name(new_name):
+                    raise ValueError(f"Speaker '{new_name}' already exists")
 
         quality_raw = body.get("max_quality", old_config.max_quality)
         if isinstance(quality_raw, str) and quality_raw.lower() == "auto":
@@ -316,7 +337,7 @@ class QobuzProxy:
             max_quality = int(quality_raw)
 
         new_config = SpeakerConfig(
-            name=body.get("name", old_config.name).strip(),
+            name=new_name,
             uuid=old_config.uuid,
             backend_type=old_config.backend_type,  # Immutable
             max_quality=max_quality,
@@ -331,20 +352,29 @@ class QobuzProxy:
             audio_buffer_size=int(body.get("buffer_size", old_config.audio_buffer_size)),
         )
 
-        await old_speaker.stop()
+        # Persist first: the edit is saved even if the restart below fails
+        self._config.speakers[config_idx] = new_config
+        self._save_config()
+
+        if speaker_idx is not None:
+            await self._speakers[speaker_idx].stop()
 
         assert self._api_client is not None
         new_speaker = Speaker(config=new_config, api_client=self._api_client, app_id=self._app_id)
         started = await new_speaker.start()
+        if speaker_idx is not None:
+            self._speakers[speaker_idx] = new_speaker
+        else:
+            self._speakers.append(new_speaker)
+
+        status = new_speaker.get_status()
         if not started:
-            await old_speaker.start()
-            raise ValueError(f"Speaker '{new_config.name}' failed to start with new config")
-
-        self._speakers[idx] = new_speaker
-        self._config.speakers[idx] = new_config
-        self._save_config()
-
-        return new_speaker.get_status()
+            logger.warning(
+                f"Speaker '{new_config.name}' failed to start with new config "
+                "(configuration saved anyway)"
+            )
+            status["warning"] = "Configuration saved, but the speaker failed to start"
+        return status
 
     async def _on_remove_speaker(self, speaker_id: str) -> None:
         """Remove a speaker at runtime."""

@@ -216,15 +216,24 @@
         html += '<input type="text" id="edit-name" value="' + escapeHtml(s.name) + '">';
         html += '</div>';
 
+        var cfg = s.config || {};
         if (s.backend === "dlna") {
             html += '<div class="form-group">';
-            html += '<label>DLNA URL</label>';
-            html += '<input type="text" id="edit-dlna-url" value="' + escapeHtml(s.dlna_url || "") + '" placeholder="http://192.168.1.x:1400/xml/device_description.xml">';
+            html += '<label>IP Address</label>';
+            html += '<input type="text" id="edit-dlna-ip" value="' + escapeHtml(cfg.dlna_ip || "") + '" placeholder="192.168.1.x">';
+            html += '</div>';
+            html += '<div class="form-group">';
+            html += '<label>Port</label>';
+            html += '<input type="number" id="edit-dlna-port" value="' + escapeHtml(String(cfg.dlna_port || 1400)) + '">';
+            html += '</div>';
+            html += '<div class="form-group">';
+            html += '<label>Description URL (optional)</label>';
+            html += '<input type="text" id="edit-dlna-url" value="' + escapeHtml(cfg.description_url || "") + '" placeholder="http://192.168.1.x:1400/xml/device_description.xml">';
             html += '</div>';
         } else if (s.backend === "local") {
             html += '<div class="form-group">';
             html += '<label>Audio Device (leave blank for default)</label>';
-            html += '<input type="text" id="edit-audio-device" value="' + escapeHtml(s.audio_device || "") + '" placeholder="default">';
+            html += '<input type="text" id="edit-audio-device" value="' + escapeHtml(cfg.audio_device || "") + '" placeholder="default">';
             html += '</div>';
         }
 
@@ -658,8 +667,17 @@
         };
 
         if (backend === "dlna") {
+            var ipEl = document.getElementById("edit-dlna-ip");
+            var portEl = document.getElementById("edit-dlna-port");
             var urlEl = document.getElementById("edit-dlna-url");
-            payload.dlna_url = urlEl ? urlEl.value.trim() : "";
+            var ip = ipEl ? ipEl.value.trim() : "";
+            if (!ip) {
+                showError("IP address is required.");
+                return;
+            }
+            payload.dlna_ip = ip;
+            payload.dlna_port = portEl ? (parseInt(portEl.value) || 1400) : 1400;
+            payload.description_url = urlEl ? urlEl.value.trim() : "";
         } else if (backend === "local") {
             var devEl = document.getElementById("edit-audio-device");
             payload.audio_device = devEl ? devEl.value.trim() : "";
@@ -682,9 +700,12 @@
                 }
                 return r.json();
             })
-            .then(function () {
+            .then(function (data) {
                 editingSpeakerId = null;
                 lastSpeakersJson = null;
+                if (data && data.warning) {
+                    showError(data.warning);
+                }
                 fetchStatus();
             })
             .catch(function (err) {
