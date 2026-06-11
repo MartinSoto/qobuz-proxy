@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp import web, ClientError, ClientSession, ClientTimeout
 
 from .url_provider import StreamingURLProvider
 
@@ -22,6 +22,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_URL_MAX_AGE_SECONDS = 240  # Refresh before 5-minute TTL
 STREAM_CHUNK_SIZE = 64 * 1024  # 64KB chunks
 REQUEST_TIMEOUT_SECONDS = 30
+MAX_UPSTREAM_RETRIES = 3
+UPSTREAM_RETRY_DELAY_SECONDS = 0.5
+
+
+def _parse_range_start(range_header: str) -> int:
+    """Extract the start byte from a Range header ("bytes=X-...")."""
+    try:
+        return int(range_header.split("=", 1)[1].split("-", 1)[0] or 0)
+    except (IndexError, ValueError):
+        return 0
 
 
 @dataclass
@@ -218,114 +228,184 @@ class AudioProxyServer:
         request: web.Request,
         track: RegisteredTrack,
     ) -> web.StreamResponse:
-        """Proxy the audio stream from Qobuz CDN."""
+        """Proxy the audio stream from Qobuz CDN.
+
+        If the upstream connection dies mid-stream (the CDN occasionally aborts
+        long-running transfers with a short read), reconnect with a Range
+        request from the last byte delivered to the client instead of dropping
+        the renderer's stream mid-track.
+        """
         # Build headers for upstream request
         headers: Dict[str, str] = {}
 
         # Forward Range header for seeking support
         range_header = request.headers.get("Range")
+        request_start = 0
         if range_header:
             headers["Range"] = range_header
+            request_start = _parse_range_start(range_header)
             logger.debug(f"Proxying with Range: {range_header}")
 
         # Create a fresh session for each request (like reference implementation)
         # This avoids connection pooling issues with long-running streams
         timeout = ClientTimeout(total=None, connect=30)  # No total timeout for streaming
 
-        try:
-            logger.debug(
-                f"Connecting to upstream URL for track {track.track_id}: {track.qobuz_url[:100]}..."
-            )
-            async with ClientSession(timeout=timeout) as session:
-                async with session.get(
-                    track.qobuz_url,
-                    headers=headers,
-                ) as upstream_response:
-                    # Determine response status
-                    if upstream_response.status == 206:
-                        status = 206  # Partial Content
-                    elif upstream_response.status == 200:
-                        status = 200
-                    else:
-                        logger.warning(
-                            f"Upstream error for track {track.track_id}: {upstream_response.status}"
-                        )
-                        return web.Response(
-                            status=502, text=f"Upstream error: {upstream_response.status}"
-                        )
+        response: Optional[web.StreamResponse] = None
+        expected_bytes: Optional[int] = None
+        is_range = range_header is not None
+        stream_start = time.monotonic()
+        bytes_sent = 0
+        retries = 0
 
-                    # Build response headers
-                    response_headers: Dict[str, str] = {
-                        "Content-Type": track.content_type,
-                        "Accept-Ranges": "bytes",
-                    }
+        while True:
+            upstream_headers = dict(headers)
+            if bytes_sent:
+                upstream_headers["Range"] = f"bytes={request_start + bytes_sent}-"
 
-                    # Forward content headers
-                    expected_bytes: Optional[int] = None
-                    if "Content-Length" in upstream_response.headers:
-                        response_headers["Content-Length"] = upstream_response.headers[
-                            "Content-Length"
-                        ]
-                        cl = upstream_response.headers["Content-Length"]
-                        expected_bytes = int(cl) if cl.isdigit() else None
-                    if "Content-Range" in upstream_response.headers:
-                        response_headers["Content-Range"] = upstream_response.headers[
-                            "Content-Range"
-                        ]
-
-                    logger.debug(f"Streaming track {track.track_id}, headers: {response_headers}")
-
-                    # Create streaming response
-                    response = web.StreamResponse(
-                        status=status,
-                        headers=response_headers,
-                    )
-                    await response.prepare(request)
-
-                    # Stream chunks to client
-                    is_range = range_header is not None
-                    stream_start = time.monotonic()
-                    bytes_sent = 0
-                    async for chunk in upstream_response.content.iter_chunked(STREAM_CHUNK_SIZE):
-                        try:
-                            await response.write(chunk)
-                            bytes_sent += len(chunk)
-                        except (ConnectionResetError, ConnectionError):
-                            self._log_stream_end(
-                                track=track,
-                                bytes_sent=bytes_sent,
-                                expected_bytes=expected_bytes,
-                                elapsed=time.monotonic() - stream_start,
-                                is_range=is_range,
-                                completed=False,
+            try:
+                logger.debug(
+                    f"Connecting to upstream URL for track {track.track_id}: "
+                    f"{track.qobuz_url[:100]}..."
+                )
+                async with ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        track.qobuz_url,
+                        headers=upstream_headers,
+                    ) as upstream_response:
+                        if upstream_response.status not in (200, 206):
+                            logger.warning(
+                                f"Upstream error for track {track.track_id}: "
+                                f"{upstream_response.status}"
                             )
+                            if response is None:
+                                return web.Response(
+                                    status=502,
+                                    text=f"Upstream error: {upstream_response.status}",
+                                )
+                            # Headers already sent — nothing more we can do
                             return response
 
-                    await response.write_eof()
+                        if bytes_sent and upstream_response.status != 206:
+                            # Upstream ignored our resume Range; restarting from
+                            # byte 0 would corrupt the audio stream
+                            logger.error(
+                                f"Upstream ignored resume Range for track {track.track_id}; "
+                                "aborting stream"
+                            )
+                            assert response is not None
+                            return response
+
+                        if response is None:
+                            # First successful connection: send headers to client
+                            status = 206 if upstream_response.status == 206 else 200
+                            response_headers: Dict[str, str] = {
+                                "Content-Type": track.content_type,
+                                "Accept-Ranges": "bytes",
+                            }
+                            if "Content-Length" in upstream_response.headers:
+                                cl = upstream_response.headers["Content-Length"]
+                                response_headers["Content-Length"] = cl
+                                expected_bytes = int(cl) if cl.isdigit() else None
+                            if "Content-Range" in upstream_response.headers:
+                                response_headers["Content-Range"] = upstream_response.headers[
+                                    "Content-Range"
+                                ]
+
+                            logger.debug(
+                                f"Streaming track {track.track_id}, headers: {response_headers}"
+                            )
+                            response = web.StreamResponse(
+                                status=status,
+                                headers=response_headers,
+                            )
+                            await response.prepare(request)
+
+                        # Stream chunks to client
+                        async for chunk in upstream_response.content.iter_chunked(
+                            STREAM_CHUNK_SIZE
+                        ):
+                            try:
+                                await response.write(chunk)
+                                bytes_sent += len(chunk)
+                            except (ConnectionResetError, ConnectionError):
+                                self._log_stream_end(
+                                    track=track,
+                                    bytes_sent=bytes_sent,
+                                    expected_bytes=expected_bytes,
+                                    elapsed=time.monotonic() - stream_start,
+                                    is_range=is_range,
+                                    completed=False,
+                                )
+                                return response
+
+                await response.write_eof()
+                self._log_stream_end(
+                    track=track,
+                    bytes_sent=bytes_sent,
+                    expected_bytes=expected_bytes,
+                    elapsed=time.monotonic() - stream_start,
+                    is_range=is_range,
+                    completed=True,
+                )
+                return response
+
+            except asyncio.CancelledError:
+                logger.debug(f"Stream cancelled for track {track.track_id}")
+                raise
+            except (ClientError, asyncio.TimeoutError) as e:
+                # Upstream-side failure — retry with a Range resume
+                retries += 1
+                if retries > MAX_UPSTREAM_RETRIES:
+                    logger.error(
+                        f"Upstream failed for track {track.track_id} after "
+                        f"{MAX_UPSTREAM_RETRIES} retries: {type(e).__name__}: {e}"
+                    )
+                    if response is None:
+                        return web.Response(status=502, text=f"Upstream error: {e}")
                     self._log_stream_end(
                         track=track,
                         bytes_sent=bytes_sent,
                         expected_bytes=expected_bytes,
                         elapsed=time.monotonic() - stream_start,
                         is_range=is_range,
-                        completed=True,
+                        completed=False,
                     )
                     return response
+                logger.warning(
+                    f"Upstream connection lost for track {track.track_id} after "
+                    f"{bytes_sent} bytes ({type(e).__name__}: {e}); "
+                    f"reconnecting ({retries}/{MAX_UPSTREAM_RETRIES})"
+                )
+                await asyncio.sleep(UPSTREAM_RETRY_DELAY_SECONDS * retries)
+                await self._refresh_track_url(track)
+            except (ConnectionResetError, ConnectionError) as e:
+                # Client disconnected - this is normal when Sonos probes or seeks
+                logger.debug(
+                    f"Client connection closed for track {track.track_id}: {type(e).__name__}"
+                )
+                if response is not None:
+                    return response
+                return web.Response(status=499, text="Client closed connection")
+            except Exception as e:
+                logger.error(f"Proxy error for track {track.track_id}: {type(e).__name__}: {e}")
+                logger.error(f"URL was: {track.qobuz_url[:100]}...")
+                import traceback
 
-        except asyncio.CancelledError:
-            logger.debug(f"Stream cancelled for track {track.track_id}")
-            raise
-        except (ConnectionResetError, ConnectionError) as e:
-            # Client disconnected - this is normal when Sonos probes or seeks
-            logger.debug(f"Client connection closed for track {track.track_id}: {type(e).__name__}")
-            return web.Response(status=499, text="Client closed connection")
+                logger.debug(f"Full traceback: {traceback.format_exc()}")
+                if response is not None:
+                    return response
+                return web.Response(status=502, text=f"Proxy error: {e}")
+
+    async def _refresh_track_url(self, track: RegisteredTrack) -> None:
+        """Fetch a fresh streaming URL before retrying (signed URLs can go stale)."""
+        try:
+            fresh_url = await self._url_provider.get_streaming_url(track.track_id)
+            track.qobuz_url = fresh_url
+            track.url_fetched_at = time.time()
         except Exception as e:
-            logger.error(f"Proxy error for track {track.track_id}: {type(e).__name__}: {e}")
-            logger.error(f"URL was: {track.qobuz_url[:100]}...")
-            import traceback
-
-            logger.debug(f"Full traceback: {traceback.format_exc()}")
-            return web.Response(status=502, text=f"Proxy error: {e}")
+            logger.warning(
+                f"Could not refresh URL for track {track.track_id}: {e}; retrying with old URL"
+            )
 
     def _log_stream_end(
         self,
