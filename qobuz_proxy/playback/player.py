@@ -89,6 +89,7 @@ class QobuzPlayer:
         self._pending_next_track: Optional[dict] = None
         self._gapless_armed: bool = False
         self._transition_generation: int = 0
+        self._gapless_arm_lock: asyncio.Lock = asyncio.Lock()
 
         # Callback for next track info changes (from command handler)
         self._on_next_track_changed_callback: Optional[Callable[[], None]] = None
@@ -892,11 +893,25 @@ class QobuzPlayer:
         self._pending_next_track = None
 
     async def _prepare_next_track_for_gapless(self) -> None:
-        """Prepare the next track for gapless playback on the backend."""
+        """Prepare the next track for gapless playback on the backend.
+
+        Serialized via a lock: overlapping calls (monitor loop racing a
+        re-arm) would each push the next track to the backend, and on Sonos
+        that queues the track twice — making it play twice.
+        """
         if not self.backend.supports_gapless or self._gapless_armed:
             return
 
         if not self._get_next_track_callback:
+            return
+
+        async with self._gapless_arm_lock:
+            await self._prepare_next_track_locked()
+
+    async def _prepare_next_track_locked(self) -> None:
+        """Arm the next track. Caller must hold `_gapless_arm_lock`."""
+        # Re-check after waiting on the lock — a concurrent arm may have won
+        if self._gapless_armed or not self._get_next_track_callback:
             return
 
         next_track_info = self._get_next_track_callback()
@@ -905,6 +920,7 @@ class QobuzPlayer:
 
         track_id = next_track_info["trackId"]
         queue_item_id = next_track_info["queueItemId"]
+        my_generation = self._transition_generation
 
         try:
             # Fetch URL and metadata
@@ -928,6 +944,15 @@ class QobuzPlayer:
             )
 
             success = await self.backend.set_next_track(url, backend_meta, queue_item_id)
+
+            # State changed while arming (skip, stop, queue edit) — the arm
+            # is stale; undo it on the backend instead of marking it armed
+            if my_generation != self._transition_generation:
+                logger.debug(f"Gapless: discarding stale arm for track {track_id}")
+                if success:
+                    await self.backend.clear_next_track()
+                return
+
             if success:
                 self._pending_next_track = {
                     "trackId": track_id,
@@ -1006,19 +1031,35 @@ class QobuzPlayer:
         # Try to arm the next next track
         await self._prepare_next_track_for_gapless()
 
-    async def _on_next_track_info_changed(self) -> None:
+    async def on_next_track_info_changed(self) -> None:
         """Called when command handler reports the next track info has changed."""
+        new_info = self._get_next_track_callback() if self._get_next_track_callback else None
+
+        # The server resends the same next track in bursts — if it's already
+        # armed, re-arming would queue a duplicate on the backend
+        pending = self._pending_next_track
+        if (
+            self._gapless_armed
+            and new_info is not None
+            and pending is not None
+            and new_info["trackId"] == pending["trackId"]
+            and new_info["queueItemId"] == pending["queueItemId"]
+        ):
+            logger.debug("Gapless: next track unchanged, keeping current arming")
+            return
+
         logger.debug("Gapless: next track info changed, re-arming")
 
-        # Clear current gapless arming
-        self._transition_generation += 1
-        self._gapless_armed = False
-        self._pending_next_track = None
-        await self.backend.clear_next_track()
+        async with self._gapless_arm_lock:
+            # Clear current gapless arming
+            self._transition_generation += 1
+            self._gapless_armed = False
+            self._pending_next_track = None
+            await self.backend.clear_next_track()
 
-        # Re-arm with new track if playing
-        if self._state == PlaybackState.PLAYING:
-            await self._prepare_next_track_for_gapless()
+            # Re-arm with new track if playing
+            if self._state == PlaybackState.PLAYING:
+                await self._prepare_next_track_locked()
 
     # =========================================================================
     # Background Tasks

@@ -96,6 +96,7 @@ class DLNABackend(AudioBackend):
         # Gapless playback state
         self._next_track_proxy_url: Optional[str] = None
         self._next_track_metadata: Optional[BackendTrackMetadata] = None
+        self._next_track_queue_nr: Optional[int] = None  # Sonos queue position of armed track
         self._gapless_supported: bool = True
         self._current_proxy_url: Optional[str] = None
 
@@ -215,8 +216,10 @@ class DLNABackend(AudioBackend):
             raise RuntimeError("Not connected")
 
         # Clear gapless state — explicit play invalidates armed next track
+        # (no queue removal needed: Sonos play clears the whole queue)
         self._next_track_proxy_url = None
         self._next_track_metadata = None
+        self._next_track_queue_nr = None
 
         self._current_metadata = metadata
         self._duration_ms = metadata.duration_ms
@@ -296,6 +299,7 @@ class DLNABackend(AudioBackend):
         # Clear gapless state
         self._next_track_proxy_url = None
         self._next_track_metadata = None
+        self._next_track_queue_nr = None
 
         if self._client and await self._client.stop():
             self._position_ms = 0
@@ -455,9 +459,16 @@ class DLNABackend(AudioBackend):
 
         # Send to device — Sonos uses queue, others use SetNextAVTransportURI
         if self._is_sonos:
-            if await self._client.add_uri_to_queue(actual_url, didl):
+            # Already armed with this URL — appending again would queue a
+            # duplicate entry and make the song play twice
+            if self._next_track_proxy_url == actual_url and self._next_track_queue_nr is not None:
+                logger.debug("Gapless: next track already armed, skipping duplicate")
+                return True
+            queue_nr = await self._client.add_uri_to_queue(actual_url, didl)
+            if queue_nr is not None:
                 self._next_track_proxy_url = actual_url
                 self._next_track_metadata = metadata
+                self._next_track_queue_nr = queue_nr
                 logger.info(f"Gapless: armed next track: {metadata.artist} - {metadata.title}")
                 return True
             logger.warning("Gapless: failed to add next track to queue")
@@ -485,9 +496,16 @@ class DLNABackend(AudioBackend):
         return False
 
     async def clear_next_track(self) -> None:
-        """Clear prepared next track."""
+        """Clear prepared next track.
+
+        On Sonos the armed track was appended to the device queue, so it must
+        be removed there too — otherwise it still plays after the current track.
+        """
+        if self._is_sonos and self._client and self._next_track_queue_nr is not None:
+            await self._client.remove_track_from_queue(self._next_track_queue_nr)
         self._next_track_proxy_url = None
         self._next_track_metadata = None
+        self._next_track_queue_nr = None
 
     # =========================================================================
     # Internal
@@ -532,9 +550,11 @@ class DLNABackend(AudioBackend):
                             self._duration_ms = self._next_track_metadata.duration_ms
                         self._position_ms = 0
                         self._playback_started_at = time.monotonic()
-                        # Clear gapless state
+                        # Clear gapless state — the armed entry is now the
+                        # playing one, so don't remove it from the queue
                         self._next_track_proxy_url = None
                         self._next_track_metadata = None
+                        self._next_track_queue_nr = None
                         # Notify player
                         self._notify_next_track_started()
                         self._notify_position_update(0)

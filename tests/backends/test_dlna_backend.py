@@ -82,3 +82,55 @@ class TestBuildDidl:
         assert "Test Track" in didl
         assert "Test Artist" in didl
         assert "Test Album" in didl
+
+
+class TestSonosGaplessQueue:
+    """Sonos gapless arming appends to the device queue — duplicates replay the song."""
+
+    def _make_sonos_backend(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = DLNABackend("10.0.0.5")
+        backend._is_sonos = True
+        backend._gapless_supported = True
+        client = MagicMock()
+        client.add_uri_to_queue = AsyncMock(return_value=7)
+        client.remove_track_from_queue = AsyncMock(return_value=True)
+        backend._client = client
+        return backend, client
+
+    async def test_set_next_track_stores_queue_position(self):
+        backend, client = self._make_sonos_backend()
+        meta = _make_metadata(track_id="222")
+
+        assert await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+
+        client.add_uri_to_queue.assert_awaited_once()
+        assert backend._next_track_queue_nr == 7
+
+    async def test_set_next_track_skips_duplicate_url(self):
+        backend, client = self._make_sonos_backend()
+        meta = _make_metadata(track_id="222")
+
+        assert await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+        assert await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+
+        client.add_uri_to_queue.assert_awaited_once()
+
+    async def test_clear_next_track_removes_queued_entry(self):
+        backend, client = self._make_sonos_backend()
+        meta = _make_metadata(track_id="222")
+        await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+
+        await backend.clear_next_track()
+
+        client.remove_track_from_queue.assert_awaited_once_with(7)
+        assert backend._next_track_queue_nr is None
+        assert backend._next_track_proxy_url is None
+
+    async def test_clear_next_track_without_armed_entry_is_noop(self):
+        backend, client = self._make_sonos_backend()
+
+        await backend.clear_next_track()
+
+        client.remove_track_from_queue.assert_not_called()

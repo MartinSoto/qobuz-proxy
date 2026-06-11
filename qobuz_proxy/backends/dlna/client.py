@@ -470,13 +470,47 @@ class DLNAClient:
             is not None
         )
 
-    async def add_uri_to_queue(self, url: str, metadata: str = "") -> bool:
+    async def add_uri_to_queue(self, url: str, metadata: str = "") -> Optional[int]:
         """
         Add a URI to the device playback queue.
 
         Args:
             url: Audio URL to enqueue
             metadata: DIDL-Lite metadata XML
+
+        Returns:
+            1-based queue position of the enqueued track, or None on failure
+        """
+        if not self.device_info:
+            return None
+
+        response = await self._soap_action(
+            self.device_info.av_transport_url,
+            UPNP_AV_TRANSPORT,
+            "AddURIToQueue",
+            {
+                "InstanceID": "0",
+                "EnqueuedURI": url,
+                "EnqueuedURIMetaData": metadata,
+                "DesiredFirstTrackNumberEnqueued": "0",
+                "EnqueueAsNext": "1",
+            },
+        )
+        if response is None:
+            return None
+
+        track_nr = self._parse_xml_value(response, "FirstTrackNumberEnqueued")
+        try:
+            return int(track_nr) if track_nr else None
+        except ValueError:
+            return None
+
+    async def remove_track_from_queue(self, track_nr: int) -> bool:
+        """
+        Remove a track from the device playback queue.
+
+        Args:
+            track_nr: 1-based queue position to remove
 
         Returns:
             True if successful
@@ -488,13 +522,11 @@ class DLNAClient:
             await self._soap_action(
                 self.device_info.av_transport_url,
                 UPNP_AV_TRANSPORT,
-                "AddURIToQueue",
+                "RemoveTrackFromQueue",
                 {
                     "InstanceID": "0",
-                    "EnqueuedURI": url,
-                    "EnqueuedURIMetaData": metadata,
-                    "DesiredFirstTrackNumberEnqueued": "0",
-                    "EnqueueAsNext": "1",
+                    "ObjectID": f"Q:0/{track_nr}",
+                    "UpdateID": "0",
                 },
             )
             is not None

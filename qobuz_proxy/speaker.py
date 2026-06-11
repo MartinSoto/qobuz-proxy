@@ -404,6 +404,13 @@ class Speaker:
                     clear_callback=self._playback_handler.clear_next_track_info,
                 )
 
+                # Re-arm gapless when the app changes the next queue item mid-track
+                # (e.g. "play next" insertions), otherwise the stale armed track
+                # plays and the inserted track is skipped.
+                self._playback_handler.set_on_next_track_changed(
+                    self._player.on_next_track_info_changed
+                )
+
                 # Register all message-type handlers
                 for msg_type in self._queue_handler.get_message_types():
                     self._ws_manager.register_handler(

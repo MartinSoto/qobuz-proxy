@@ -343,6 +343,40 @@ class TestSpeakerLifecycle:
 
 
 class TestSpeakerWebSocket:
+    async def test_setup_websocket_wires_gapless_rearm_callback(self):
+        """Queue edits mid-track must re-arm gapless via the command handler callback."""
+        config = _make_speaker_config()
+        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker._queue = MagicMock()
+        player = MagicMock()
+        player.start = AsyncMock()
+        player.get_volume = AsyncMock(return_value=50)
+        player.on_next_track_info_changed = AsyncMock()
+        speaker._player = player
+
+        tokens = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(
+                jwt="jwt",
+                exp=9999999999,
+                endpoint="wss://test.qobuz.com/ws",
+            ),
+        )
+
+        with (
+            patch("qobuz_proxy.speaker.WsManager") as mock_ws_cls,
+            patch("qobuz_proxy.speaker.StateReporter") as mock_sr_cls,
+        ):
+            mock_ws = mock_ws_cls.return_value
+            mock_ws.start = AsyncMock()
+            mock_ws.send_volume_changed = AsyncMock()
+            mock_sr_cls.return_value.start = AsyncMock()
+
+            await speaker._setup_websocket(tokens)
+
+        assert speaker._playback_handler is not None
+        assert speaker._playback_handler._on_next_track_changed is player.on_next_track_info_changed
+
     async def test_setup_websocket_refreshes_existing_manager(self):
         """If ws_manager already exists, _setup_websocket should only refresh tokens."""
         config = _make_speaker_config()
