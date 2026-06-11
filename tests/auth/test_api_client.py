@@ -1,6 +1,5 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import aiohttp
 
 from qobuz_proxy.auth.api_client import QobuzAPIClient
 

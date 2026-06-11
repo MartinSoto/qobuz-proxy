@@ -13,14 +13,15 @@ from pathlib import Path
 from typing import Any
 
 from qobuz_proxy import __commit__, __version__
+from qobuz_proxy.config import Config, ConfigError, load_config, AUTO_QUALITY
+from qobuz_proxy.app import QobuzProxy
+from qobuz_proxy.backends import BackendNotFoundError
 
 
 def _version_string() -> str:
     """Format version string with optional commit suffix."""
     return f"v{__version__} ({__commit__})" if __commit__ else f"v{__version__}"
-from qobuz_proxy.config import Config, ConfigError, load_config, AUTO_QUALITY
-from qobuz_proxy.app import QobuzProxy
-from qobuz_proxy.backends import BackendNotFoundError
+
 
 logger = logging.getLogger(__name__)
 

@@ -44,8 +44,10 @@ def _detect_commit() -> str:
 
 __commit__ = _detect_commit()
 
-from .app import QobuzProxy
-from .config import Config, load_config, ConfigError
+# These imports must stay below __version__/__commit__: app.py imports them
+# back from this package at module level.
+from .app import QobuzProxy  # noqa: E402
+from .config import Config, load_config, ConfigError  # noqa: E402
 
 __all__ = [
     "__version__",

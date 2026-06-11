@@ -84,7 +84,9 @@ class QobuzAPIClient:
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
-                        logger.warning(f"Login validation failed: HTTP {resp.status} — {body[:200]}")
+                        logger.warning(
+                            f"Login validation failed: HTTP {resp.status} — {body[:200]}"
+                        )
                         return False
                     response = await resp.json()
 
