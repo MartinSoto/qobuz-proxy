@@ -136,7 +136,6 @@
         var html = '<div class="speaker-actions">';
         var idArg = escapeAttr(JSON.stringify(s.id));
         html += '<button onclick="editSpeaker(' + idArg + ')">Edit</button>';
-        html += '<button onclick="removeSpeaker(' + idArg + ')" style="color:#ef9a9a;">Remove</button>';
         html += '</div>';
         return html;
     }
@@ -262,6 +261,7 @@
         html += '<div class="button-group">';
         html += '<button id="edit-speaker-submit" onclick="submitEditSpeaker(' + escapeAttr(JSON.stringify(s.id)) + ', ' + escapeAttr(JSON.stringify(s.backend)) + ')">Save</button>';
         html += '<button class="button-secondary" onclick="cancelEdit()">Cancel</button>';
+        html += '<button class="button-danger" style="margin-left:auto;" onclick="removeSpeaker(' + escapeAttr(JSON.stringify(s.id)) + ')">Remove</button>';
         html += '</div>';
 
         html += '</div>';
@@ -748,6 +748,7 @@
                 }
             })
             .then(function () {
+                editingSpeakerId = null;
                 lastSpeakersJson = null;
                 fetchStatus();
             })
