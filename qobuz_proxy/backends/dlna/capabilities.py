@@ -56,6 +56,10 @@ class DLNACapabilities:
     supports_mp3: bool = True  # Assume baseline MP3 support
     max_sample_rate: int = 44100
     max_bit_depth: int = 16
+    # True when a FLAC entry carried explicit rate/depth info (DLNA profile or
+    # parameter tokens). False means max_sample_rate/max_bit_depth are just our
+    # conservative defaults — the device never said what it supports.
+    format_info_confirmed: bool = False
 
     @property
     def max_quality(self) -> int:
@@ -176,6 +180,8 @@ def parse_protocol_info_sink(sink: str) -> DLNACapabilities:
             caps.supports_flac = True
             caps.max_sample_rate = max(caps.max_sample_rate, sr or 44100)
             caps.max_bit_depth = max(caps.max_bit_depth, bd or 16)
+            if sr or bd:
+                caps.format_info_confirmed = True
         elif mime in MP3_MIME_TYPES:
             caps.supports_mp3 = True
 
@@ -204,8 +210,14 @@ def parse_protocol_info_sink(sink: str) -> DLNACapabilities:
     logger.info(
         f"Parsed capabilities: FLAC={caps.supports_flac}, "
         f"max_sr={caps.max_sample_rate}Hz, max_bd={caps.max_bit_depth}bit, "
-        f"quality={caps.max_quality}"
+        f"quality={caps.max_quality}, confirmed={caps.format_info_confirmed}"
     )
+    if caps.supports_flac and not caps.format_info_confirmed:
+        logger.info(
+            "Device advertises FLAC but does not report supported sample rates "
+            "or bit depths; assuming CD quality (16/44). Set max_quality "
+            "manually if the device supports hi-res."
+        )
     return caps
 
 

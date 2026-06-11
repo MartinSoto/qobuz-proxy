@@ -66,3 +66,35 @@ class TestMp3Aliases:
     def test_audio_mp3_alias_detected(self) -> None:
         caps = parse_protocol_info_sink(_entry("audio/mp3"))
         assert caps.supports_mp3 is True
+
+
+class TestFormatInfoConfirmed:
+    """Distinguish explicit rate/depth info from defaulted CD assumptions."""
+
+    def test_bare_flac_entry_is_not_confirmed(self) -> None:
+        """gmediarender-style Sink: FLAC with no params means 16/44 is a guess."""
+        caps = parse_protocol_info_sink(_entry("audio/x-flac"))
+        assert caps.format_info_confirmed is False
+
+    def test_l16_rate_does_not_confirm_flac_capabilities(self) -> None:
+        """An explicit L16 rate says nothing about the device's FLAC limits."""
+        sink = ",".join(
+            [
+                "http-get:*:audio/L16;rate=44100;channels=2:*",
+                _entry("audio/x-flac"),
+            ]
+        )
+        caps = parse_protocol_info_sink(sink)
+        assert caps.format_info_confirmed is False
+
+    def test_dlna_profile_confirms(self) -> None:
+        sink = "http-get:*:audio/flac:DLNA.ORG_PN=FLAC_192;DLNA.ORG_OP=01"
+        caps = parse_protocol_info_sink(sink)
+        assert caps.format_info_confirmed is True
+        assert caps.max_quality == 27
+
+    def test_explicit_tokens_confirm(self) -> None:
+        sink = "http-get:*:audio/flac:sampleRate=96000;bitsPerSample=24"
+        caps = parse_protocol_info_sink(sink)
+        assert caps.format_info_confirmed is True
+        assert caps.max_quality == 7

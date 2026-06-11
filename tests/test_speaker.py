@@ -514,3 +514,67 @@ class TestSpeakerStateReport:
         report = MagicMock()
         # Should not raise
         await speaker._send_state_report(report)
+
+
+class TestQualitySourceStatus:
+    """get_status() must say where the effective quality came from."""
+
+    @staticmethod
+    async def _start_auto_speaker(recommended, confirmed):
+        from qobuz_proxy.backends.dlna import DLNABackend
+
+        config = _make_speaker_config(max_quality=AUTO_QUALITY)
+        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+
+        mock_backend = MagicMock(spec=DLNABackend)
+        mock_backend.name = "Mock DLNA"
+        mock_backend.get_recommended_quality.return_value = recommended
+        mock_backend.quality_detection_confirmed = confirmed
+
+        mock_proxy = MagicMock()
+        mock_proxy.start = AsyncMock()
+
+        with (
+            patch(
+                "qobuz_proxy.speaker.BackendFactory.create_from_config",
+                new_callable=AsyncMock,
+                return_value=mock_backend,
+            ),
+            patch("qobuz_proxy.speaker.AudioProxyServer", return_value=mock_proxy),
+            patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc_cls,
+        ):
+            mock_disc_cls.return_value.start = AsyncMock()
+            await speaker.start()
+        return speaker
+
+    async def test_confirmed_auto_detection(self):
+        speaker = await self._start_auto_speaker(recommended=7, confirmed=True)
+        cfg = speaker.get_status()["config"]
+
+        assert cfg["max_quality"] == "auto"
+        assert cfg["effective_quality"] == 7
+        assert cfg["quality_source"] == "auto"
+
+    async def test_unconfirmed_auto_detection_is_fallback(self):
+        """gmediarender-style device: quality is a guess, the UI must say so."""
+        speaker = await self._start_auto_speaker(recommended=6, confirmed=False)
+        cfg = speaker.get_status()["config"]
+
+        assert cfg["max_quality"] == "auto"
+        assert cfg["effective_quality"] == 6
+        assert cfg["quality_source"] == "auto_fallback"
+
+    async def test_no_recommendation_is_fallback(self):
+        speaker = await self._start_auto_speaker(recommended=None, confirmed=False)
+        cfg = speaker.get_status()["config"]
+
+        assert cfg["quality_source"] == "auto_fallback"
+
+    def test_manual_quality(self):
+        config = _make_speaker_config(max_quality=27)
+        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        cfg = speaker.get_status()["config"]
+
+        assert cfg["max_quality"] == 27
+        assert cfg["effective_quality"] == 27
+        assert cfg["quality_source"] == "manual"

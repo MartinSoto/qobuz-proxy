@@ -84,6 +84,30 @@ class TestBuildDidl:
         assert "Test Album" in didl
 
 
+class TestQualityDetectionConfirmed:
+    """Backend exposes whether auto-detected quality came from explicit device info."""
+
+    def test_unconfirmed_without_capabilities(self):
+        from qobuz_proxy.backends.dlna.backend import DLNABackend
+
+        backend = DLNABackend("192.168.1.10")
+        assert backend.quality_detection_confirmed is False
+
+    def test_follows_capabilities_flag(self):
+        from qobuz_proxy.backends.dlna.backend import DLNABackend
+        from qobuz_proxy.backends.dlna.capabilities import parse_protocol_info_sink
+
+        backend = DLNABackend("192.168.1.10")
+
+        backend._capabilities = parse_protocol_info_sink(
+            "http-get:*:audio/flac:DLNA.ORG_PN=FLAC_192;DLNA.ORG_OP=01"
+        )
+        assert backend.quality_detection_confirmed is True
+
+        backend._capabilities = parse_protocol_info_sink("http-get:*:audio/x-flac:*")
+        assert backend.quality_detection_confirmed is False
+
+
 class TestSonosGaplessQueue:
     """Sonos gapless arming appends to the device queue — duplicates replay the song."""
 

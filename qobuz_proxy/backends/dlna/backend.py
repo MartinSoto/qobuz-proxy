@@ -421,6 +421,15 @@ class DLNABackend(AudioBackend):
             return self._capabilities.max_quality
         return None
 
+    @property
+    def quality_detection_confirmed(self) -> bool:
+        """Whether the recommended quality came from explicit device format info.
+
+        False means the device advertised FLAC without stating sample rates or
+        bit depths, so the recommendation is just a conservative CD default.
+        """
+        return self._capabilities is not None and self._capabilities.format_info_confirmed
+
     # =========================================================================
     # Gapless Playback
     # =========================================================================

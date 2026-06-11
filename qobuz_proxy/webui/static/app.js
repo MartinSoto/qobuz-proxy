@@ -194,8 +194,20 @@
             } else if (s.backend === "local" && cfg.audio_device) {
                 idleParts.push(escapeHtml(cfg.audio_device));
             }
+            if (cfg.effective_quality) {
+                var qText = qualityLabel(cfg.effective_quality);
+                if (cfg.max_quality === "auto") {
+                    qText += " (auto)";
+                }
+                idleParts.push(escapeHtml(qText));
+            }
             if (idleParts.length) {
                 html += '<div class="speaker-idle-info">' + idleParts.join(' · ') + '</div>';
+            }
+            if (cfg.quality_source === "auto_fallback" && state !== "disconnected") {
+                html += '<div class="speaker-idle-info" style="color:#e0a030;">' +
+                    'Couldn\'t detect this device\'s hi-res support. ' +
+                    'Pick a quality in Edit if it supports better than CD.</div>';
             }
 
             html += '</div>'; // flex child
@@ -239,7 +251,12 @@
 
         html += '<div class="form-group">';
         html += '<label>Max Quality</label>';
-        html += '<select id="edit-quality">' + qualityOptions(s.max_quality || "auto") + '</select>';
+        html += '<select id="edit-quality">' + qualityOptions(cfg.max_quality || "auto") + '</select>';
+        if (cfg.quality_source === "auto_fallback") {
+            html += '<div class="muted" style="font-size:12px;margin-top:4px;color:#e0a030;">' +
+                'This device doesn\'t report its hi-res support, so Auto uses CD (16/44). ' +
+                'Pick a quality if it supports better than CD.</div>';
+        }
         html += '</div>';
 
         html += '<div class="button-group">';

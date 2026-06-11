@@ -79,6 +79,11 @@ class Speaker:
 
         # Effective quality (may differ from config when AUTO_QUALITY is resolved)
         self._effective_quality: int = config.max_quality
+        # Where the effective quality came from: "manual", "auto" (detected from
+        # the device), or "auto_fallback" (device never said — conservative CD)
+        self._quality_source: str = (
+            "manual" if config.max_quality != AUTO_QUALITY else "auto_fallback"
+        )
 
         # Component slots — populated during start()
         self._discovery: Optional[DiscoveryService] = None
@@ -133,7 +138,13 @@ class Speaker:
             }
 
         # Build config section
-        config_dict: dict = {"max_quality": self._effective_quality}
+        config_dict: dict = {
+            "max_quality": (
+                "auto" if self._config.max_quality == AUTO_QUALITY else self._config.max_quality
+            ),
+            "effective_quality": self._effective_quality,
+            "quality_source": self._quality_source,
+        }
         if self._config.backend_type == "dlna":
             config_dict["dlna_ip"] = self._config.dlna_ip
             config_dict["dlna_port"] = self._config.dlna_port
@@ -223,12 +234,23 @@ class Speaker:
                             7: "Hi-Res (24/96)",
                             27: "Hi-Res (24/192)",
                         }
-                        logger.info(
-                            f"[{self.name}] Auto-detected max quality: "
-                            f"{quality_names.get(self._effective_quality, self._effective_quality)}"
-                        )
+                        if backend.quality_detection_confirmed:
+                            self._quality_source = "auto"
+                            logger.info(
+                                f"[{self.name}] Auto-detected max quality: "
+                                f"{quality_names.get(self._effective_quality, self._effective_quality)}"
+                            )
+                        else:
+                            self._quality_source = "auto_fallback"
+                            logger.info(
+                                f"[{self.name}] Device did not report its supported "
+                                f"formats; using conservative quality: "
+                                f"{quality_names.get(self._effective_quality, self._effective_quality)}. "
+                                f"Set max_quality manually if the device supports hi-res."
+                            )
                     else:
                         self._effective_quality = AUTO_FALLBACK_QUALITY
+                        self._quality_source = "auto_fallback"
                         logger.info(
                             f"[{self.name}] Capability discovery unavailable, "
                             f"using fallback quality: CD (FLAC 16/44)"
@@ -236,6 +258,7 @@ class Speaker:
                 else:
                     # Local backend: default to Hi-Res 192k
                     self._effective_quality = 27
+                    self._quality_source = "auto"
                     logger.info(f"[{self.name}] Local backend, using max quality: Hi-Res (24/192)")
 
             # 4. Create metadata service
