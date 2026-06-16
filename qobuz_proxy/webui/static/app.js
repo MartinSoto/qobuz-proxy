@@ -28,12 +28,30 @@
     }
 
     function startLogin() {
-        var origin = window.location.origin;
-        window.location.href = "/auth/login?origin=" + encodeURIComponent(origin);
+        // Use the document base (honors HA ingress <base href>) so the OAuth
+        // callback returns to this exact UI, prefix and all. Strip the trailing
+        // slash so the server can append "/auth/callback".
+        var base = document.baseURI.replace(/\/$/, "");
+        var url = "auth/login?origin=" + encodeURIComponent(base);
+        // Behind Home Assistant ingress the UI runs in an iframe. Qobuz (and the
+        // third-party providers on its sign-in page, e.g. Google) refuse to be
+        // framed, AND the OAuth callback can't return through ingress (HA's
+        // ingress_session cookie isn't sent on the cross-site return from Qobuz,
+        // so the callback 401s). So run login against the add-on's DIRECT port
+        // in a new top-level tab — host networking exposes it and /data (the
+        // saved token) is shared with this panel, which flips to "connected" via
+        // the /api/status poll once login completes.
+        if (window.self !== window.top) {
+            var port = window.QOBUZ_DIRECT_PORT || "8689";
+            var direct = window.location.protocol + "//" + window.location.hostname + ":" + port;
+            window.open(direct + "/auth/login?origin=" + encodeURIComponent(direct), "_blank");
+        } else {
+            window.location.href = url;
+        }
     }
 
     function logout() {
-        fetch("/api/auth/logout", { method: "POST" })
+        fetch("api/auth/logout", { method: "POST" })
             .then(function () {
                 showAuthState("disconnected");
                 lastSpeakersJson = null;
@@ -410,7 +428,7 @@
         }
         if (rescanBtn) rescanBtn.disabled = true;
 
-        fetch("/api/discover/dlna", {
+        fetch("api/discover/dlna", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ timeout: 5 }),
@@ -453,7 +471,7 @@
     }
 
     function startAudioDeviceDiscovery() {
-        fetch("/api/discover/audio-devices")
+        fetch("api/discover/audio-devices")
             .then(function (r) {
                 if (r.status === 404) throw new Error("not_supported");
                 return r.json();
@@ -628,7 +646,7 @@
             submitBtn.textContent = "Adding…";
         }
 
-        fetch("/api/speakers", {
+        fetch("api/speakers", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
@@ -706,7 +724,7 @@
             submitBtn.textContent = "Saving…";
         }
 
-        fetch("/api/speakers/" + encodeURIComponent(id), {
+        fetch("api/speakers/" + encodeURIComponent(id), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
@@ -741,7 +759,7 @@
     function removeSpeaker(id) {
         if (!confirm("Remove this speaker?")) return;
 
-        fetch("/api/speakers/" + encodeURIComponent(id), { method: "DELETE" })
+        fetch("api/speakers/" + encodeURIComponent(id), { method: "DELETE" })
             .then(function (r) {
                 if (!r.ok) {
                     return r.json().then(function (d) { throw new Error(d.error || "Failed to remove speaker"); });
@@ -776,7 +794,7 @@
     // -------------------------------------------------------------------------
 
     function fetchStatus() {
-        fetch("/api/status")
+        fetch("api/status")
             .then(function (response) {
                 if (!response.ok) throw new Error("HTTP " + response.status);
                 return response.json();

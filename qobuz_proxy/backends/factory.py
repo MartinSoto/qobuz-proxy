@@ -66,7 +66,7 @@ class BackendFactory:
         if not backend_class:
             available = BackendRegistry.available_types()
             raise BackendNotFoundError(
-                f"Backend type '{backend_type}' not available. " f"Available types: {available}"
+                f"Backend type '{backend_type}' not available. Available types: {available}"
             )
 
         # Dispatch to type-specific factory method

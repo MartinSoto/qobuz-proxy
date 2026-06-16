@@ -323,8 +323,7 @@ class MetadataService:
         """
         quality_name = AudioQuality.get_name(metadata.actual_quality)
         logger.info(
-            f"Now playing: {metadata.artist} - {metadata.title} "
-            f"[{metadata.album}] ({quality_name})"
+            f"Now playing: {metadata.artist} - {metadata.title} [{metadata.album}] ({quality_name})"
         )
 
     def log_now_playing_info(
@@ -341,6 +340,5 @@ class MetadataService:
             actual_quality if actual_quality is not None else self._max_quality
         )
         logger.info(
-            f"Now playing: {metadata.artist} - {metadata.title} "
-            f"[{metadata.album}] ({quality_name})"
+            f"Now playing: {metadata.artist} - {metadata.title} [{metadata.album}] ({quality_name})"
         )

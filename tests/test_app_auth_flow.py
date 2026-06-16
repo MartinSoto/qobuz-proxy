@@ -36,7 +36,9 @@ class TestStartupWithoutToken:
     async def test_web_server_starts(self):
         config = _make_config()
         app = QobuzProxy(config)
-        with (patch("qobuz_proxy.app.load_user_token", return_value=None),):
+        with (
+            patch("qobuz_proxy.app.load_user_token", return_value=None),
+        ):
             try:
                 await app.start()
                 assert app._web_app is not None
@@ -46,7 +48,9 @@ class TestStartupWithoutToken:
     async def test_auth_state_is_unauthenticated(self):
         config = _make_config()
         app = QobuzProxy(config)
-        with (patch("qobuz_proxy.app.load_user_token", return_value=None),):
+        with (
+            patch("qobuz_proxy.app.load_user_token", return_value=None),
+        ):
             try:
                 await app.start()
                 assert app._auth_state["authenticated"] is False

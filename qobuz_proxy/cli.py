@@ -25,6 +25,7 @@ def _version_string() -> str:
 
 logger = logging.getLogger(__name__)
 
+
 # Exit codes
 EXIT_SUCCESS = 0
 EXIT_CONFIG_ERROR = 1

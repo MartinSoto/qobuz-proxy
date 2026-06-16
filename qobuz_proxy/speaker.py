@@ -309,8 +309,7 @@ class Speaker:
 
             self._is_running = True
             logger.info(
-                f"[{self.name}] Ready — device '{self._config.name}' "
-                f"is now visible in Qobuz app"
+                f"[{self.name}] Ready — device '{self._config.name}' is now visible in Qobuz app"
             )
             return True
 

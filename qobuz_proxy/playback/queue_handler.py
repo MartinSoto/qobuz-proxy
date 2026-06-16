@@ -133,7 +133,7 @@ class QueueHandler:
             await self.queue.set_shuffle(enabled=True, pivot_item_id=pivot_id)
 
         logger.info(
-            f"Queue loaded: {len(tracks)} tracks, version {version}, " f"position {queue_position}"
+            f"Queue loaded: {len(tracks)} tracks, version {version}, position {queue_position}"
         )
 
     async def handle_set_state(

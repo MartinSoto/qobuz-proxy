@@ -117,9 +117,7 @@ class LocalAudioBackend(AudioBackend):
         if audio_data.ndim == 1:
             audio_data = audio_data.reshape(-1, 1)
 
-        logger.debug(
-            f"Decoded: {len(audio_data)} frames, {audio_data.shape[1]}ch, " f"{sample_rate}Hz"
-        )
+        logger.debug(f"Decoded: {len(audio_data)} frames, {audio_data.shape[1]}ch, {sample_rate}Hz")
         return audio_data, sample_rate
 
     async def _feeding_loop(self) -> None:

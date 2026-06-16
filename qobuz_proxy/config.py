@@ -221,8 +221,7 @@ def validate_config(config: Config) -> None:
     # Logging
     if config.logging.level.lower() not in VALID_LOG_LEVELS:
         errors.append(
-            f"Invalid log level: {config.logging.level}. "
-            f"Valid values: {sorted(VALID_LOG_LEVELS)}"
+            f"Invalid log level: {config.logging.level}. Valid values: {sorted(VALID_LOG_LEVELS)}"
         )
 
     if errors:

@@ -499,8 +499,7 @@ class DLNABackend(AudioBackend):
             )
         else:
             logger.warning(
-                "Gapless: failed to arm next track (transient error), "
-                "will retry on next poll cycle"
+                "Gapless: failed to arm next track (transient error), will retry on next poll cycle"
             )
         return False
 

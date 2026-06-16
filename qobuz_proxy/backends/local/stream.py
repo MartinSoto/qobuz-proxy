@@ -66,7 +66,7 @@ class AudioOutputStream:
             callback=self._audio_callback,
         )
         logger.debug(
-            f"Audio stream opened: {sample_rate}Hz, {channels}ch, " f"blocksize={self._blocksize}"
+            f"Audio stream opened: {sample_rate}Hz, {channels}ch, blocksize={self._blocksize}"
         )
 
     def start(self) -> None:

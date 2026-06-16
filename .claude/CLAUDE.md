@@ -8,29 +8,30 @@ QobuzProxy is a headless Qobuz music player that appears as a Qobuz Connect devi
 
 ## Commands
 
+This project uses **[uv](https://docs.astral.sh/uv/)** to manage the local environment (`.venv` + `uv.lock`). Do not use `pip`/`venv` directly.
+
 ```bash
 # Setup
-python3 -m venv venv && source venv/bin/activate
-pip install -e ".[dev]"
-pip install -e ".[dev,local]"              # Include local audio backend (sounddevice, numpy, soundfile)
+uv sync                                     # Create .venv, install runtime deps + dev group (default), write uv.lock
+uv sync --all-extras                        # Also install the local audio backend extra (sounddevice, numpy, soundfile)
 
-# Run
-python3 -m qobuz_proxy
-qobuz-proxy --config config.yaml           # Then visit http://localhost:8689 to log in
-qobuz-proxy --discover                    # Find DLNA renderers
+# Run (uv run executes inside .venv — no manual activation needed)
+uv run python -m qobuz_proxy
+uv run qobuz-proxy --config config.yaml    # Then visit http://localhost:8689 to log in
+uv run qobuz-proxy --discover              # Find DLNA renderers
 
 # Test
-pytest                                     # All tests
-pytest tests/connect/test_protocol.py      # Single file
-pytest tests/connect/test_protocol.py::TestProtocol::test_method  # Single test
+uv run pytest                              # All tests
+uv run pytest tests/connect/test_protocol.py      # Single file
+uv run pytest tests/connect/test_protocol.py::TestProtocol::test_method  # Single test
 
 # Code quality
-black qobuz_proxy/ tests/                 # Format (100 char line length)
-ruff check qobuz_proxy/ tests/            # Lint
-mypy qobuz_proxy/                         # Type check (strict)
+uv run ruff format qobuz_proxy/ tests/     # Format (100 char line length)
+uv run ruff check qobuz_proxy/ tests/      # Lint
+uv run mypy qobuz_proxy/                    # Type check (strict)
 ```
 
-**Always use `python3`**, never bare `python`.
+Run Python via `uv run` (or `uv run python`), never bare `python`/`python3` and never `pip install`. Add/remove dependencies with `uv add` / `uv remove` so `pyproject.toml` and `uv.lock` stay in sync.
 
 ## Protocol Buffer Compilation
 
@@ -81,7 +82,7 @@ Key env vars: `QOBUZ_AUTH_TOKEN`, `QOBUZ_USER_ID`, `QOBUZ_MAX_QUALITY`, `QOBUZPR
 
 ## Code Style
 
-- **Black** with 100 char line length, **Ruff** for linting, **mypy** strict
+- **Ruff** for both formatting (`ruff format`) and linting, 100 char line length, **mypy** strict
 - Type hints required on all public functions, Google-style docstrings only for non-obvious APIs
 - All I/O is async. No blocking calls in main event loop
 - Never log passwords or auth tokens

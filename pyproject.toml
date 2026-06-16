@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qobuz-proxy"
-version = "1.3.8"
+version = "1.3.9"
 description = "Headless Qobuz music player service with DLNA support"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,23 +38,33 @@ dependencies = [
 Repository = "https://github.com/leolobato/qobuz-proxy"
 "Bug Tracker" = "https://github.com/leolobato/qobuz-proxy/issues"
 
+# Optional runtime feature: the local (PortAudio) audio backend.
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.21.0",
-    "black>=23.12.0",
-    "mypy>=1.7.0",
-    "ruff>=0.1.0",
-    "types-PyYAML>=6.0",
-]
 local = [
     "sounddevice>=0.4.6",
     "numpy>=1.24.0",
     "soundfile>=0.12.1",
+    "numpy>=1.24.0",
+]
+
+# Development tooling (PEP 735 dependency group). uv installs the `dev` group
+# by default on `uv sync` — see [tool.uv].default-groups below.
+[dependency-groups]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "mypy>=1.7.0",
+    "ruff>=0.1.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
 qobuz-proxy = "qobuz_proxy.cli:main"
+
+# uv manages the local environment (.venv + uv.lock). See .claude/CLAUDE.md.
+[tool.uv]
+package = true                 # build & install this project (editable) into the env
+default-groups = ["dev"]       # `uv sync` includes the dev group unless --no-dev
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -63,13 +73,15 @@ include = ["qobuz_proxy*"]
 [tool.setuptools.package-data]
 "qobuz_proxy.webui" = ["static/**/*"]
 
-[tool.black]
-line-length = 100
-target-version = ["py310"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint.per-file-ignores]
+"qobuz_proxy/__init__.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.10"
