@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 # Threshold for restart vs previous track (milliseconds)
 PREVIOUS_TRACK_THRESHOLD_MS = 3000
 
+# After a WebSocket reconnect, the Qobuz server replays its last-known session
+# snapshot via SET_STATE — typically PAUSED at a position from before the drop.
+# If the renderer is actually still playing further along the same track, treat
+# that as a stale replay and ignore the pause/seek. This is the minimum gap
+# (renderer ahead of server) at which we suppress.
+_STALE_SNAPSHOT_THRESHOLD_MS = 5000
+
 
 class QobuzPlayer:
     """
@@ -68,6 +75,15 @@ class QobuzPlayer:
 
         # State
         self._state: PlaybackState = PlaybackState.STOPPED
+
+        # Playback command serialization. A track switch in the Qobuz app sends
+        # a burst of SET_STATE messages; without this lock the resulting
+        # load/play/stop calls overlap and fire concurrent SOAP control
+        # requests, which wedges DLNA AVTransport renderers. The generation
+        # counter lets a newer command supersede an older one still waiting on
+        # the lock (latest-command-wins).
+        self._playback_lock = asyncio.Lock()
+        self._command_generation = 0
 
         # State reporting - supports both callback and StateReporter
         self._state_update_callback: Optional[Callable[[], asyncio.Future]] = None
@@ -350,6 +366,116 @@ class QobuzPlayer:
     # Playback Commands
     # =========================================================================
 
+    def _next_generation(self) -> int:
+        """Bump and return the playback command generation.
+
+        Public command entrypoints call this before awaiting the playback
+        lock. If a newer command bumps the generation while an older one is
+        still queued on the lock, the older one detects the mismatch after
+        acquiring and skips — so only the latest command in a burst runs.
+        """
+        self._command_generation += 1
+        return self._command_generation
+
+    async def apply_remote_state(
+        self,
+        *,
+        track_id: Optional[str],
+        queue_item_id: Optional[int],
+        position_ms: Optional[int],
+        playing_state: Optional[int],
+    ) -> None:
+        """Apply a full SET_STATE intent from the app atomically.
+
+        A SET_STATE is a multi-step intent (load this track, seek here, then
+        play/pause/stop). Each SET_STATE message is dispatched as its own task,
+        so if these steps were applied via separate locked methods they could
+        interleave — an older SET_STATE could play a stale track after a newer
+        one already queued a different load. Applying the whole sequence under a
+        single lock acquisition and a single generation check makes the newest
+        SET_STATE win as a unit, with no interleaving.
+
+        Args:
+            track_id: Target track id, or None if the message had no currentQueueItem.
+            queue_item_id: Queue item id for the target track (if any).
+            position_ms: Target position, or None if no currentPosition was sent.
+            playing_state: Proto playing state (1=STOPPED, 2=PLAYING, 3=PAUSED),
+                or None if the message had no playingState.
+        """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("SET_STATE superseded by newer command; skipping")
+                return
+
+            # Load if a track is specified and differs from the loaded one.
+            if track_id is not None:
+                cur = self._current_track
+                if cur is None or cur.track_id != track_id:
+                    logger.info(f"Loading new track: {track_id}")
+                    if not await self._load_track_locked(queue_item_id or 0, track_id):
+                        return
+
+            # Detect a stale session-restore snapshot (server replays an old
+            # PAUSED position after a reconnect while we're still playing).
+            stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
+
+            # Position, then play/pause/stop — same order as the app expects.
+            if position_ms is not None and not stale:
+                await self.seek(position_ms)
+
+            if playing_state is not None and not stale:
+                # Proto: 1=STOPPED, 2=PLAYING, 3=PAUSED
+                if playing_state == 2:
+                    await self._play_locked(position_ms or 0)
+                elif playing_state == 3:
+                    await self._pause_locked()
+                elif playing_state == 1:
+                    await self._stop_playback_locked()
+
+    def _is_stale_pause_snapshot_locked(
+        self,
+        track_id: Optional[str],
+        position_ms: Optional[int],
+        playing_state: Optional[int],
+    ) -> bool:
+        """Decide whether an inbound SET_STATE is a stale session-restore replay.
+
+        Must be called while holding ``_playback_lock`` so the live player state
+        it reads is consistent with the surrounding mutation. Returns True when
+        ALL of:
+          - server says PAUSED
+          - renderer is still PLAYING
+          - it's the same track the renderer is on
+          - server position is more than _STALE_SNAPSHOT_THRESHOLD_MS behind the
+            renderer's actual position
+        """
+        if playing_state != 3:
+            return False
+        if self._state != PlaybackState.PLAYING:
+            return False
+        if position_ms is None:
+            return False
+        # A different target track is a real command (track change), not a replay.
+        cur = self._current_track
+        if track_id is not None and (cur is None or cur.track_id != track_id):
+            return False
+
+        actual_pos = self.current_position_ms
+        gap_ms = actual_pos - position_ms
+        if gap_ms <= _STALE_SNAPSHOT_THRESHOLD_MS:
+            return False
+
+        logger.info(
+            "Ignoring stale SET_STATE: server says PAUSED at %dms, renderer is "
+            "PLAYING at %dms (%.1fs ahead) on same track — likely a session-"
+            "restore replay after WebSocket reconnect; keeping playback.",
+            position_ms,
+            actual_pos,
+            gap_ms / 1000.0,
+        )
+        return True
+
     async def play(self, position_ms: int = 0) -> bool:
         """
         Start or resume playback.
@@ -360,6 +486,14 @@ class QobuzPlayer:
         Returns:
             True if playback started/resumed successfully
         """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("play superseded by newer command; skipping")
+                return False
+            return await self._play_locked(position_ms)
+
+    async def _play_locked(self, position_ms: int = 0) -> bool:
         logger.debug(f"Play command, current state: {self._state}")
 
         # Resume from pause
@@ -411,6 +545,14 @@ class QobuzPlayer:
         Returns:
             True if track was reloaded successfully
         """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("reload_current_track superseded by newer command; skipping")
+                return False
+            return await self._reload_current_track_locked()
+
+    async def _reload_current_track_locked(self) -> bool:
         if not self._current_track:
             return False
 
@@ -453,6 +595,14 @@ class QobuzPlayer:
         Returns:
             True if paused successfully
         """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("pause superseded by newer command; skipping")
+                return False
+            return await self._pause_locked()
+
+    async def _pause_locked(self) -> bool:
         if self._state != PlaybackState.PLAYING:
             logger.debug(f"Cannot pause in state {self._state}")
             return False
@@ -474,6 +624,14 @@ class QobuzPlayer:
 
         Resets position to 0 but keeps queue position.
         """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("stop_playback superseded by newer command; skipping")
+                return
+            await self._stop_playback_locked()
+
+    async def _stop_playback_locked(self) -> None:
         # Clear gapless state — explicit stop
         self._clear_gapless_state()
 
@@ -504,6 +662,18 @@ class QobuzPlayer:
         Returns:
             True if track loaded successfully
         """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("load_track superseded by newer command; skipping")
+                return False
+            return await self._load_track_locked(queue_item_id, track_id)
+
+    async def _load_track_locked(
+        self,
+        queue_item_id: int,
+        track_id: str,
+    ) -> bool:
         logger.info(f"Loading track: track_id={track_id}, queue_item_id={queue_item_id}")
 
         # Stop current playback if playing
@@ -556,6 +726,19 @@ class QobuzPlayer:
         Returns:
             True if playback started successfully
         """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("play_track superseded by newer command; skipping")
+                return False
+            return await self._play_track_locked(queue_item_id, track_id, position_ms)
+
+    async def _play_track_locked(
+        self,
+        queue_item_id: int,
+        track_id: str,
+        position_ms: int = 0,
+    ) -> bool:
         # Clear gapless state — explicit track change
         self._clear_gapless_state()
 
@@ -564,7 +747,7 @@ class QobuzPlayer:
         )
 
         # Load the track first
-        if not await self.load_track(queue_item_id, track_id):
+        if not await self._load_track_locked(queue_item_id, track_id):
             return False
 
         # Set starting position
@@ -628,6 +811,14 @@ class QobuzPlayer:
         Returns:
             True if advanced to next track, False if at end
         """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("next_track superseded by newer command; skipping")
+                return False
+            return await self._next_track_locked()
+
+    async def _next_track_locked(self) -> bool:
         # Clear gapless state — explicit skip
         self._clear_gapless_state()
 
@@ -664,6 +855,14 @@ class QobuzPlayer:
         Returns:
             True if action taken successfully
         """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("previous_track superseded by newer command; skipping")
+                return False
+            return await self._previous_track_locked()
+
+    async def _previous_track_locked(self) -> bool:
         # Clear gapless state — explicit navigation
         self._clear_gapless_state()
 

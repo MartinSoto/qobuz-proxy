@@ -9,6 +9,7 @@ import asyncio
 import logging
 import socket
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -22,6 +23,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_URL_MAX_AGE_SECONDS = 240  # Refresh before 5-minute TTL
 STREAM_CHUNK_SIZE = 64 * 1024  # 64KB chunks
 REQUEST_TIMEOUT_SECONDS = 30
+# Per-read timeout: fail fast when the CDN stalls mid-stream instead of hanging
+# forever (the overall stream has no total timeout).
+READ_TIMEOUT_SECONDS = 30
+# Mid-stream reconnect settings: how many times to reconnect (with a Range resume)
+# before giving up, and how long to back off between attempts.
 MAX_UPSTREAM_RETRIES = 3
 UPSTREAM_RETRY_DELAY_SECONDS = 0.5
 
@@ -246,9 +252,9 @@ class AudioProxyServer:
             request_start = _parse_range_start(range_header)
             logger.debug(f"Proxying with Range: {range_header}")
 
-        # Create a fresh session for each request (like reference implementation)
-        # This avoids connection pooling issues with long-running streams
-        timeout = ClientTimeout(total=None, connect=30)  # No total timeout for streaming
+        # No total timeout for streaming, but a per-read timeout so a stalled
+        # CDN connection fails fast instead of hanging forever.
+        timeout = ClientTimeout(total=None, connect=30, sock_read=READ_TIMEOUT_SECONDS)
 
         response: Optional[web.StreamResponse] = None
         expected_bytes: Optional[int] = None
@@ -389,8 +395,6 @@ class AudioProxyServer:
             except Exception as e:
                 logger.error(f"Proxy error for track {track.track_id}: {type(e).__name__}: {e}")
                 logger.error(f"URL was: {track.qobuz_url[:100]}...")
-                import traceback
-
                 logger.debug(f"Full traceback: {traceback.format_exc()}")
                 if response is not None:
                     return response
