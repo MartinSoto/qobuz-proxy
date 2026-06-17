@@ -176,6 +176,15 @@ async def test_index_injects_ingress_base(client: TestClient) -> None:
     assert '<base href="/api/hassio_ingress/abc123/">' in body
 
 
+async def test_index_rejects_malicious_ingress_path(client: TestClient) -> None:
+    """A header that isn't a clean path must not be reflected into the HTML."""
+    resp = await client.get("/", headers={"X-Ingress-Path": '"><script>alert(1)</script>'})
+    assert resp.status == 200
+    body = await resp.text()
+    assert '<base href="/">' in body
+    assert "<script>alert(1)" not in body
+
+
 async def test_auth_callback_redirects_under_ingress(client: TestClient) -> None:
     """On success the callback should redirect back to the ingress base, not root."""
     mock_creds = {

@@ -1,6 +1,7 @@
 """Web UI API routes for status and authentication."""
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,9 @@ def _format_uptime(seconds: float) -> str:
     return f"{minutes}m"
 
 
+_INGRESS_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
+
+
 def _ingress_base(request: web.Request) -> str:
     """Return the base path the UI is served under, with a trailing slash.
 
@@ -36,9 +40,16 @@ def _ingress_base(request: web.Request) -> str:
     holding the path prefix (e.g. ``/api/hassio_ingress/<token>``). Using it as
     the document ``<base href>`` lets all relative links/fetches resolve both
     behind ingress and on direct ``http://host:8689/`` access.
+
+    The value is reflected into the served HTML and into redirect ``Location``
+    headers, so it is validated against a strict path charset; anything else
+    (including header-injection attempts on the directly-exposed port) falls
+    back to the root base.
     """
     ingress_path = request.headers.get("X-Ingress-Path", "")
-    return f"{ingress_path}/" if ingress_path else "/"
+    if ingress_path and _INGRESS_PATH_RE.match(ingress_path):
+        return f"{ingress_path.rstrip('/')}/"
+    return "/"
 
 
 async def _handle_index(request: web.Request) -> web.Response:
