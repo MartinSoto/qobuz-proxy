@@ -44,7 +44,6 @@ local = [
     "sounddevice>=0.4.6",
     "numpy>=1.24.0",
     "soundfile>=0.12.1",
-    "numpy>=1.24.0",
 ]
 
 # Development tooling (PEP 735 dependency group). uv installs the `dev` group
