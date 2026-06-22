@@ -37,6 +37,7 @@ from qobuz_proxy.playback import (
     VolumeCommandHandler,
 )
 from qobuz_proxy.backends import AudioBackend, BackendFactory, PlaybackState
+from qobuz_proxy.playback.play_reporter import PlayReporter
 from qobuz_proxy.playback.state_reporter import PlaybackStateReport
 from qobuz_proxy.backends.dlna import AudioProxyServer, DLNABackend, MetadataServiceURLProvider
 
@@ -291,6 +292,7 @@ class Speaker:
                 queue=self._queue,
                 metadata_service=self._metadata_service,
                 backend=backend,
+                play_reporter=PlayReporter(self._api_client),
             )
             if isinstance(backend, DLNABackend):
                 self._player.set_fixed_volume_mode(self._config.dlna_fixed_volume)

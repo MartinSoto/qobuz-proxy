@@ -52,6 +52,7 @@ class TrackMetadata:
     actual_quality: int = 0  # Quality ID of the streaming URL
     sample_rate: int = 0  # Hz, e.g. 44100, 96000, 192000
     bit_depth: int = 0  # e.g. 16, 24
+    blob: str = ""  # Opaque token from getFileUrl, needed for reportStreamingEnd
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -207,6 +208,13 @@ class MetadataService:
             return (cached.actual_quality, cached.sample_rate, cached.bit_depth)
         return (0, 0, 0)
 
+    def get_track_blob(self, track_id: str) -> Optional[str]:
+        """Return the cached getFileUrl blob for a track, or None if uncached."""
+        cached = self._cache.get(track_id)
+        if cached is None:
+            return None
+        return cached.blob
+
     def get_track_actual_quality(self, track_id: str) -> Optional[int]:
         """
         Get the actual streaming quality for a cached track.
@@ -291,6 +299,7 @@ class MetadataService:
                     sr = result.get("sampling_rate", 0)
                     metadata.sample_rate = int(float(sr) * 1000) if sr else 0
                     metadata.bit_depth = int(result.get("bit_depth", 0))
+                    metadata.blob = result.get("blob", "") or ""
 
                     if actual_quality != self._max_quality:
                         logger.info(

@@ -5,8 +5,10 @@ Handles authentication, session management, and signed API requests.
 """
 
 import hashlib
+import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -210,6 +212,8 @@ class QobuzAPIClient:
                                 "bit_depth": data.get("bit_depth", 0),
                                 "sampling_rate": data.get("sampling_rate", 0),
                                 "mime_type": data.get("mime_type", ""),
+                                # Opaque token needed by track/reportStreamingEndJson.
+                                "blob": data.get("blob", ""),
                             }
                         return None
                     else:
@@ -220,6 +224,104 @@ class QobuzAPIClient:
             logger.error(f"Failed to get track URL: {e}")
 
         return None
+
+    def _report_headers(self) -> dict[str, str]:
+        """Auth headers shared by the streaming-report endpoints."""
+        headers = {"X-App-Id": self.app_id}
+        if self.user_auth_token:
+            headers["X-User-Auth-Token"] = self.user_auth_token
+        if self.x_session_id:
+            headers["X-Session-Id"] = self.x_session_id
+        return headers
+
+    async def report_streaming_start(self, *, track_id: str, format_id: int) -> bool:
+        """Tell Qobuz a track started playing (track/reportStreamingStart).
+
+        This registers the play with Qobuz, which in turn powers listening
+        history and Last.fm "now playing"/scrobbling for linked accounts. The
+        body mirrors the official client: a form field ``events`` holding a
+        one-element JSON array. The call is unsigned; auth is via headers.
+        """
+        await self.start_session()
+        event = {
+            "user_id": int(self.user_id) if self.user_id else 0,
+            "track_id": int(track_id),
+            "format_id": int(format_id),
+            "date": int(time.time()),
+            "duration": 0,
+            "online": True,
+            "local": False,
+        }
+        body = "events=" + json.dumps([event], separators=(",", ":"))
+        headers = self._report_headers()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        return await self._post_report(
+            f"{self.API_BASE}/track/reportStreamingStart", body, headers, "start"
+        )
+
+    async def report_streaming_end(
+        self,
+        *,
+        track_id: str,
+        blob: str,
+        context_uuid: Optional[str],
+        started_at_ms: int,
+        played_seconds: int,
+    ) -> bool:
+        """Tell Qobuz a track finished playing (track/reportStreamingEndJson).
+
+        The end event carries how long the track was actually played, which is
+        what Qobuz uses to decide whether the play counts (and scrobbles). The
+        ``blob`` comes from the track/getFileUrl response and ``context_uuid``
+        from the play queue.
+        """
+        await self.start_session()
+        event: dict[str, Any] = {
+            "blob": blob,
+            "track_context_uuid": context_uuid or "",
+            "start_stream": self._iso8601_ms(started_at_ms),
+            "online": True,
+            "local": False,
+            "duration": int(played_seconds),
+        }
+        from qobuz_proxy import __version__
+
+        payload = {
+            "events": [event],
+            "renderer_context": {"software_version": f"qobuz-proxy-{__version__}"},
+        }
+        body = json.dumps(payload, separators=(",", ":"))
+        headers = self._report_headers()
+        headers["Content-Type"] = "application/json"
+        return await self._post_report(
+            f"{self.API_BASE}/track/reportStreamingEndJson", body, headers, f"end track {track_id}"
+        )
+
+    async def _post_report(self, url: str, body: str, headers: dict[str, str], what: str) -> bool:
+        """POST a streaming-report body; log and swallow failures (best-effort)."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, data=body, headers=headers, timeout=timeout) as resp:
+                    # Qobuz answers reportStreamingStart with 201 Created (body
+                    # still says success), so accept any 2xx.
+                    if 200 <= resp.status < 300:
+                        logger.debug(f"Streaming report ({what}) ok: HTTP {resp.status}")
+                        return True
+                    text = await resp.text()
+                    logger.warning(
+                        f"Streaming report ({what}) failed: HTTP {resp.status} — {text[:200]}"
+                    )
+                    return False
+        except Exception as e:
+            logger.warning(f"Streaming report ({what}) error: {type(e).__name__}: {e}")
+            return False
+
+    @staticmethod
+    def _iso8601_ms(epoch_ms: int) -> str:
+        """Format epoch milliseconds as ISO8601 UTC with millis and a Z suffix."""
+        dt = datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
     async def get_track_metadata(self, track_id: str) -> Optional[dict[str, Any]]:
         """

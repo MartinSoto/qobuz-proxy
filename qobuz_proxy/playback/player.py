@@ -20,11 +20,18 @@ from .metadata import MetadataService
 
 if TYPE_CHECKING:
     from .state_reporter import StateReporter
+    from .play_reporter import PlayReporter
 
 logger = logging.getLogger(__name__)
 
 # Threshold for restart vs previous track (milliseconds)
 PREVIOUS_TRACK_THRESHOLD_MS = 3000
+
+# When we begin a track at a position beyond this, treat it as adopted mid-play
+# from the controlling app (a Connect handoff) rather than a play we initiated.
+# The app already reported/scrobbled that play, so we suppress our own
+# reportStreamingStart to avoid a duplicate Last.fm scrobble.
+_HANDOFF_POSITION_THRESHOLD_MS = 5000
 
 # After a WebSocket reconnect, the Qobuz server replays its last-known session
 # snapshot via SET_STATE — typically PAUSED at a position from before the drop.
@@ -59,11 +66,14 @@ class QobuzPlayer:
         queue: QobuzQueue,
         metadata_service: MetadataService,
         backend: AudioBackend,
+        play_reporter: Optional["PlayReporter"] = None,
     ):
         """Initialize player."""
         self.queue = queue
         self.metadata = metadata_service
         self.backend = backend
+        # Optional: reports plays to Qobuz (listening history / Last.fm scrobbling).
+        self._play_reporter = play_reporter
 
         # Current track
         self._current_track: Optional[QueueTrack] = None
@@ -502,6 +512,9 @@ class QobuzPlayer:
             self._state = PlaybackState.PLAYING
             self._position_timestamp_ms = int(time.time() * 1000)
             await self._send_state_update()
+            # Resume continues an existing listen — pass the current position so
+            # we don't re-report a start (and re-scrobble) on every pause/resume.
+            await self._report_playing(self._position_value_ms)
             logger.info("Playback resumed")
             return True
 
@@ -528,7 +541,7 @@ class QobuzPlayer:
             self._position_timestamp_ms = int(time.time() * 1000)
 
         # Start playback
-        success = await self._start_playback()
+        success = await self._start_playback(position_ms)
 
         # Seek if position > 0 and playback started
         if success and position_ms > 0:
@@ -614,6 +627,7 @@ class QobuzPlayer:
         await self.backend.pause()
         self._state = PlaybackState.PAUSED
         await self._send_state_update()
+        await self._report_stopped()
 
         logger.info("Playback paused")
         return True
@@ -642,6 +656,7 @@ class QobuzPlayer:
         self._position_timestamp_ms = int(time.time() * 1000)
 
         await self._send_state_update()
+        await self._report_stopped()
         logger.info("Playback stopped")
 
     async def load_track(
@@ -755,7 +770,7 @@ class QobuzPlayer:
         self._position_timestamp_ms = int(time.time() * 1000)
 
         # Start playback
-        success = await self._start_playback()
+        success = await self._start_playback(position_ms)
 
         # Seek if position > 0 and playback started
         if success and position_ms > 0:
@@ -901,9 +916,14 @@ class QobuzPlayer:
     # Internal Playback Management
     # =========================================================================
 
-    async def _start_playback(self) -> bool:
+    async def _start_playback(self, start_position_ms: int = 0) -> bool:
         """
         Start playback of current track.
+
+        Args:
+            start_position_ms: Position the track begins at. A large value means
+                we're adopting an in-progress track from the app (handoff), which
+                suppresses our play-start report.
 
         Returns:
             True if playback started successfully
@@ -980,6 +1000,7 @@ class QobuzPlayer:
             self._position_timestamp_ms = int(time.time() * 1000)
 
             await self._send_state_update()
+            await self._report_playing(start_position_ms)
             return True
 
         except Exception as e:
@@ -987,6 +1008,49 @@ class QobuzPlayer:
             self._state = PlaybackState.ERROR
             await self._send_state_update()
             return False
+
+    # =========================================================================
+    # Play Reporting (Qobuz listening history / Last.fm scrobbling)
+    # =========================================================================
+
+    async def _report_playing(self, start_position_ms: int = 0) -> None:
+        """Tell the play reporter the current track is now playing.
+
+        A start beyond the handoff threshold means the app already owns (and
+        scrobbled) this play, so we track it locally but suppress our start
+        report to avoid a duplicate scrobble.
+        """
+        if not self._play_reporter or not self._current_track:
+            return
+        track = self._current_track
+        format_id = self.metadata.get_track_actual_quality(track.track_id) or 0
+        blob = self.metadata.get_track_blob(track.track_id) or ""
+        report_start = start_position_ms < _HANDOFF_POSITION_THRESHOLD_MS
+        await self._play_reporter.note_playing(
+            track_id=track.track_id,
+            format_id=format_id,
+            blob=blob,
+            context_uuid=self._format_context_uuid(track.context_uuid),
+            report_start=report_start,
+        )
+
+    async def _report_stopped(self) -> None:
+        """Tell the play reporter playback stopped (pause/stop/track end)."""
+        if not self._play_reporter:
+            return
+        await self._play_reporter.note_stopped()
+
+    @staticmethod
+    def _format_context_uuid(context_uuid: Optional[bytes]) -> Optional[str]:
+        """Format the 16-byte queue context UUID as a canonical UUID string."""
+        if not context_uuid:
+            return None
+        try:
+            import uuid
+
+            return str(uuid.UUID(bytes=bytes(context_uuid)))
+        except (ValueError, TypeError):
+            return None
 
     # =========================================================================
     # Position Tracking
@@ -1038,6 +1102,9 @@ class QobuzPlayer:
 
         logger.info("Track ended naturally")
 
+        # The track finished — report the completed play before advancing.
+        await self._report_stopped()
+
         # Get queue state to check repeat mode
         queue_state = await self.queue.get_state()
 
@@ -1045,6 +1112,8 @@ class QobuzPlayer:
             # Restart current track
             await self.backend.seek(0)
             self._set_position(0)
+            # Replaying the same track counts as a new play.
+            await self._report_playing()
             return
 
         # Try to get next track from command handler (SET_STATE nextQueueItem)
@@ -1223,6 +1292,9 @@ class QobuzPlayer:
             self.metadata.log_now_playing_info(backend_meta, actual_quality)
         if self._file_quality_report_callback and actual_quality:
             await self._file_quality_report_callback(actual_quality)
+
+        # Report the play swap: ends the previous track, starts this one.
+        await self._report_playing()
 
         # Send state update
         await self._send_state_update()
