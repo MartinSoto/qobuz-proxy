@@ -7,8 +7,6 @@ Processes playback commands from the Qobuz app via WsManager.
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
-from ..backends.types import PlaybackState
-
 if TYPE_CHECKING:
     from .player import QobuzPlayer
     from .queue import QobuzQueue
@@ -25,13 +23,6 @@ MSG_TYPE_SET_MAX_AUDIO_QUALITY = 44  # SrvrRndrSetMaxAudioQuality
 MSG_TYPE_SET_LOOP_MODE = 45  # SrvrRndrSetLoopMode
 MSG_TYPE_SET_SHUFFLE_MODE = 46  # SrvrRndrSetShuffleMode
 MSG_TYPE_SET_AUTOPLAY_MODE = 47  # SrvrRndrSetAutoplayMode
-
-# After a WebSocket reconnect, the Qobuz server replays its last-known session
-# snapshot via SET_STATE — typically PAUSED with a position from before the drop.
-# If the renderer is actually still playing further along the same track, treat
-# that as a stale replay and ignore the pause/seek. Threshold is the minimum
-# gap (renderer ahead of server) at which we suppress.
-_STALE_SNAPSHOT_THRESHOLD_MS = 5000
 
 
 class PlaybackCommandHandler:
@@ -154,94 +145,23 @@ class PlaybackCommandHandler:
             next_track_changed = True
             logger.debug("Next track cleared (nextQueueItem not present in SET_STATE)")
 
-        # Check if the app is telling us to play a different track than what we're playing
-        player_track = self.player.current_track
-        player_track_id = player_track.track_id if player_track else None
-
-        if current_item and str(current_track_id) != player_track_id:
-            # App wants us to play a different track - load it
-            logger.info(f"Loading new track: {current_track_id}")
-            await self.player.load_track(
-                queue_item_id=current_queue_item_id,
-                track_id=str(current_track_id),
-            )
-
-        # Detect stale session-restore snapshot from server (e.g. right after a
-        # WebSocket reconnect): server says PAUSED at an old position, but the
-        # renderer is still playing the same track further along. Honouring it
-        # would yank playback backwards and pause for no user-visible reason.
-        stale_snapshot = self._is_stale_pause_snapshot(
-            state=state,
-            current_track_id=current_track_id,
-            player_track_id=player_track_id,
+        # Apply the desired remote state as a single atomic unit. A SET_STATE is
+        # a multi-step intent (load this track, seek here, then play/pause/stop)
+        # and each SET_STATE message runs in its own task, so applying the steps
+        # via separate locked player calls could interleave and leave playback on
+        # a stale track. apply_remote_state() applies the whole sequence under one
+        # lock acquisition + generation check (newest SET_STATE wins as a unit),
+        # and also handles the stale session-restore snapshot detection.
+        await self.player.apply_remote_state(
+            track_id=str(current_track_id) if current_item else None,
+            queue_item_id=current_queue_item_id,
+            position_ms=state.currentPosition if state.HasField("currentPosition") else None,
+            playing_state=state.playingState if state.HasField("playingState") else None,
         )
-
-        # Extract position
-        position_ms = 0
-        if state.HasField("currentPosition"):
-            position_ms = state.currentPosition
-            logger.debug(f"Position: {position_ms}ms")
-            if not stale_snapshot:
-                await self.player.seek(position_ms=position_ms)
-
-        # Handle playing state - apply AFTER track is loaded
-        if state.HasField("playingState") and not stale_snapshot:
-            proto_state = state.playingState
-            logger.debug(f"Playing state: {proto_state}")
-
-            # Proto: 1=STOPPED, 2=PLAYING, 3=PAUSED
-            if proto_state == 2:  # PLAYING
-                await self.player.play(position_ms=position_ms)
-            elif proto_state == 3:  # PAUSED
-                await self.player.pause()
-            elif proto_state == 1:  # STOPPED
-                await self.player.stop_playback()
 
         # Notify gapless system about next track change (after state handling)
         if next_track_changed and self._on_next_track_changed:
             await self._on_next_track_changed()
-
-    def _is_stale_pause_snapshot(
-        self,
-        state: Any,
-        current_track_id: Optional[int],
-        player_track_id: Optional[str],
-    ) -> bool:
-        """Decide whether an inbound SET_STATE is a stale session-restore replay.
-
-        Returns True when ALL of:
-          - server says PAUSED
-          - renderer is still PLAYING
-          - it's the same track the renderer is on
-          - server's currentPosition is more than _STALE_SNAPSHOT_THRESHOLD_MS
-            behind the renderer's actual position
-        """
-        if not state.HasField("playingState") or state.playingState != 3:
-            return False
-        if self.player.state != PlaybackState.PLAYING:
-            return False
-        if not state.HasField("currentPosition"):
-            return False
-        # If the server is pointing us at a different track, it's a real
-        # command (track change), not a stale replay.
-        if current_track_id is not None and str(current_track_id) != player_track_id:
-            return False
-
-        actual_pos = self.player.current_position_ms
-        server_pos = state.currentPosition
-        gap_ms = actual_pos - server_pos
-        if gap_ms <= _STALE_SNAPSHOT_THRESHOLD_MS:
-            return False
-
-        logger.info(
-            "Ignoring stale SET_STATE: server says PAUSED at %dms, renderer is "
-            "PLAYING at %dms (%.1fs ahead) on same track — likely a session-"
-            "restore replay after WebSocket reconnect; keeping playback.",
-            server_pos,
-            actual_pos,
-            gap_ms / 1000.0,
-        )
-        return True
 
     def get_next_track_info(self) -> Optional[dict]:
         """Get the stored next track info for auto-advance."""
