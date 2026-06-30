@@ -420,3 +420,67 @@ class TestSpeakerEditCallbacks:
 
         assert config.speakers[1].max_quality == 27  # B updated
         assert config.speakers[0].max_quality == 6  # A untouched
+
+    async def test_remove_deletes_config_entry_matched_by_name(self):
+        """Config entry must be removed by name, not by running-list index.
+
+        When an earlier speaker failed to start, the running list and the
+        config list are misaligned; popping the config by the running index
+        would delete the wrong speaker.
+        """
+        config = _make_config(
+            _make_speaker_config(name="Speaker A", http_port=8689),
+            _make_speaker_config(name="Speaker B", http_port=8690),
+        )
+        # Speaker A failed to start, so only B is running (index misalignment):
+        # B is at running index 0 but config index 1.
+        speaker_b = MagicMock()
+        speaker_b.name = "Speaker B"
+        speaker_b.stop = AsyncMock()
+
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = [speaker_b]
+
+        with patch.object(app, "_save_config"):
+            await app._on_remove_speaker("speaker-b")
+
+        # Only B removed; A's config must survive.
+        assert [sc.name for sc in config.speakers] == ["Speaker A"]
+        assert app._speakers == []
+        speaker_b.stop.assert_called_once()
+
+    async def test_remove_non_running_speaker(self):
+        """A configured speaker that failed to start can still be removed."""
+        config = _make_config(
+            _make_speaker_config(name="Speaker A", http_port=8689),
+            _make_speaker_config(name="Speaker B", http_port=8690),
+        )
+        # A failed to start; only B is running.
+        speaker_b = MagicMock()
+        speaker_b.name = "Speaker B"
+        speaker_b.stop = AsyncMock()
+
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = [speaker_b]
+
+        with patch.object(app, "_save_config"):
+            await app._on_remove_speaker("speaker-a")
+
+        # A removed from config; B left untouched and still running.
+        assert [sc.name for sc in config.speakers] == ["Speaker B"]
+        assert app._speakers == [speaker_b]
+        speaker_b.stop.assert_not_called()
+
+    async def test_remove_unknown_speaker_raises(self):
+        """Removing a speaker that isn't configured raises KeyError."""
+        import pytest
+
+        config = _make_config(_make_speaker_config(name="Speaker A"))
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = []
+
+        with pytest.raises(KeyError):
+            await app._on_remove_speaker("nope")

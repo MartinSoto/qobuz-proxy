@@ -378,18 +378,28 @@ class QobuzProxy:
 
     async def _on_remove_speaker(self, speaker_id: str) -> None:
         """Remove a speaker at runtime."""
-        idx = None
-        for i, s in enumerate(self._speakers):
-            if slugify_name(s.name) == speaker_id:
-                idx = i
+        # Match the config entry by name: the running list and the config list
+        # can be misaligned when some speakers failed to start, so the running
+        # index must not be used to pop from the config list.
+        config_idx = None
+        for i, sc in enumerate(self._config.speakers):
+            if slugify_name(sc.name) == speaker_id:
+                config_idx = i
                 break
-        if idx is None:
+        if config_idx is None:
             raise KeyError(speaker_id)
 
-        speaker = self._speakers.pop(idx)
-        self._config.speakers.pop(idx)
+        speaker_idx = None
+        for i, s in enumerate(self._speakers):
+            if slugify_name(s.name) == speaker_id:
+                speaker_idx = i
+                break
 
-        await speaker.stop()
+        self._config.speakers.pop(config_idx)
+        if speaker_idx is not None:
+            speaker = self._speakers.pop(speaker_idx)
+            await speaker.stop()
+
         self._save_config()
 
     def _save_config(self) -> None:
