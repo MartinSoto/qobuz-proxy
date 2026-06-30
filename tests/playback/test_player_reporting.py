@@ -4,6 +4,7 @@ Wires a real PlayReporter (over a mocked API client) into the player and checks
 that play/pause/stop/track-end/track-switch produce the right report calls.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from qobuz_proxy.backends import BackendTrackMetadata, PlaybackState
@@ -84,13 +85,116 @@ class TestPlayerReporting:
         assert api.report_streaming_end.await_args.kwargs["track_id"] == "555"
         assert api.report_streaming_end.await_args.kwargs["blob"] == "theblob"
 
-    async def test_pause_reports_end(self) -> None:
+    async def test_pause_does_not_report_end(self) -> None:
+        """Pausing keeps the listen open — a streaming-end on pause would
+        produce a premature/duplicate scrobble."""
         player, api = _make_player_with_reporter()
         await player.play_track(queue_item_id=1, track_id="555")
 
         await player.pause()
 
+        api.report_streaming_end.assert_not_awaited()
+
+    async def test_pause_resume_cycles_report_one_start_one_end(self) -> None:
+        """A single listen with several pause/resume cycles reports exactly one
+        start and, on stop, exactly one end (no duplicate scrobbles)."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="555")
+
+        for _ in range(3):
+            await player.pause()
+            await player.play()  # resume
+
+        api.report_streaming_end.assert_not_awaited()
+        assert api.report_streaming_start.await_count == 1
+
+        await player.stop_playback()
+
         api.report_streaming_end.assert_awaited_once()
+        assert api.report_streaming_end.await_args.kwargs["track_id"] == "555"
+
+    async def test_load_only_track_change_while_paused_ends_previous(self) -> None:
+        """A track change that only loads (no immediate play) while paused must
+        still end the previous play — pause no longer closes the session."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        await player.pause()
+        api.report_streaming_end.assert_not_awaited()
+
+        # Load-only change to a new track (no playingState -> no play).
+        await player.apply_remote_state(
+            track_id="200", queue_item_id=2, position_ms=None, playing_state=None
+        )
+
+        api.report_streaming_end.assert_awaited_once()
+        assert api.report_streaming_end.await_args.kwargs["track_id"] == "100"
+
+    async def test_external_pause_stops_reporter_clock(self) -> None:
+        """A device-originated pause (detected by the monitor) must pause the
+        played-time clock too, not just an app-driven pause."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+
+        # The renderer reports it paused on its own.
+        player.backend.get_state = AsyncMock(return_value=PlaybackState.PAUSED)
+        player.backend.get_position = AsyncMock(return_value=0)
+
+        player._is_running = True
+        task = asyncio.create_task(player._playback_monitor_loop())
+        await asyncio.sleep(0.6)  # allow one poll cycle (loop sleeps 0.5s)
+        player._is_running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert player.state == PlaybackState.PAUSED
+        api.report_streaming_end.assert_not_awaited()
+        # Session stays open but its played-time clock is paused.
+        assert player._play_reporter._active is not None
+        assert player._play_reporter._active.segment_started_ms is None
+
+    async def test_reload_while_paused_ends_session_so_next_play_is_fresh(self) -> None:
+        """A quality reload while paused must end the play, so the next play of
+        the same track reports a fresh start (new quality/blob), not a resume."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        await player.pause()
+
+        await player.reload_current_track()
+        api.report_streaming_end.assert_awaited_once()
+
+        await player.play()  # plays the reloaded track from STOPPED
+
+        # A brand-new start was reported (not merged into the old session).
+        assert api.report_streaming_start.await_count == 2
+
+    async def test_external_stop_while_paused_closes_report(self) -> None:
+        """An external renderer stop after an app pause must close the open
+        play-report session (the monitor keeps watching while paused)."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        await player.pause()
+        api.report_streaming_end.assert_not_awaited()
+
+        # The renderer is stopped externally while we believe we're paused.
+        player.backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        player.backend.get_position = AsyncMock(return_value=0)
+
+        player._is_running = True
+        task = asyncio.create_task(player._playback_monitor_loop())
+        await asyncio.sleep(0.6)  # allow one poll cycle (loop sleeps 0.5s)
+        player._is_running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert player.state == PlaybackState.STOPPED
+        api.report_streaming_end.assert_awaited_once()
+        assert api.report_streaming_end.await_args.kwargs["track_id"] == "100"
 
     async def test_switching_track_reports_end_then_start(self) -> None:
         player, api = _make_player_with_reporter()
@@ -123,6 +227,101 @@ class TestPlayerReporting:
         )
 
         api.report_streaming_start.assert_awaited_once_with(track_id="900", format_id=27)
+
+    async def test_restart_paused_track_reports_fresh_play_on_resume(self) -> None:
+        """Restarting a paused track (previous past threshold) ends the prior
+        listen; the resumed replay reports as a fresh play, not a merge."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        await player.pause()
+        player._position_value_ms = 10_000  # past the restart threshold
+
+        await player.previous_track()  # restart current track
+        api.report_streaming_end.assert_awaited_once()
+
+        await player.play()  # resume -> fresh play of the restarted track
+        assert api.report_streaming_start.await_count == 2
+
+    async def test_same_track_new_queue_item_reports_fresh_play(self) -> None:
+        """Replaying the same track from a different queue slot while paused must
+        report a fresh play (keyed by queue item), not merge into the old one."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        await player.pause()
+        api.report_streaming_end.assert_not_awaited()
+
+        # Same track, different queue item, position 0, resume playing.
+        await player.apply_remote_state(
+            track_id="100", queue_item_id=2, position_ms=0, playing_state=2
+        )
+
+        # Old play ended and a fresh start reported for the new queue occurrence.
+        api.report_streaming_end.assert_awaited_once()
+        assert api.report_streaming_start.await_count == 2
+
+    async def test_late_queue_item_id_does_not_split_play(self) -> None:
+        """A queue item id that arrives after the play started (initial id 0)
+        is a late-fill, not a new occurrence — it must not split the listen."""
+        player, api = _make_player_with_reporter()
+        # First SET_STATE lacks a real queue item (proto default 0).
+        await player.apply_remote_state(
+            track_id="100", queue_item_id=0, position_ms=0, playing_state=2
+        )
+        assert api.report_streaming_start.await_count == 1
+
+        # Later SET_STATE supplies the real queue item id, same track, playing.
+        await player.apply_remote_state(
+            track_id="100", queue_item_id=5, position_ms=0, playing_state=2
+        )
+
+        # No split: the same listen continues, no extra end/start.
+        api.report_streaming_end.assert_not_awaited()
+        assert api.report_streaming_start.await_count == 1
+        assert player.current_track.queue_item_id == 5
+
+    async def test_same_track_new_queue_item_while_playing_ends_old(self) -> None:
+        """A queue-item change to the same track while PLAYING must end the old
+        play (the PLAYING play step does not re-report)."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        assert api.report_streaming_start.await_count == 1
+
+        # Same track, new queue item from position 0, still playing.
+        await player.apply_remote_state(
+            track_id="100", queue_item_id=2, position_ms=0, playing_state=2
+        )
+
+        # The prior occurrence's play was ended and the fresh occurrence started.
+        api.report_streaming_end.assert_awaited_once()
+        assert api.report_streaming_start.await_count == 2
+
+    async def test_same_track_new_queue_item_handoff_suppresses_start(self) -> None:
+        """A new queue occurrence adopted mid-stream (non-zero start) is tracked
+        but must not re-report a start the controller already owns."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        assert api.report_streaming_start.await_count == 1
+
+        # New queue item but adopted at ~30s (handoff) — no fresh start.
+        await player.apply_remote_state(
+            track_id="100", queue_item_id=2, position_ms=30000, playing_state=2
+        )
+
+        api.report_streaming_end.assert_awaited_once()
+        assert api.report_streaming_start.await_count == 1
+
+    async def test_shutdown_while_paused_reports_end(self) -> None:
+        """Shutting down mid-listen (paused) must still close the play report."""
+        player, api = _make_player_with_reporter()
+        player.queue.stop = AsyncMock()
+        await player.play_track(queue_item_id=1, track_id="100")
+        await player.pause()
+        api.report_streaming_end.assert_not_awaited()
+
+        await player.stop()
+
+        api.report_streaming_end.assert_awaited_once()
+        assert api.report_streaming_end.await_args.kwargs["track_id"] == "100"
 
     async def test_no_reporter_is_safe(self) -> None:
         """A player built without a reporter must not crash on playback."""

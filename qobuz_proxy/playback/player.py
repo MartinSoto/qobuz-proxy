@@ -174,6 +174,10 @@ class QobuzPlayer:
                 except asyncio.CancelledError:
                     pass
 
+        # Close any open play report (incl. a paused listen, which no longer
+        # closes on pause) so a shutdown mid-listen still lands in history.
+        await self._report_stopped()
+
         # Stop queue
         await self.queue.stop()
 
@@ -436,20 +440,45 @@ class QobuzPlayer:
                         queue_item_id or 0, track_id, context_uuid
                     ):
                         return
-                elif not stale and context_uuid is not None and cur.context_uuid != context_uuid:
-                    # Same track already loaded, but the controller now supplied
-                    # (or changed) the play context — keep it current so the play
-                    # report carries it. Only overwrite with a real value so a
-                    # later context-less SET_STATE can't wipe a known context.
-                    cur.context_uuid = context_uuid
-                    # The play may already be active in the reporter (we return
-                    # early from _play_locked while PLAYING), so re-sync its
-                    # session or the streaming-end report keeps the old context.
-                    if self._play_reporter:
-                        self._play_reporter.update_context(
-                            track_id=track_id,
-                            context_uuid=self._format_context_uuid(context_uuid),
-                        )
+                elif not stale and queue_item_id and cur.queue_item_id and (
+                    cur.queue_item_id != queue_item_id
+                ):
+                    # Same track but a genuinely different queue occurrence (both
+                    # ids known and differing) — a distinct play. End the prior
+                    # play and adopt the new queue item; the upcoming play (or
+                    # this re-report while PLAYING) starts the new occurrence
+                    # fresh. A late-arriving id (previous id unknown/0) is handled
+                    # by the same-play branch below, so it isn't mistaken for a
+                    # replay.
+                    cur.queue_item_id = queue_item_id
+                    if context_uuid is not None:
+                        cur.context_uuid = context_uuid
+                    await self._report_stopped()
+                    # While PLAYING the play/pause step below returns early
+                    # without re-reporting, so start the new occurrence now,
+                    # using the incoming start position (typically 0) so it
+                    # reports a fresh start. Paused/stopped cases report fresh
+                    # via the subsequent play.
+                    if self._state == PlaybackState.PLAYING:
+                        await self._report_playing(position_ms or 0)
+                elif not stale:
+                    # Same play. Fill in a late queue item id if we never had a
+                    # real one, and adopt a changed/late context. Only overwrite
+                    # context with a real value so a context-less SET_STATE can't
+                    # wipe a known context.
+                    if queue_item_id and not cur.queue_item_id:
+                        cur.queue_item_id = queue_item_id
+                    if context_uuid is not None and cur.context_uuid != context_uuid:
+                        cur.context_uuid = context_uuid
+                        # The play may already be active in the reporter (we
+                        # return early from _play_locked while PLAYING), so
+                        # re-sync its session or the end report keeps the old
+                        # context.
+                        if self._play_reporter:
+                            self._play_reporter.update_context(
+                                track_id=track_id,
+                                context_uuid=self._format_context_uuid(context_uuid),
+                            )
 
             # Position, then play/pause/stop — same order as the app expects.
             if position_ms is not None and not stale:
@@ -624,6 +653,10 @@ class QobuzPlayer:
             self._state = PlaybackState.STOPPED
             self._position_value_ms = saved_position
             self._position_timestamp_ms = int(time.time() * 1000)
+            # End the paused play's report: the next play re-fetches at the new
+            # quality (new blob/format), so it must report as a fresh play rather
+            # than resume this now-stale session.
+            await self._report_stopped()
             return True
 
     async def pause(self) -> bool:
@@ -652,7 +685,12 @@ class QobuzPlayer:
         await self.backend.pause()
         self._state = PlaybackState.PAUSED
         await self._send_state_update()
-        await self._report_stopped()
+        # A pause does not end the listen — keeping the play-reporting session
+        # open across pause/resume avoids emitting a streaming-end (and a
+        # duplicate scrobble) on every pause. The session is closed on a real
+        # stop, track change, or track end. note_paused stops the played-time
+        # clock so paused time is excluded from the reported duration.
+        self._report_paused()
 
         logger.info("Playback paused")
         return True
@@ -721,6 +759,10 @@ class QobuzPlayer:
         if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
             await self.backend.stop()
             self._state = PlaybackState.STOPPED
+            # End the outgoing track's play report now that it's being replaced.
+            # Pause no longer ends the session, so a load-only track change (no
+            # immediate play) would otherwise leave the previous play unreported.
+            await self._report_stopped()
 
         # Create track object. The context UUID identifies the album/playlist the
         # track is played from and is required for Qobuz listening history /
@@ -932,6 +974,11 @@ class QobuzPlayer:
             self._position_value_ms = 0
             self._position_timestamp_ms = int(time.time() * 1000)
             await self._send_state_update()
+            if self._state == PlaybackState.PAUSED:
+                # Restarting a paused track ends the prior listen so the next
+                # resume reports the replay as a fresh play instead of merging
+                # into the open (paused) session.
+                await self._report_stopped()
             return True
 
         # Stop current playback
@@ -1077,6 +1124,11 @@ class QobuzPlayer:
         if not self._play_reporter:
             return
         await self._play_reporter.note_stopped()
+
+    def _report_paused(self) -> None:
+        """Tell the play reporter playback paused (session stays open)."""
+        if self._play_reporter:
+            self._play_reporter.note_paused()
 
     @staticmethod
     def _format_context_uuid(context_uuid: Optional[bytes]) -> Optional[str]:
@@ -1430,6 +1482,9 @@ class QobuzPlayer:
                         # External pause (e.g., DLNA device)
                         self._state = PlaybackState.PAUSED
                         await self._send_state_update()
+                        # Stop the played-time clock so this pause is excluded
+                        # from the reported duration, like an app-driven pause.
+                        self._report_paused()
 
                     # Update position from backend
                     position = await self.backend.get_position()
@@ -1438,6 +1493,15 @@ class QobuzPlayer:
                     # Try to arm gapless if not already armed
                     if not self._gapless_armed:
                         await self._prepare_next_track_for_gapless()
+
+                elif self._state == PlaybackState.PAUSED:
+                    # Keep watching while paused: a pause leaves the play-report
+                    # session open, so an external stop/timeout on the renderer
+                    # must close it (otherwise a later play merges into it).
+                    if await self.backend.get_state() == PlaybackState.STOPPED:
+                        self._state = PlaybackState.STOPPED
+                        await self._send_state_update()
+                        await self._report_stopped()
 
             except asyncio.CancelledError:
                 break
