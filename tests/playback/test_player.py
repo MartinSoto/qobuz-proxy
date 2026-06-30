@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from qobuz_proxy.backends import PlaybackState
 from qobuz_proxy.playback.player import QobuzPlayer
+from qobuz_proxy.playback.queue import QueueTrack, RepeatMode
 
 
 def _make_player(next_track_info=None):
@@ -128,3 +129,89 @@ class TestPrepareNextTrackConcurrency:
         assert player._gapless_armed is False
         assert player._pending_next_track is None
         backend.clear_next_track.assert_awaited()
+
+
+class TestRepeatOneNaturalEnd:
+    """Repeat-one must re-issue play; the backend is already STOPPED on natural end."""
+
+    def _arm_repeat_one(self, player, backend):
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        backend.stop = AsyncMock()
+
+        player._current_track = QueueTrack(
+            queue_item_id=9,
+            track_id="222",
+            streaming_url="http://proxy:7120/audio/222_9.flac",
+        )
+        player._state = PlaybackState.PLAYING
+
+        queue_state = MagicMock()
+        queue_state.repeat_mode = RepeatMode.ONE
+        player.queue.get_state = AsyncMock(return_value=queue_state)
+
+    async def test_restarts_playback_on_natural_end(self):
+        player, backend = _make_player()
+        self._arm_repeat_one(player, backend)
+
+        await player._handle_track_ended(player._current_track)
+
+        # Audio must actually restart — a bare seek(0) on a stopped renderer is silent.
+        backend.play.assert_awaited_once()
+        assert player._state == PlaybackState.PLAYING
+        # The position base is reset to 0 (the live clock interpolates from here,
+        # so assert the stored base rather than the timing-sensitive clock).
+        assert player._position_value_ms == 0
+
+    async def test_refetches_url_so_repeat_does_not_use_expired_link(self):
+        player, backend = _make_player()
+        self._arm_repeat_one(player, backend)
+
+        await player._handle_track_ended(player._current_track)
+
+        # Cached URL is cleared and re-fetched so a long repeat loop never
+        # plays through an expired streaming link.
+        player.metadata.get_streaming_url.assert_awaited()
+
+    async def test_does_not_advance_to_next_track(self):
+        next_info = {"trackId": "999", "queueItemId": 42}
+        player, backend = _make_player(next_track_info=next_info)
+        self._arm_repeat_one(player, backend)
+
+        await player._handle_track_ended(player._current_track)
+
+        # The armed next track must be ignored under repeat-one.
+        assert player._current_track.track_id == "222"
+        # Stale gapless arming is dropped on natural end.
+        assert player._gapless_armed is False
+        assert player._pending_next_track is None
+
+    async def test_restart_yields_to_user_stop(self):
+        """A user Stop that raced the natural end must not be overridden.
+
+        Stop leaves _current_track set but flips state to STOPPED, so the
+        restart must detect the state change and bail.
+        """
+        player, backend = _make_player()
+        self._arm_repeat_one(player, backend)
+        ended_track = player._current_track
+
+        # Stop ran while we were reporting: same track, but state is STOPPED.
+        player._state = PlaybackState.STOPPED
+
+        await player._restart_current_track(ended_track)
+
+        backend.play.assert_not_awaited()
+
+    async def test_restart_yields_to_user_next(self):
+        """A user Next that swapped the current track must not be overridden."""
+        player, backend = _make_player()
+        self._arm_repeat_one(player, backend)
+        ended_track = player._current_track
+
+        # Next ran while we were reporting: a different track is now current.
+        player._current_track = QueueTrack(queue_item_id=10, track_id="333")
+
+        await player._restart_current_track(ended_track)
+
+        backend.play.assert_not_awaited()

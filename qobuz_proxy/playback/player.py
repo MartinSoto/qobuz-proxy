@@ -1091,10 +1091,17 @@ class QobuzPlayer:
     def _on_track_ended(self) -> None:
         """Callback when backend reports track ended naturally."""
         logger.debug("Track ended callback")
-        asyncio.create_task(self._handle_track_ended())
+        # Snapshot the track that ended synchronously, before any queued user
+        # command (stop/next/play) task can run. The automatic repeat restart
+        # is only valid while this exact track is still the active one.
+        asyncio.create_task(self._handle_track_ended(self._current_track))
 
-    async def _handle_track_ended(self) -> None:
-        """Handle natural track end."""
+    async def _handle_track_ended(self, ended_track: Optional[QueueTrack]) -> None:
+        """Handle natural track end.
+
+        ``ended_track`` is the track that was playing when the backend reported
+        the end, used to detect a user command that superseded the restart.
+        """
         # Clear gapless state — prevents stale gapless callbacks from racing
         self._transition_generation += 1
         self._gapless_armed = False
@@ -1108,12 +1115,10 @@ class QobuzPlayer:
         # Get queue state to check repeat mode
         queue_state = await self.queue.get_state()
 
-        if queue_state.repeat_mode == RepeatMode.ONE:
-            # Restart current track
-            await self.backend.seek(0)
-            self._set_position(0)
-            # Replaying the same track counts as a new play.
-            await self._report_playing()
+        if queue_state.repeat_mode == RepeatMode.ONE and ended_track is not None:
+            # Restart the current track from the beginning under repeat-one,
+            # unless a user command superseded us while we were reporting.
+            await self._restart_current_track(ended_track)
             return
 
         # Try to get next track from command handler (SET_STATE nextQueueItem)
@@ -1139,6 +1144,36 @@ class QobuzPlayer:
         self._current_track = None
         self._position_value_ms = 0
         await self._send_state_update()
+
+    async def _restart_current_track(self, ended_track: QueueTrack) -> None:
+        """Restart the current track from the beginning (repeat-one).
+
+        ``ended_track`` is the track that ended. The restart only proceeds while
+        that exact track is still active and the player is still PLAYING — a
+        user stop (-> STOPPED), pause (-> PAUSED), or next/play (different
+        ``_current_track``) that raced the natural end therefore wins, and we
+        skip the replay rather than override their intent.
+        """
+        async with self._playback_lock:
+            if self._current_track is not ended_track or self._state != PlaybackState.PLAYING:
+                logger.debug("repeat-one restart superseded by user command; skipping")
+                return
+            await self._restart_current_track_locked()
+
+    async def _restart_current_track_locked(self) -> None:
+        """Restart the current track, assuming the playback lock is held.
+
+        On natural end the backend has already transitioned to STOPPED, so a
+        bare seek(0) leaves it silent — we must re-issue play. The cached URL
+        is cleared so a fresh, non-expired streaming link is fetched for the
+        repeat. ``_start_playback`` reports the new play; the completed one was
+        already reported by the caller.
+        """
+        if not self._current_track:
+            return
+        self._current_track.streaming_url = None
+        self._set_position(0)
+        await self._start_playback()
 
     def _on_playback_error(self, message: str) -> None:
         """Callback when backend reports playback error."""
