@@ -323,6 +323,7 @@ class TestResumeChecksBackend:
     async def test_failed_resume_stays_paused(self):
         player, backend = _make_player()
         backend.resume = AsyncMock(return_value=False)
+        player._send_state_update = AsyncMock()
         player._current_track = QueueTrack(queue_item_id=9, track_id="222")
         player._state = PlaybackState.PAUSED
 
@@ -330,6 +331,8 @@ class TestResumeChecksBackend:
 
         assert result is False
         assert player._state == PlaybackState.PAUSED
+        # The real PAUSED state is pushed so the app corrects immediately.
+        player._send_state_update.assert_awaited()
 
     async def test_successful_resume_goes_playing(self):
         player, backend = _make_player()

@@ -33,6 +33,13 @@ PREVIOUS_TRACK_THRESHOLD_MS = 3000
 # reportStreamingStart to avoid a duplicate Last.fm scrobble.
 _HANDOFF_POSITION_THRESHOLD_MS = 5000
 
+# While paused, the monitor watches for an external renderer stop. A DLNA
+# get_state() collapses transient read failures (and unrecognized device state
+# strings) to STOPPED, so a real stop must be confirmed by this many consecutive
+# STOPPED polls (~0.5s each) before ending the listen — one bad poll must not
+# prematurely stop a normal paused track or lose its resume position.
+_PAUSED_STOP_CONFIRMATIONS = 3
+
 # After a WebSocket reconnect, the Qobuz server replays its last-known session
 # snapshot via SET_STATE — typically PAUSED at a position from before the drop.
 # If the renderer is actually still playing further along the same track, treat
@@ -85,6 +92,9 @@ class QobuzPlayer:
 
         # State
         self._state: PlaybackState = PlaybackState.STOPPED
+
+        # Consecutive STOPPED polls seen while paused (external-stop detection).
+        self._paused_stop_polls = 0
 
         # Playback command serialization. A track switch in the Qobuz app sends
         # a burst of SET_STATE messages; without this lock the resulting
@@ -443,24 +453,18 @@ class QobuzPlayer:
                 elif not stale and queue_item_id and cur.queue_item_id and (
                     cur.queue_item_id != queue_item_id
                 ):
-                    # Same track but a genuinely different queue occurrence (both
-                    # ids known and differing) — a distinct play. End the prior
-                    # play and adopt the new queue item; the upcoming play (or
-                    # this re-report while PLAYING) starts the new occurrence
-                    # fresh. A late-arriving id (previous id unknown/0) is handled
-                    # by the same-play branch below, so it isn't mistaken for a
-                    # replay.
+                    # Same track but a different known queue occurrence id. Adopt
+                    # it. Only split the play report when not currently playing:
+                    # a paused/stopped track re-armed from a different slot is a
+                    # distinct play, so end the prior report and let the
+                    # subsequent play report fresh. While PLAYING the audio is
+                    # continuous (e.g. a queue reorder reassigned the id), so it
+                    # stays one listen — splitting it would double-scrobble.
                     cur.queue_item_id = queue_item_id
                     if context_uuid is not None:
                         cur.context_uuid = context_uuid
-                    await self._report_stopped()
-                    # While PLAYING the play/pause step below returns early
-                    # without re-reporting, so start the new occurrence now,
-                    # using the incoming start position (typically 0) so it
-                    # reports a fresh start. Paused/stopped cases report fresh
-                    # via the subsequent play.
-                    if self._state == PlaybackState.PLAYING:
-                        await self._report_playing(position_ms or 0)
+                    if self._state != PlaybackState.PLAYING:
+                        await self._report_stopped()
                 elif not stale:
                     # Same play. Fill in a late queue item id if we never had a
                     # real one, and adopt a changed/late context. Only overwrite
@@ -560,8 +564,11 @@ class QobuzPlayer:
         if self._state == PlaybackState.PAUSED:
             if not await self.backend.resume():
                 # The renderer rejected the resume (e.g. SOAP failure) — stay
-                # PAUSED rather than reporting PLAYING over a silent device.
+                # PAUSED rather than reporting PLAYING over a silent device, and
+                # push the real PAUSED state so the app (which requested PLAY)
+                # corrects immediately instead of waiting for the next heartbeat.
                 logger.warning("Backend failed to resume; remaining paused")
+                await self._send_state_update()
                 return False
             self._state = PlaybackState.PLAYING
             self._position_timestamp_ms = int(time.time() * 1000)
@@ -1472,6 +1479,7 @@ class QobuzPlayer:
                 await asyncio.sleep(0.5)
 
                 if self._state == PlaybackState.PLAYING:
+                    self._paused_stop_polls = 0
                     # Poll backend state
                     backend_state = await self.backend.get_state()
 
@@ -1498,10 +1506,21 @@ class QobuzPlayer:
                     # Keep watching while paused: a pause leaves the play-report
                     # session open, so an external stop/timeout on the renderer
                     # must close it (otherwise a later play merges into it).
+                    # Require consecutive STOPPED polls before trusting it —
+                    # get_state() reports STOPPED on a transient read failure, and
+                    # one bad poll must not end a normal paused listen.
                     if await self.backend.get_state() == PlaybackState.STOPPED:
-                        self._state = PlaybackState.STOPPED
-                        await self._send_state_update()
-                        await self._report_stopped()
+                        self._paused_stop_polls += 1
+                        if self._paused_stop_polls >= _PAUSED_STOP_CONFIRMATIONS:
+                            self._paused_stop_polls = 0
+                            self._state = PlaybackState.STOPPED
+                            await self._send_state_update()
+                            await self._report_stopped()
+                    else:
+                        self._paused_stop_polls = 0
+
+                else:
+                    self._paused_stop_polls = 0
 
             except asyncio.CancelledError:
                 break

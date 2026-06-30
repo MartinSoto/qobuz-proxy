@@ -170,18 +170,7 @@ class TestPlayerReporting:
         # A brand-new start was reported (not merged into the old session).
         assert api.report_streaming_start.await_count == 2
 
-    async def test_external_stop_while_paused_closes_report(self) -> None:
-        """An external renderer stop after an app pause must close the open
-        play-report session (the monitor keeps watching while paused)."""
-        player, api = _make_player_with_reporter()
-        await player.play_track(queue_item_id=1, track_id="100")
-        await player.pause()
-        api.report_streaming_end.assert_not_awaited()
-
-        # The renderer is stopped externally while we believe we're paused.
-        player.backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
-        player.backend.get_position = AsyncMock(return_value=0)
-
+    async def _run_monitor_briefly(self, player) -> None:
         player._is_running = True
         task = asyncio.create_task(player._playback_monitor_loop())
         await asyncio.sleep(0.6)  # allow one poll cycle (loop sleeps 0.5s)
@@ -192,9 +181,39 @@ class TestPlayerReporting:
         except asyncio.CancelledError:
             pass
 
+    async def test_external_stop_while_paused_closes_report_after_confirmation(self) -> None:
+        """An external renderer stop (confirmed by consecutive polls) after an
+        app pause must close the open play-report session."""
+        from qobuz_proxy.playback.player import _PAUSED_STOP_CONFIRMATIONS
+
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        await player.pause()
+
+        # The renderer is stopped externally; one more poll crosses the
+        # confirmation threshold.
+        player.backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        player._paused_stop_polls = _PAUSED_STOP_CONFIRMATIONS - 1
+
+        await self._run_monitor_briefly(player)
+
         assert player.state == PlaybackState.STOPPED
         api.report_streaming_end.assert_awaited_once()
         assert api.report_streaming_end.await_args.kwargs["track_id"] == "100"
+
+    async def test_single_transient_stop_while_paused_does_not_close(self) -> None:
+        """A single STOPPED reading (e.g. a transient SOAP failure, which
+        get_state collapses to STOPPED) must not end a normal paused listen."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        await player.pause()
+
+        player.backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+
+        await self._run_monitor_briefly(player)  # one poll only
+
+        assert player.state == PlaybackState.PAUSED
+        api.report_streaming_end.assert_not_awaited()
 
     async def test_switching_track_reports_end_then_start(self) -> None:
         player, api = _make_player_with_reporter()
@@ -279,36 +298,23 @@ class TestPlayerReporting:
         assert api.report_streaming_start.await_count == 1
         assert player.current_track.queue_item_id == 5
 
-    async def test_same_track_new_queue_item_while_playing_ends_old(self) -> None:
-        """A queue-item change to the same track while PLAYING must end the old
-        play (the PLAYING play step does not re-report)."""
+    async def test_same_track_new_queue_item_while_playing_keeps_one_listen(self) -> None:
+        """A queue-item change to the same track while PLAYING (continuous audio,
+        e.g. a queue reorder reassigned the id) must NOT split the listen — that
+        would double-scrobble. It adopts the id and stays one play."""
         player, api = _make_player_with_reporter()
         await player.play_track(queue_item_id=1, track_id="100")
         assert api.report_streaming_start.await_count == 1
 
-        # Same track, new queue item from position 0, still playing.
+        # Same track, new queue item, still playing uninterrupted.
         await player.apply_remote_state(
             track_id="100", queue_item_id=2, position_ms=0, playing_state=2
         )
 
-        # The prior occurrence's play was ended and the fresh occurrence started.
-        api.report_streaming_end.assert_awaited_once()
-        assert api.report_streaming_start.await_count == 2
-
-    async def test_same_track_new_queue_item_handoff_suppresses_start(self) -> None:
-        """A new queue occurrence adopted mid-stream (non-zero start) is tracked
-        but must not re-report a start the controller already owns."""
-        player, api = _make_player_with_reporter()
-        await player.play_track(queue_item_id=1, track_id="100")
+        # One continuous listen: no extra end/start, but the id is adopted.
+        api.report_streaming_end.assert_not_awaited()
         assert api.report_streaming_start.await_count == 1
-
-        # New queue item but adopted at ~30s (handoff) — no fresh start.
-        await player.apply_remote_state(
-            track_id="100", queue_item_id=2, position_ms=30000, playing_state=2
-        )
-
-        api.report_streaming_end.assert_awaited_once()
-        assert api.report_streaming_start.await_count == 1
+        assert player.current_track.queue_item_id == 2
 
     async def test_shutdown_while_paused_reports_end(self) -> None:
         """Shutting down mid-listen (paused) must still close the play report."""
