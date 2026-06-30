@@ -70,9 +70,14 @@ class AudioBackend(ABC):
         pass
 
     @abstractmethod
-    async def resume(self) -> None:
-        """Resume paused playback."""
-        pass
+    async def resume(self) -> bool:
+        """Resume paused playback.
+
+        Returns:
+            True if the backend resumed, False if it could not (e.g. the
+            renderer rejected the command).
+        """
+        ...
 
     @abstractmethod
     async def stop(self) -> None:

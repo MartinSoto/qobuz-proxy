@@ -322,10 +322,16 @@ class DLNABackend(AudioBackend):
         if self._client and await self._client.pause():
             self._notify_state_change(PlaybackState.PAUSED)
 
-    async def resume(self) -> None:
-        """Resume playback."""
+    async def resume(self) -> bool:
+        """Resume playback.
+
+        Returns True only when the renderer accepted the play command — a
+        failed SOAP call must not be reported as a successful resume.
+        """
         if self._client and await self._client.play():
             self._notify_state_change(PlaybackState.PLAYING)
+            return True
+        return False
 
     async def stop(self) -> None:
         """Stop playback."""

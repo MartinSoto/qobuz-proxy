@@ -508,7 +508,11 @@ class QobuzPlayer:
 
         # Resume from pause
         if self._state == PlaybackState.PAUSED:
-            await self.backend.resume()
+            if not await self.backend.resume():
+                # The renderer rejected the resume (e.g. SOAP failure) — stay
+                # PAUSED rather than reporting PLAYING over a silent device.
+                logger.warning("Backend failed to resume; remaining paused")
+                return False
             self._state = PlaybackState.PLAYING
             self._position_timestamp_ms = int(time.time() * 1000)
             await self._send_state_update()

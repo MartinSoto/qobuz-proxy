@@ -131,6 +131,32 @@ class TestPrepareNextTrackConcurrency:
         backend.clear_next_track.assert_awaited()
 
 
+class TestResumeChecksBackend:
+    """Resume must not report PLAYING unless the backend actually resumed."""
+
+    async def test_failed_resume_stays_paused(self):
+        player, backend = _make_player()
+        backend.resume = AsyncMock(return_value=False)
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
+        player._state = PlaybackState.PAUSED
+
+        result = await player.play()
+
+        assert result is False
+        assert player._state == PlaybackState.PAUSED
+
+    async def test_successful_resume_goes_playing(self):
+        player, backend = _make_player()
+        backend.resume = AsyncMock(return_value=True)
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
+        player._state = PlaybackState.PAUSED
+
+        result = await player.play()
+
+        assert result is True
+        assert player._state == PlaybackState.PLAYING
+
+
 class TestRepeatOneNaturalEnd:
     """Repeat-one must re-issue play; the backend is already STOPPED on natural end."""
 

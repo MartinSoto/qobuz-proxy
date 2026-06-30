@@ -192,10 +192,13 @@ class LocalAudioBackend(AudioBackend):
             self._stream.pause()
         self._notify_state_change(PlaybackState.PAUSED)
 
-    async def resume(self) -> None:
-        if self._stream:
-            self._stream.resume()
+    async def resume(self) -> bool:
+        if not self._stream:
+            # Nothing to resume — the output stream is gone.
+            return False
+        self._stream.resume()
         self._notify_state_change(PlaybackState.PLAYING)
+        return True
 
     async def stop(self) -> None:
         await self._cancel_feeding()
