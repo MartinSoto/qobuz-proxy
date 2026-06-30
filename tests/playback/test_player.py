@@ -294,6 +294,29 @@ class TestContextUuidPropagation:
         assert player._current_track.context_uuid == ctx
 
 
+class TestNextAtEndOfQueue:
+    """Skipping past the end of the queue must still report the finished play."""
+
+    async def test_reports_stopped_at_end_of_queue(self):
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        reporter = MagicMock()
+        reporter.note_playing = AsyncMock()
+        reporter.note_stopped = AsyncMock()
+        player._play_reporter = reporter
+
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
+        player._state = PlaybackState.PLAYING
+        player.queue.advance_to_next = AsyncMock(return_value=None)  # end of queue
+
+        result = await player.next_track()
+
+        assert result is False
+        assert player._state == PlaybackState.STOPPED
+        # The finished play is reported so it scrobbles and the session closes.
+        reporter.note_stopped.assert_awaited_once()
+
+
 class TestResumeChecksBackend:
     """Resume must not report PLAYING unless the backend actually resumed."""
 

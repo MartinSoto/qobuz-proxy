@@ -886,6 +886,10 @@ class QobuzPlayer:
             self._current_track = None
             self._position_value_ms = 0
             await self._send_state_update()
+            # Report the finished play so the last track lands in listening
+            # history / is scrobbled, and the lingering session is closed (an
+            # open session would inflate the next play's reported duration).
+            await self._report_stopped()
             logger.info("End of queue - playback stopped")
             return False
 
