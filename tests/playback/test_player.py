@@ -1,6 +1,7 @@
 """Tests for QobuzPlayer gapless re-arming."""
 
 import asyncio
+import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 from qobuz_proxy.backends import PlaybackState
@@ -129,6 +130,168 @@ class TestPrepareNextTrackConcurrency:
         assert player._gapless_armed is False
         assert player._pending_next_track is None
         backend.clear_next_track.assert_awaited()
+
+
+class TestContextUuidPropagation:
+    """The album/playlist context UUID must reach the played track for scrobbles."""
+
+    async def test_apply_remote_state_sets_context_uuid(self):
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        backend.seek = AsyncMock()
+        ctx = uuid.UUID("12345678-1234-5678-1234-567812345678").bytes
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=None,
+            playing_state=None,
+            context_uuid=ctx,
+        )
+
+        assert player._current_track.context_uuid == ctx
+
+    async def test_load_track_defaults_context_to_none(self):
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+
+        await player._load_track_locked(9, "222")
+
+        assert player._current_track.context_uuid is None
+
+    async def test_play_report_carries_formatted_context_uuid(self):
+        player, backend = _make_player()
+        backend.play = AsyncMock()
+        backend.stop = AsyncMock()
+        backend.seek = AsyncMock()
+        reporter = MagicMock()
+        reporter.note_playing = AsyncMock()
+        reporter.note_stopped = AsyncMock()
+        player._play_reporter = reporter
+        player.metadata.get_track_actual_quality.return_value = 6
+        player.metadata.get_track_blob.return_value = "blob"
+
+        ctx = uuid.UUID("12345678-1234-5678-1234-567812345678").bytes
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=0,
+            playing_state=2,  # PLAYING
+            context_uuid=ctx,
+        )
+
+        reporter.note_playing.assert_awaited()
+        assert (
+            reporter.note_playing.await_args.kwargs["context_uuid"]
+            == "12345678-1234-5678-1234-567812345678"
+        )
+
+    async def test_same_track_set_state_updates_late_context(self):
+        """A later SET_STATE for the already-loaded track must adopt its context."""
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        backend.seek = AsyncMock()
+        # First SET_STATE: same track, no context yet.
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
+        ctx = uuid.UUID("12345678-1234-5678-1234-567812345678").bytes
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=None,
+            playing_state=None,
+            context_uuid=ctx,
+        )
+
+        assert player._current_track.context_uuid == ctx
+
+    async def test_same_track_context_less_set_state_keeps_context(self):
+        """A context-less SET_STATE must not wipe a known context."""
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        backend.seek = AsyncMock()
+        ctx = uuid.UUID("12345678-1234-5678-1234-567812345678").bytes
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222", context_uuid=ctx)
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=None,
+            playing_state=None,
+            context_uuid=None,
+        )
+
+        assert player._current_track.context_uuid == ctx
+
+    async def test_stale_pause_snapshot_does_not_overwrite_context(self):
+        """A stale reconnect snapshot must not replace the live play context."""
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        backend.seek = AsyncMock()
+        live_ctx = uuid.UUID("12345678-1234-5678-1234-567812345678").bytes
+        stale_ctx = uuid.UUID("99999999-9999-9999-9999-999999999999").bytes
+
+        # Live: playing the track at ~60s with the real context.
+        player._current_track = QueueTrack(
+            queue_item_id=9, track_id="222", context_uuid=live_ctx
+        )
+        player._state = PlaybackState.PLAYING
+        player._position_value_ms = 60_000
+        player._position_timestamp_ms = 0  # avoid time-based interpolation drift
+
+        reporter = MagicMock()
+        reporter.update_context = MagicMock()
+        player._play_reporter = reporter
+
+        # Stale PAUSED snapshot: same track, far-behind position, different context.
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=1_000,
+            playing_state=3,  # PAUSED
+            context_uuid=stale_ctx,
+        )
+
+        assert player._current_track.context_uuid == live_ctx
+        reporter.update_context.assert_not_called()
+
+    async def test_next_track_context_change_triggers_rearm(self):
+        """A changed next-track context must re-arm gapless, not no-op."""
+        ctx_old = uuid.UUID("11111111-1111-1111-1111-111111111111").bytes
+        ctx_new = uuid.UUID("22222222-2222-2222-2222-222222222222").bytes
+        new_next = {"trackId": "222", "queueItemId": 9, "contextUuid": ctx_new}
+        player, backend = _make_player(next_track_info=new_next)
+        player._state = PlaybackState.PLAYING
+        player._gapless_armed = True
+        # Armed for the same track/queue item but with the old context.
+        player._pending_next_track = {
+            "trackId": "222",
+            "queueItemId": 9,
+            "contextUuid": ctx_old,
+        }
+
+        await player.on_next_track_info_changed()
+
+        # Re-armed (cleared then prepared) rather than kept stale.
+        backend.clear_next_track.assert_awaited_once()
+
+    async def test_gapless_transition_carries_context_uuid(self):
+        player, backend = _make_player()
+        player._gapless_armed = True
+        ctx = uuid.UUID("12345678-1234-5678-1234-567812345678").bytes
+        player._pending_next_track = {
+            "trackId": "222",
+            "queueItemId": 9,
+            "contextUuid": ctx,
+            "url": "http://proxy:7120/audio/222_9.flac",
+            "metadata": {"duration_ms": 1000},
+            "backend_meta": None,
+        }
+        player.metadata.get_track_actual_quality.return_value = 6
+
+        await player._handle_gapless_transition()
+
+        assert player._current_track.context_uuid == ctx
 
 
 class TestResumeChecksBackend:

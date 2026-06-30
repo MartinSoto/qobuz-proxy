@@ -73,6 +73,30 @@ class TestPlayReporter:
         )
         api.report_streaming_start.assert_not_awaited()
 
+    async def test_update_context_applies_to_end_report(self) -> None:
+        """A context that arrives after the play started must reach the end report."""
+        reporter, api, clock = _reporter()
+        # Play started without a context (controller hadn't sent it yet).
+        await reporter.note_playing(track_id="100", format_id=27, blob="b", context_uuid=None)
+
+        reporter.update_context(track_id="100", context_uuid="late-ctx")
+
+        clock["ms"] += 10_000
+        await reporter.note_stopped()
+        assert api.report_streaming_end.await_args.kwargs["context_uuid"] == "late-ctx"
+
+    async def test_update_context_ignores_wrong_track_and_none(self) -> None:
+        reporter, api, _ = _reporter()
+        await reporter.note_playing(track_id="100", format_id=27, blob="b", context_uuid="orig")
+
+        # Wrong track: ignored.
+        reporter.update_context(track_id="999", context_uuid="other")
+        # None value: must not wipe a known context.
+        reporter.update_context(track_id="100", context_uuid=None)
+
+        await reporter.note_stopped()
+        assert api.report_streaming_end.await_args.kwargs["context_uuid"] == "orig"
+
     async def test_switching_track_ends_previous_then_starts_new(self) -> None:
         reporter, api, clock = _reporter()
         await reporter.note_playing(track_id="100", format_id=27, blob="b1", context_uuid="u1")

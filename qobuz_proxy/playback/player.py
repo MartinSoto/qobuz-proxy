@@ -394,6 +394,7 @@ class QobuzPlayer:
         queue_item_id: Optional[int],
         position_ms: Optional[int],
         playing_state: Optional[int],
+        context_uuid: Optional[bytes] = None,
     ) -> None:
         """Apply a full SET_STATE intent from the app atomically.
 
@@ -411,6 +412,8 @@ class QobuzPlayer:
             position_ms: Target position, or None if no currentPosition was sent.
             playing_state: Proto playing state (1=STOPPED, 2=PLAYING, 3=PAUSED),
                 or None if the message had no playingState.
+            context_uuid: Album/playlist context bytes for the target track, used
+                for play reporting (listening history / scrobbles).
         """
         gen = self._next_generation()
         async with self._playback_lock:
@@ -418,17 +421,35 @@ class QobuzPlayer:
                 logger.debug("SET_STATE superseded by newer command; skipping")
                 return
 
+            # Detect a stale session-restore snapshot (server replays an old
+            # PAUSED position after a reconnect while we're still playing). Done
+            # before any mutation so a replayed snapshot can't overwrite live
+            # state (position or context) with its outdated values.
+            stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
+
             # Load if a track is specified and differs from the loaded one.
             if track_id is not None:
                 cur = self._current_track
                 if cur is None or cur.track_id != track_id:
                     logger.info(f"Loading new track: {track_id}")
-                    if not await self._load_track_locked(queue_item_id or 0, track_id):
+                    if not await self._load_track_locked(
+                        queue_item_id or 0, track_id, context_uuid
+                    ):
                         return
-
-            # Detect a stale session-restore snapshot (server replays an old
-            # PAUSED position after a reconnect while we're still playing).
-            stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
+                elif not stale and context_uuid is not None and cur.context_uuid != context_uuid:
+                    # Same track already loaded, but the controller now supplied
+                    # (or changed) the play context — keep it current so the play
+                    # report carries it. Only overwrite with a real value so a
+                    # later context-less SET_STATE can't wipe a known context.
+                    cur.context_uuid = context_uuid
+                    # The play may already be active in the reporter (we return
+                    # early from _play_locked while PLAYING), so re-sync its
+                    # session or the streaming-end report keeps the old context.
+                    if self._play_reporter:
+                        self._play_reporter.update_context(
+                            track_id=track_id,
+                            context_uuid=self._format_context_uuid(context_uuid),
+                        )
 
             # Position, then play/pause/stop — same order as the app expects.
             if position_ms is not None and not stale:
@@ -692,6 +713,7 @@ class QobuzPlayer:
         self,
         queue_item_id: int,
         track_id: str,
+        context_uuid: Optional[bytes] = None,
     ) -> bool:
         logger.info(f"Loading track: track_id={track_id}, queue_item_id={queue_item_id}")
 
@@ -700,10 +722,13 @@ class QobuzPlayer:
             await self.backend.stop()
             self._state = PlaybackState.STOPPED
 
-        # Create track object
+        # Create track object. The context UUID identifies the album/playlist the
+        # track is played from and is required for Qobuz listening history /
+        # Last.fm scrobbles, so it must be carried onto the QueueTrack.
         self._current_track = QueueTrack(
             queue_item_id=queue_item_id,
             track_id=track_id,
+            context_uuid=context_uuid,
         )
 
         # Pre-fetch URL and metadata
@@ -733,6 +758,7 @@ class QobuzPlayer:
         queue_item_id: int,
         track_id: str,
         position_ms: int = 0,
+        context_uuid: Optional[bytes] = None,
     ) -> bool:
         """
         Play a specific track from the queue.
@@ -741,6 +767,7 @@ class QobuzPlayer:
             queue_item_id: Queue item identifier
             track_id: Qobuz track ID
             position_ms: Starting position in milliseconds
+            context_uuid: Album/playlist context bytes, used for play reporting.
 
         Returns:
             True if playback started successfully
@@ -750,13 +777,16 @@ class QobuzPlayer:
             if gen != self._command_generation:
                 logger.debug("play_track superseded by newer command; skipping")
                 return False
-            return await self._play_track_locked(queue_item_id, track_id, position_ms)
+            return await self._play_track_locked(
+                queue_item_id, track_id, position_ms, context_uuid
+            )
 
     async def _play_track_locked(
         self,
         queue_item_id: int,
         track_id: str,
         position_ms: int = 0,
+        context_uuid: Optional[bytes] = None,
     ) -> bool:
         # Clear gapless state — explicit track change
         self._clear_gapless_state()
@@ -766,7 +796,7 @@ class QobuzPlayer:
         )
 
         # Load the track first
-        if not await self._load_track_locked(queue_item_id, track_id):
+        if not await self._load_track_locked(queue_item_id, track_id, context_uuid):
             return False
 
         # Set starting position
@@ -1139,6 +1169,7 @@ class QobuzPlayer:
                     queue_item_id=next_track_info["queueItemId"],
                     track_id=next_track_info["trackId"],
                     position_ms=0,
+                    context_uuid=next_track_info.get("contextUuid"),
                 )
                 return
 
@@ -1264,6 +1295,7 @@ class QobuzPlayer:
                 self._pending_next_track = {
                     "trackId": track_id,
                     "queueItemId": queue_item_id,
+                    "contextUuid": next_track_info.get("contextUuid"),
                     "url": url,
                     "metadata": meta,
                     "backend_meta": backend_meta,
@@ -1306,6 +1338,7 @@ class QobuzPlayer:
         self._current_track = QueueTrack(
             queue_item_id=queue_item_id,
             track_id=track_id,
+            context_uuid=next_info.get("contextUuid"),
             streaming_url=next_info.get("url"),
             metadata=meta or {},
             duration_ms=meta.get("duration_ms", 0) if meta else 0,
@@ -1354,6 +1387,7 @@ class QobuzPlayer:
             and pending is not None
             and new_info["trackId"] == pending["trackId"]
             and new_info["queueItemId"] == pending["queueItemId"]
+            and new_info.get("contextUuid") == pending.get("contextUuid")
         ):
             logger.debug("Gapless: next track unchanged, keeping current arming")
             return

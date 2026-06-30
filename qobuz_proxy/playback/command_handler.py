@@ -112,10 +112,12 @@ class PlaybackCommandHandler:
         current_item = None
         current_queue_item_id = None
         current_track_id = None
+        current_context_uuid = None
         if state.HasField("currentQueueItem"):
             current_item = state.currentQueueItem
             current_queue_item_id = current_item.queueItemId
             current_track_id = current_item.trackId
+            current_context_uuid = current_item.contextUuid if current_item.contextUuid else None
             logger.debug(
                 f"Current queue item: queueItemId={current_queue_item_id}, trackId={current_track_id}"
             )
@@ -124,16 +126,30 @@ class PlaybackCommandHandler:
         next_track_changed = False
         if state.HasField("nextQueueItem"):
             next_item = state.nextQueueItem
-            new_next_info = {
-                "queueItemId": next_item.queueItemId,
-                "trackId": str(next_item.trackId),
-                "contextUuid": next_item.contextUuid if next_item.contextUuid else None,
-            }
-            # Detect change by queueItemId (handles same track at different positions)
             old_queue_item_id = (
                 self._next_track_info.get("queueItemId") if self._next_track_info else None
             )
-            if new_next_info["queueItemId"] != old_queue_item_id:
+            old_context_uuid = (
+                self._next_track_info.get("contextUuid") if self._next_track_info else None
+            )
+            new_context_uuid = next_item.contextUuid if next_item.contextUuid else None
+            # Preserve a previously-known context if the server resends the same
+            # next item without the optional contextUuid, so we don't lose it for
+            # the next play (mirrors the current-track behaviour).
+            if new_context_uuid is None and next_item.queueItemId == old_queue_item_id:
+                new_context_uuid = old_context_uuid
+            new_next_info = {
+                "queueItemId": next_item.queueItemId,
+                "trackId": str(next_item.trackId),
+                "contextUuid": new_context_uuid,
+            }
+            # Detect change by queueItemId (handles same track at different
+            # positions) or by a changed/late-arriving context UUID, which the
+            # gapless arm must pick up so the next play reports the right context.
+            if (
+                new_next_info["queueItemId"] != old_queue_item_id
+                or new_next_info["contextUuid"] != old_context_uuid
+            ):
                 next_track_changed = True
             self._next_track_info = new_next_info
             logger.debug(
@@ -157,6 +173,7 @@ class PlaybackCommandHandler:
             queue_item_id=current_queue_item_id,
             position_ms=state.currentPosition if state.HasField("currentPosition") else None,
             playing_state=state.playingState if state.HasField("playingState") else None,
+            context_uuid=current_context_uuid,
         )
 
         # Notify gapless system about next track change (after state handling)

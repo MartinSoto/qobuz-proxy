@@ -72,6 +72,22 @@ class PlayReporter:
         if report_start:
             await self._api.report_streaming_start(track_id=track_id, format_id=format_id)
 
+    def update_context(self, *, track_id: str, context_uuid: Optional[str]) -> None:
+        """Adopt a context UUID that arrived after the play started.
+
+        The controller sometimes supplies the play context in a later SET_STATE
+        than the one that began the play. Without this, the streaming-end report
+        for the active play would carry a stale/None context. Only a real value
+        for the currently-active track is applied, so a context-less resend
+        cannot wipe a known context.
+        """
+        if (
+            self._active is not None
+            and self._active.track_id == track_id
+            and context_uuid is not None
+        ):
+            self._active.context_uuid = context_uuid
+
     async def note_stopped(self) -> None:
         """Mark that playback stopped (pause/stop/track-end). Idempotent."""
         await self._end_active()

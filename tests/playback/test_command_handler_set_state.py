@@ -21,6 +21,7 @@ def _set_state_msg(
     queue_item_id: int,
     playing_state: int | None = 2,
     position_ms: int | None = None,
+    context_uuid: bytes | None = None,
 ):
     """Build a server->renderer SET_STATE (type 41) protobuf message."""
     msg = pb.QConnectMessage()
@@ -32,6 +33,8 @@ def _set_state_msg(
         st.currentPosition = position_ms
     st.currentQueueItem.queueItemId = queue_item_id
     st.currentQueueItem.trackId = track_id
+    if context_uuid is not None:
+        st.currentQueueItem.contextUuid = context_uuid
     return msg
 
 
@@ -46,6 +49,41 @@ class TestSetStateHandling:
         assert player.current_track.track_id == "2001"
         assert backend.played == ["2001"]
         assert player.state == PlaybackState.PLAYING
+
+    async def test_set_state_propagates_context_uuid(self) -> None:
+        """The currentQueueItem context UUID must reach the played track so
+        the play report (listening history / scrobble) carries it."""
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+
+        ctx = bytes(range(16))
+        await handler._handle_set_state(
+            _set_state_msg(track_id=2001, queue_item_id=5, context_uuid=ctx)
+        )
+
+        assert player.current_track is not None
+        assert player.current_track.context_uuid == ctx
+
+    async def test_next_item_context_preserved_on_contextless_resend(self) -> None:
+        """A context-less resend of the same nextQueueItem must keep the context."""
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        ctx = bytes(range(16))
+
+        first = _set_state_msg(track_id=1, queue_item_id=1)
+        first.srvrRndrSetState.nextQueueItem.queueItemId = 2
+        first.srvrRndrSetState.nextQueueItem.trackId = 1002
+        first.srvrRndrSetState.nextQueueItem.contextUuid = ctx
+        await handler._handle_set_state(first)
+        assert handler.get_next_track_info()["contextUuid"] == ctx
+
+        # Server resends the same next item without the optional contextUuid.
+        second = _set_state_msg(track_id=1, queue_item_id=1)
+        second.srvrRndrSetState.nextQueueItem.queueItemId = 2
+        second.srvrRndrSetState.nextQueueItem.trackId = 1002
+        await handler._handle_set_state(second)
+
+        assert handler.get_next_track_info()["contextUuid"] == ctx
 
     async def test_overlapping_set_state_newest_wins(self) -> None:
         """Two SET_STATE messages handled concurrently (as independent tasks):
