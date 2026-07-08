@@ -91,7 +91,9 @@ class QueueHandler:
 
         This is sent when tracks are loaded into the queue (play command).
         """
-        load_msg = message.srvrCtrlQueueLoadTracks
+        # Field is srvrCtrlQueueTracksLoaded (its *type* is SrvrCtrlQueueLoadTracks;
+        # ctrlSrvrQueueLoadTracks is the controller→server direction)
+        load_msg = message.srvrCtrlQueueTracksLoaded
 
         # Extract version
         version = QueueVersion(
