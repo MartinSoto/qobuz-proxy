@@ -7,11 +7,16 @@ Handles track ordering, shuffle, repeat, and preloading.
 import asyncio
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine, Optional
 
 logger = logging.getLogger(__name__)
+
+# How long a cached streaming URL may be trusted. Qobuz signed URLs live for
+# ~5 minutes; anything older than this must be re-fetched before use.
+URL_CACHE_TTL_SECONDS = 240.0
 
 
 class RepeatMode(Enum):
@@ -44,6 +49,18 @@ class QueueTrack:
     metadata: dict[str, Any] = field(default_factory=dict)
     start_ms: int = 0
     duration_ms: int = 0
+    url_fetched_at: float = 0.0  # time.time() when streaming_url was cached
+
+    def set_streaming_url(self, url: Optional[str]) -> None:
+        """Cache a streaming URL together with its fetch time."""
+        self.streaming_url = url
+        self.url_fetched_at = time.time() if url else 0.0
+
+    def url_is_stale(self, ttl_s: float = URL_CACHE_TTL_SECONDS) -> bool:
+        """Whether the cached URL must be treated as absent (missing or past TTL)."""
+        if not self.streaming_url:
+            return True
+        return (time.time() - self.url_fetched_at) >= ttl_s
 
 
 @dataclass
@@ -478,8 +495,9 @@ class QobuzQueue:
                 track_index = self._shuffled_indexes[idx]
                 track = self._tracks[track_index]
 
-                # Skip if already preloaded
-                if track.queue_item_id in self._preloaded_ids:
+                # Skip if already preloaded — unless its cached URL went stale,
+                # in which case it needs a fresh one before it can be played
+                if track.queue_item_id in self._preloaded_ids and not track.url_is_stale():
                     continue
 
                 tracks_to_preload.append(track)
@@ -498,11 +516,11 @@ class QobuzQueue:
                             f"{metadata.get('artist', '?')} - {metadata.get('title', '?')}"
                         )
 
-                # Fetch URL if missing
-                if not track.streaming_url and self._get_url_callback:
+                # Fetch URL if missing or stale
+                if track.url_is_stale() and self._get_url_callback:
                     url = await self._get_url_callback(track.track_id)
                     if url:
-                        track.streaming_url = url
+                        track.set_streaming_url(url)
                         logger.debug(f"Preloaded URL for track {track.track_id}")
 
                 # Mark as preloaded

@@ -450,8 +450,11 @@ class QobuzPlayer:
                         queue_item_id or 0, track_id, context_uuid
                     ):
                         return
-                elif not stale and queue_item_id and cur.queue_item_id and (
-                    cur.queue_item_id != queue_item_id
+                elif (
+                    not stale
+                    and queue_item_id
+                    and cur.queue_item_id
+                    and (cur.queue_item_id != queue_item_id)
                 ):
                     # Same track but a different known queue occurrence id. Adopt
                     # it. Only split the play report when not currently playing:
@@ -784,7 +787,7 @@ class QobuzPlayer:
         try:
             url = await self._get_track_url(track_id)
             if url:
-                self._current_track.streaming_url = url
+                self._current_track.set_streaming_url(url)
             else:
                 logger.error(f"Failed to get URL for track {track_id}")
                 return False
@@ -826,9 +829,7 @@ class QobuzPlayer:
             if gen != self._command_generation:
                 logger.debug("play_track superseded by newer command; skipping")
                 return False
-            return await self._play_track_locked(
-                queue_item_id, track_id, position_ms, context_uuid
-            )
+            return await self._play_track_locked(queue_item_id, track_id, position_ms, context_uuid)
 
     async def _play_track_locked(
         self,
@@ -1031,8 +1032,10 @@ class QobuzPlayer:
         await self._send_state_update()
 
         try:
-            # Get streaming URL if not cached
-            url = track.streaming_url
+            # Get streaming URL if not cached. A cached URL past its TTL is
+            # treated as absent: a track loaded PAUSED and played later than
+            # the URL lifetime must not start from an expired URL.
+            url = None if track.url_is_stale() else track.streaming_url
             if not url:
                 url = await self._get_track_url(track.track_id)
                 if not url:
@@ -1040,7 +1043,7 @@ class QobuzPlayer:
                     self._state = PlaybackState.ERROR
                     await self._send_state_update()
                     return False
-                track.streaming_url = url
+                track.set_streaming_url(url)
 
             # Get metadata if not cached
             meta: Optional[dict] = track.metadata if track.metadata else None

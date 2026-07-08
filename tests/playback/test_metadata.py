@@ -420,6 +420,38 @@ class TestMetadataService:
         assert url2 == "https://streaming.example.com/second.flac"
 
     @pytest.mark.asyncio
+    async def test_failed_refresh_clears_expired_url(
+        self, metadata_service: MetadataService, mock_api: MockAPIClient
+    ) -> None:
+        """An expired URL must not be served as valid when its refresh fails."""
+        mock_api.get_track_metadata.return_value = {
+            "title": "Test Track",
+            "artist": "Test Artist",
+            "album": "Test Album",
+            "duration_ms": 180000,
+            "album_art_url": "",
+        }
+        mock_api.get_track_url.return_value = {
+            "url": "https://streaming.example.com/old.flac",
+            "format_id": 27,
+            "bit_depth": 24,
+            "sampling_rate": 192.0,
+            "mime_type": "audio/flac",
+        }
+
+        url1 = await metadata_service.get_streaming_url("12345")
+        assert url1 == "https://streaming.example.com/old.flac"
+
+        # Expire the cached URL and make every refresh attempt fail
+        cached = metadata_service._cache.get("12345")
+        assert cached is not None
+        cached.streaming_url_expires_at = int(time.time()) - 1
+        mock_api.get_track_url.return_value = None
+
+        url2 = await metadata_service.get_streaming_url("12345")
+        assert not url2  # the dead URL must not come back as "valid"
+
+    @pytest.mark.asyncio
     async def test_preload_tracks(
         self, metadata_service: MetadataService, mock_api: MockAPIClient
     ) -> None:

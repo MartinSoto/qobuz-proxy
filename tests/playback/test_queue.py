@@ -58,6 +58,21 @@ class TestQueueTrack:
         assert track.start_ms == 0
         assert track.duration_ms == 0
 
+    def test_url_staleness(self) -> None:
+        """A cached URL is only trusted within its TTL."""
+        track = QueueTrack(queue_item_id=1, track_id="12345")
+        assert track.url_is_stale()  # no URL at all
+
+        track.set_streaming_url("https://example.com/track.flac")
+        assert not track.url_is_stale()
+
+        track.url_fetched_at -= 241  # age the URL past the 240s TTL
+        assert track.url_is_stale()
+
+        track.set_streaming_url(None)
+        assert track.url_is_stale()
+        assert track.url_fetched_at == 0.0
+
 
 class TestQobuzQueue:
     """Tests for QobuzQueue class."""
@@ -444,6 +459,31 @@ class TestQobuzQueue:
         # Check that callbacks were called for first few tracks
         assert metadata_callback.call_count >= 1
         assert url_callback.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_preload_refreshes_stale_urls(
+        self, queue: QobuzQueue, sample_tracks: list[dict[str, Any]]
+    ) -> None:
+        """A preloaded track whose URL aged past the TTL gets a fresh one."""
+        url_callback = AsyncMock(return_value="https://example.com/track.flac")
+        queue.set_url_callback(url_callback)
+
+        await queue.load_queue(sample_tracks, QueueVersion())
+        await queue.start()
+        await asyncio.sleep(1.5)
+
+        initial_url_calls = url_callback.call_count
+        assert initial_url_calls >= 1
+
+        # Age all cached URLs past the TTL
+        for track in queue._tracks:
+            if track.streaming_url:
+                track.url_fetched_at -= 300
+
+        await asyncio.sleep(1.5)
+        await queue.stop()
+
+        assert url_callback.call_count > initial_url_calls
 
     @pytest.mark.asyncio
     async def test_preload_skips_already_preloaded(

@@ -310,9 +310,22 @@ class MetadataService:
                     return
 
             logger.error(f"No streaming URL available for {metadata.track_id}")
+            self._clear_streaming_url(metadata)
 
         except Exception as e:
             logger.error(f"Failed to fetch URL for {metadata.track_id}: {e}")
+            self._clear_streaming_url(metadata)
+
+    @staticmethod
+    def _clear_streaming_url(metadata: TrackMetadata) -> None:
+        """Drop a stale URL after a failed refresh.
+
+        Keeping the old URL around would make `get_streaming_url` hand an
+        expired URL to callers as if it were valid; failing loudly lets them
+        retry instead of hitting a CDN 401/403.
+        """
+        metadata.streaming_url = ""
+        metadata.streaming_url_expires_at = 0
 
     def _get_quality_fallback_order(self) -> list[int]:
         """Get quality IDs in fallback order from max_quality."""
