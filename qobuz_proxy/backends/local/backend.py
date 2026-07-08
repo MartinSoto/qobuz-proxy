@@ -201,8 +201,10 @@ class LocalAudioBackend(AudioBackend):
         self._notify_state_change(PlaybackState.PAUSED)
 
     async def resume(self) -> bool:
-        if not self._stream:
-            # Nothing to resume — the output stream is gone.
+        # Resume only makes sense with a track loaded (paused mid-play). The
+        # stream object survives stop(), so checking it alone would report a
+        # phantom PLAYING state with nothing to play.
+        if not self._stream or self._audio_data is None:
             return False
         self._stream.resume()
         self._notify_state_change(PlaybackState.PLAYING)

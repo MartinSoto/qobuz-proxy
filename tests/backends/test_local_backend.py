@@ -228,6 +228,31 @@ class TestPauseResume:
         await backend.stop()
         await backend.disconnect()
 
+    async def test_resume_after_stop_reports_nothing_to_play(self) -> None:
+        """Regression for BUG-25: stop() unloads the track, so a later resume()
+        must fail instead of reporting a phantom PLAYING at 0:00 in silence."""
+        backend = await _create_connected_backend()
+
+        async def fake_download(url):
+            return FAKE_AUDIO_44100.copy(), 44100
+
+        backend._download_and_decode = fake_download
+        backend._stream.set_ring_buffer = MagicMock()
+        backend._stream.open = MagicMock()
+        backend._stream.start = MagicMock()
+        backend._stream.stop = MagicMock()
+        backend._stream.resume = MagicMock()
+
+        await backend.play("http://example.com/track.flac", _make_metadata())
+        await asyncio.sleep(0.01)
+        await backend.stop()
+
+        assert await backend.resume() is False
+        assert backend._state == PlaybackState.STOPPED
+        backend._stream.resume.assert_not_called()
+
+        await backend.disconnect()
+
 
 # ---------------------------------------------------------------------------
 # Tests: Stop
