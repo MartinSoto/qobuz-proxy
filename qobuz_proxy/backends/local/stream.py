@@ -70,7 +70,12 @@ class AudioOutputStream:
         )
 
     def start(self) -> None:
-        """Start the audio stream."""
+        """Start the audio stream.
+
+        Clears any lingering pause: a track started while the previous one was
+        paused must play, not sit behind a callback that emits silence forever.
+        """
+        self._paused = False
         if self._stream:
             self._stream.start()
 
