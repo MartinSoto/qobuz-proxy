@@ -9,7 +9,7 @@ from typing import Any
 
 from qobuz_proxy.connect.protocol import QConnectMessageType
 
-from .queue import QobuzQueue, QueueVersion, RepeatMode
+from .queue import QobuzQueue, QueueVersion
 
 logger = logging.getLogger(__name__)
 
@@ -137,46 +137,3 @@ class QueueHandler:
         logger.info(
             f"Queue loaded: {len(tracks)} tracks, version {version}, position {queue_position}"
         )
-
-    async def handle_set_state(
-        self,
-        current_queue_item_id: int | None = None,
-        shuffle_mode: bool | None = None,
-        loop_mode: int | None = None,
-    ) -> None:
-        """
-        Handle state changes from SET_STATE messages.
-
-        This is called by the playback handler when processing SET_STATE
-        messages that include queue-related fields.
-
-        Args:
-            current_queue_item_id: New current track in queue
-            shuffle_mode: Shuffle enabled/disabled
-            loop_mode: Loop mode (0=off, 1=one, 2=all)
-        """
-        # Update current queue position if specified
-        if current_queue_item_id is not None:
-            await self.queue.set_current_by_item_id(current_queue_item_id)
-
-        # Update shuffle mode
-        if shuffle_mode is not None:
-            current_state = await self.queue.get_state()
-            if shuffle_mode != current_state.shuffle_enabled:
-                pivot_id = current_state.current_queue_item_id if shuffle_mode else None
-                await self.queue.set_shuffle(shuffle_mode, pivot_item_id=pivot_id)
-
-        # Update loop mode
-        if loop_mode is not None:
-            mode = self._map_loop_mode(loop_mode)
-            await self.queue.set_repeat_mode(mode)
-
-    def _map_loop_mode(self, proto_mode: int) -> RepeatMode:
-        """Map protobuf loop mode to RepeatMode enum."""
-        mapping = {
-            0: RepeatMode.OFF,  # LOOP_MODE_UNKNOWN or OFF
-            1: RepeatMode.OFF,  # LOOP_MODE_OFF
-            2: RepeatMode.ONE,  # LOOP_MODE_REPEAT_ONE
-            3: RepeatMode.ALL,  # LOOP_MODE_REPEAT_ALL
-        }
-        return mapping.get(proto_mode, RepeatMode.OFF)

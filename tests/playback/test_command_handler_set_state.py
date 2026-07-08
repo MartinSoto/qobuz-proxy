@@ -39,6 +39,33 @@ def _set_state_msg(
 
 
 class TestSetStateHandling:
+    async def test_set_state_syncs_queue_index(self) -> None:
+        """Regression for BUG-33: the queue's current index must follow the
+        currentQueueItem of SET_STATE, or queue-based fallbacks (auto-advance,
+        get_current_track) act on a stale index."""
+        from qobuz_proxy.playback.queue import QobuzQueue, QueueVersion
+
+        player, backend = _make_player()
+        queue = QobuzQueue()
+        handler = PlaybackCommandHandler(player, queue=queue)
+
+        await queue.load_queue(
+            tracks=[
+                {"queueItemId": 1, "trackId": 3001},
+                {"queueItemId": 2, "trackId": 3002},
+                {"queueItemId": 3, "trackId": 3003},
+            ],
+            version=QueueVersion(major=1, minor=0),
+        )
+
+        await handler._handle_set_state(_set_state_msg(track_id=3003, queue_item_id=3))
+
+        state = await queue.get_state()
+        assert state.current_queue_item_id == 3
+        current = await queue.get_current_track()
+        assert current is not None
+        assert current.track_id == "3003"
+
     async def test_single_set_state_loads_and_plays(self) -> None:
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)

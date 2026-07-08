@@ -7,7 +7,7 @@ command supersede an older one waiting on it.
 """
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from qobuz_proxy.backends.base import AudioBackend
 from qobuz_proxy.backends import BackendTrackMetadata, PlaybackState
@@ -69,6 +69,7 @@ def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:
     metadata.log_now_playing_info = MagicMock()
 
     queue = MagicMock()
+    queue.set_current_by_item_id = AsyncMock(return_value=True)
     player = QobuzPlayer(queue=queue, metadata_service=metadata, backend=backend)
     return player, backend
 

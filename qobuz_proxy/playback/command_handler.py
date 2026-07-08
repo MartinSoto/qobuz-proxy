@@ -161,6 +161,13 @@ class PlaybackCommandHandler:
             next_track_changed = True
             logger.debug("Next track cleared (nextQueueItem not present in SET_STATE)")
 
+        # Keep the queue's current index in sync with the item the app shows.
+        # Without this, queue-based fallbacks (auto-advance at track end,
+        # get_current_track) act on a stale index — e.g. restarting the same
+        # track instead of advancing.
+        if current_queue_item_id is not None:
+            await self.queue.set_current_by_item_id(current_queue_item_id)
+
         # Apply the desired remote state as a single atomic unit. A SET_STATE is
         # a multi-step intent (load this track, seek here, then play/pause/stop)
         # and each SET_STATE message runs in its own task, so applying the steps
