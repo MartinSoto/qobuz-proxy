@@ -312,6 +312,9 @@ class DLNAClient:
             time_str = self._parse_xml_value(response, "RelTime")
             if time_str:
                 ms = self._time_string_to_ms(time_str)
+                if ms is None:
+                    logger.debug(f"GetPositionInfo: unparseable RelTime {time_str!r}")
+                    return None
                 logger.debug(f"GetPositionInfo: RelTime={time_str} -> {ms}ms")
                 return ms
             else:
@@ -937,8 +940,13 @@ class DLNAClient:
         secs = seconds % 60
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-    def _time_string_to_ms(self, time_str: str) -> int:
-        """Convert HH:MM:SS to milliseconds."""
+    def _time_string_to_ms(self, time_str: str) -> Optional[int]:
+        """Convert HH:MM:SS to milliseconds; None if unparseable.
+
+        Many renderers report RelTime as "NOT_IMPLEMENTED" — some always, some
+        transiently during transitions. That must surface as "unknown", not as
+        position 0, or it stomps the last known position every poll.
+        """
         try:
             parts = time_str.split(":")
             if len(parts) == 3:
@@ -947,4 +955,4 @@ class DLNAClient:
                 return int(total * 1000)
         except (ValueError, IndexError):
             pass
-        return 0
+        return None

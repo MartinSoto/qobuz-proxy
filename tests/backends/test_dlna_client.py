@@ -54,6 +54,29 @@ class TestConnect:
         assert client._session is None
 
 
+class TestTimeStringParsing:
+    def test_parses_hms(self):
+        client = DLNAClient("10.0.0.5")
+        assert client._time_string_to_ms("0:03:25") == 205000
+        assert client._time_string_to_ms("01:00:00.500") == 3600500
+
+    def test_not_implemented_returns_none(self):
+        """Regression for BUG-10: NOT_IMPLEMENTED must read as unknown, not 0,
+        or it stomps the last known position on every poll."""
+        client = DLNAClient("10.0.0.5")
+        assert client._time_string_to_ms("NOT_IMPLEMENTED") is None
+        assert client._time_string_to_ms("") is None
+        assert client._time_string_to_ms("garbage") is None
+
+    async def test_position_info_unparseable_reltime_is_none(self):
+        client = _make_client()
+        client._soap_action = AsyncMock(  # type: ignore[method-assign]
+            return_value="<RelTime>NOT_IMPLEMENTED</RelTime>"
+        )
+
+        assert await client.get_position_info() is None
+
+
 class TestAddUriToQueue:
     async def test_returns_enqueued_track_number(self):
         client = _make_client()
