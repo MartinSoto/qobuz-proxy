@@ -1,9 +1,18 @@
 """Tests for multi-speaker orchestration and auth lifecycle in QobuzProxy."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from qobuz_proxy.app import QobuzProxy
 from qobuz_proxy.config import Config, QobuzConfig, SpeakerConfig
+
+
+def _make_mock_speaker(name: str, starts: bool) -> MagicMock:
+    speaker = MagicMock()
+    speaker.start = AsyncMock(return_value=starts)
+    speaker.stop = AsyncMock()
+    speaker.name = name
+    return speaker
 
 
 def _make_speaker_config(
@@ -120,6 +129,63 @@ class TestMultiSpeakerOrchestration:
             # App stays running even if speakers failed (no RuntimeError)
             assert app.is_running
             assert len(app._speakers) == 0
+
+    async def test_failed_speaker_retries_in_background(self):
+        """A speaker that fails at boot is retried and eventually joins the running list."""
+        sc1 = _make_speaker_config("Living Room")
+        config = _make_config(sc1)
+
+        bad = _make_mock_speaker("Living Room", starts=False)
+        still_bad = _make_mock_speaker("Living Room", starts=False)
+        good = _make_mock_speaker("Living Room", starts=True)
+
+        with (
+            patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
+            patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
+            patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
+            patch("qobuz_proxy.app.Speaker", side_effect=[bad, still_bad, good]),
+            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0.01,)),
+            patch("qobuz_proxy.app.SPEAKER_RETRY_STEADY_DELAY_SECONDS", 0.01),
+        ):
+            MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
+
+            app = QobuzProxy(config)
+            await app.start()
+
+            assert app._speakers == []
+            retry_task = app._speaker_retry_tasks["living-room"]
+
+            await asyncio.wait_for(retry_task, timeout=2.0)
+
+            assert app._speakers == [good]
+            assert app._speaker_retry_tasks == {}
+            still_bad.start.assert_awaited_once()
+            good.start.assert_awaited_once()
+
+    async def test_stop_cancels_pending_retries(self):
+        """Shutting down cancels background speaker retries."""
+        sc1 = _make_speaker_config("Living Room")
+        config = _make_config(sc1)
+
+        bad = _make_mock_speaker("Living Room", starts=False)
+
+        with (
+            patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
+            patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
+            patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
+            patch("qobuz_proxy.app.Speaker", side_effect=[bad]),
+        ):
+            MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
+
+            app = QobuzProxy(config)
+            await app.start()
+
+            retry_task = app._speaker_retry_tasks["living-room"]
+            await app.stop()
+
+            assert app._speaker_retry_tasks == {}
+            await asyncio.sleep(0)
+            assert retry_task.cancelled()
 
     async def test_stop_stops_all_speakers(self):
         """After a successful start, stop() calls stop() on all started speakers."""

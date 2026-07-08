@@ -36,6 +36,11 @@ from qobuz_proxy.webui.routes import register_routes
 
 logger = logging.getLogger(__name__)
 
+# Backoff schedule for speakers that fail to start (renderer offline, boot
+# races between containers). After the ramp, keep trying at a steady pace.
+SPEAKER_RETRY_DELAYS_SECONDS: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0)
+SPEAKER_RETRY_STEADY_DELAY_SECONDS: float = 300.0
+
 
 class QobuzProxy:
     """
@@ -75,6 +80,9 @@ class QobuzProxy:
 
         # Speakers
         self._speakers: list[Speaker] = []
+        # Background retry tasks for speakers that failed to start, keyed by
+        # slugified speaker name. Also keeps strong references to the tasks.
+        self._speaker_retry_tasks: dict[str, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------
     # Public interface
@@ -356,6 +364,9 @@ class QobuzProxy:
         self._config.speakers[config_idx] = new_config
         self._save_config()
 
+        # The edited speaker replaces any pending boot retry of the old config
+        self._cancel_speaker_retry(speaker_id)
+
         if speaker_idx is not None:
             await self._speakers[speaker_idx].stop()
 
@@ -396,6 +407,7 @@ class QobuzProxy:
                 break
 
         self._config.speakers.pop(config_idx)
+        self._cancel_speaker_retry(speaker_id)
         if speaker_idx is not None:
             speaker = self._speakers.pop(speaker_idx)
             await speaker.stop()
@@ -460,7 +472,12 @@ class QobuzProxy:
     # ------------------------------------------------------------------
 
     async def _start_speakers(self) -> None:
-        """Create and start Speaker instances from config."""
+        """Create and start Speaker instances from config.
+
+        Speakers that fail to start (e.g. the renderer is still booting or
+        temporarily unreachable) are retried in the background instead of
+        being dropped until the next restart.
+        """
         assert self._api_client is not None
 
         if not self._config.speakers:
@@ -468,38 +485,107 @@ class QobuzProxy:
             logger.info(f"No speakers configured — add speakers at http://localhost:{port}")
             return
 
+        running_ids = {slugify_name(s.name) for s in self._speakers}
+        configs = [sc for sc in self._config.speakers if slugify_name(sc.name) not in running_ids]
+
         speakers = [
             Speaker(
                 config=sc,
                 api_client=self._api_client,
                 app_id=self._app_id,
             )
-            for sc in self._config.speakers
+            for sc in configs
         ]
 
         results = await asyncio.gather(*[s.start() for s in speakers], return_exceptions=True)
 
-        started: list[Speaker] = []
-        for speaker, result in zip(speakers, results):
-            if isinstance(result, Exception):
-                logger.warning(f"Speaker '{speaker.name}' failed to start: {result}")
-            elif result is False:
-                logger.warning(f"Speaker '{speaker.name}' failed to start")
+        for sc, speaker, result in zip(configs, speakers, results):
+            if isinstance(result, BaseException) or result is False:
+                reason = f": {result}" if isinstance(result, BaseException) else ""
+                logger.warning(
+                    f"Speaker '{speaker.name}' failed to start{reason} — retrying in background"
+                )
+                self._schedule_speaker_retry(sc)
             else:
-                started.append(speaker)
+                self._speakers.append(speaker)
 
-        if not started:
-            logger.error("No speakers started successfully — check configuration and logs")
+        if not self._speakers:
+            logger.error(
+                "No speakers started successfully — retrying in background; "
+                "check configuration and logs"
+            )
             return
 
-        self._speakers = started
         names = ", ".join(s.name for s in self._speakers)
         port = self._config.server.http_port
         logger.info(f"qobuz-proxy ready — {len(self._speakers)} speaker(s): {names}")
         logger.info(f"Web UI: http://localhost:{port}")
 
+    def _schedule_speaker_retry(self, config: SpeakerConfig) -> None:
+        """Start (or keep) a background task retrying a failed speaker."""
+        speaker_id = slugify_name(config.name)
+        existing = self._speaker_retry_tasks.get(speaker_id)
+        if existing and not existing.done():
+            return
+        self._speaker_retry_tasks[speaker_id] = asyncio.create_task(self._retry_speaker(config))
+
+    def _cancel_speaker_retry(self, speaker_id: str) -> None:
+        """Stop retrying a speaker (it was edited, removed, or is shutting down)."""
+        task = self._speaker_retry_tasks.pop(speaker_id, None)
+        if task:
+            task.cancel()
+
+    async def _retry_speaker(self, config: SpeakerConfig) -> None:
+        """Retry starting a speaker with backoff until it comes up.
+
+        Renderers routinely boot slower than qobuz-proxy (sibling Docker
+        containers, powered-off devices), so a failed start must not drop
+        the speaker until the next restart.
+        """
+
+        def retry_delay(attempt: int) -> float:
+            if attempt < len(SPEAKER_RETRY_DELAYS_SECONDS):
+                return SPEAKER_RETRY_DELAYS_SECONDS[attempt]
+            return SPEAKER_RETRY_STEADY_DELAY_SECONDS
+
+        speaker_id = slugify_name(config.name)
+        attempt = 0
+        try:
+            while True:
+                await asyncio.sleep(retry_delay(attempt))
+                attempt += 1
+
+                if self._api_client is None:
+                    return  # Logged out — speakers restart on the next login
+
+                speaker = Speaker(config=config, api_client=self._api_client, app_id=self._app_id)
+                try:
+                    started = await speaker.start()
+                except asyncio.CancelledError:
+                    await speaker.stop()
+                    raise
+                except Exception as e:
+                    logger.debug(f"Speaker '{config.name}' retry raised: {e}")
+                    started = False
+
+                if started:
+                    self._speakers.append(speaker)
+                    logger.info(f"Speaker '{config.name}' started after {attempt} retry attempt(s)")
+                    return
+
+                logger.info(
+                    f"Speaker '{config.name}' still failing to start "
+                    f"(attempt {attempt}) — next retry in {retry_delay(attempt):.0f}s"
+                )
+        finally:
+            self._speaker_retry_tasks.pop(speaker_id, None)
+
     async def _stop_speakers(self) -> None:
-        """Stop all running speakers."""
+        """Stop all running speakers and any pending start retries."""
+        for task in list(self._speaker_retry_tasks.values()):
+            task.cancel()
+        self._speaker_retry_tasks.clear()
+
         if self._speakers:
             await asyncio.gather(*[s.stop() for s in self._speakers], return_exceptions=True)
             self._speakers = []
