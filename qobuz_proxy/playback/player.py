@@ -654,7 +654,7 @@ class QobuzPlayer:
 
         if was_playing:
             # Restart playback from saved position
-            success = await self._start_playback()
+            success = await self._start_playback(saved_position)
             if success and saved_position > 0:
                 await self.backend.seek(saved_position)
             return success
@@ -1088,10 +1088,12 @@ class QobuzPlayer:
             # Start playback on backend
             await self.backend.play(url, backend_meta)
 
-            # Update state
+            # Update state. Report the start position, not 0 — the caller
+            # seeks the backend right after, and reporting 0 first makes the
+            # app's progress bar snap to 0:00 until the next heartbeat.
             self._state = PlaybackState.PLAYING
             self._current_duration_ms = track.duration_ms
-            self._position_value_ms = 0
+            self._position_value_ms = start_position_ms
             self._position_timestamp_ms = int(time.time() * 1000)
 
             await self._send_state_update()

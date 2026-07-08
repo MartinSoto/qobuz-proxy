@@ -78,6 +78,18 @@ async def _coro(value):  # type: ignore[no-untyped-def]
     return value
 
 
+class TestPositionedStart:
+    async def test_positioned_start_reports_start_position(self) -> None:
+        """Regression for BUG-18: starting at a position must not report 0:00
+        to the app (progress bar snapped to zero until the next heartbeat)."""
+        player, backend = _make_player()
+
+        await player.play_track(queue_item_id=1, track_id="42", position_ms=60_000)
+
+        assert player._position_value_ms == 60_000
+        assert player.current_position_ms >= 60_000
+
+
 class TestPlaybackSerialization:
     async def test_concurrent_play_track_never_overlaps(self) -> None:
         player, backend = _make_player()
