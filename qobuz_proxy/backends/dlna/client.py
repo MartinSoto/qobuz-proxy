@@ -109,10 +109,20 @@ class DLNAClient:
         """
         self._session = self._build_session()
 
-        # Try to fetch device description
-        self.device_info = await self._fetch_device_description()
-        if not self.device_info.av_transport_url:
-            raise DLNAClientError(f"Device at {self.ip}:{self.port} does not support AVTransport")
+        try:
+            # Try to fetch device description
+            self.device_info = await self._fetch_device_description()
+            if not self.device_info.av_transport_url:
+                raise DLNAClientError(
+                    f"Device at {self.ip}:{self.port} does not support AVTransport"
+                )
+        except BaseException:
+            session, self._session = self._session, None
+            try:
+                await session.close()
+            except Exception:
+                pass
+            raise
 
         logger.info(f"Connected to DLNA device: {self.device_info.friendly_name}")
         return self.device_info

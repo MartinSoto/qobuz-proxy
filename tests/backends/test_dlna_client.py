@@ -2,7 +2,9 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
-from qobuz_proxy.backends.dlna.client import DLNAClient
+import pytest
+
+from qobuz_proxy.backends.dlna.client import DLNAClient, DLNAClientError
 
 ADD_URI_RESPONSE = """<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -20,6 +22,36 @@ def _make_client() -> DLNAClient:
     client = DLNAClient("10.0.0.5")
     client.device_info = MagicMock(av_transport_url="http://10.0.0.5:1400/AVTransport/Control")
     return client
+
+
+class TestConnect:
+    async def test_closes_session_when_description_fetch_fails(self):
+        client = DLNAClient("10.0.0.5")
+        session = AsyncMock()
+        client._build_session = MagicMock(return_value=session)  # type: ignore[method-assign]
+        client._fetch_device_description = AsyncMock(  # type: ignore[method-assign]
+            side_effect=DLNAClientError("unreachable")
+        )
+
+        with pytest.raises(DLNAClientError):
+            await client.connect()
+
+        session.close.assert_awaited_once()
+        assert client._session is None
+
+    async def test_closes_session_when_device_lacks_av_transport(self):
+        client = DLNAClient("10.0.0.5")
+        session = AsyncMock()
+        client._build_session = MagicMock(return_value=session)  # type: ignore[method-assign]
+        client._fetch_device_description = AsyncMock(  # type: ignore[method-assign]
+            return_value=MagicMock(av_transport_url="")
+        )
+
+        with pytest.raises(DLNAClientError):
+            await client.connect()
+
+        session.close.assert_awaited_once()
+        assert client._session is None
 
 
 class TestAddUriToQueue:
