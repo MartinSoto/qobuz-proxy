@@ -77,6 +77,90 @@ class FlakyUpstream:
             await self._runner.cleanup()
 
 
+class ExpiredUrlUpstream:
+    """Fake CDN that rejects stale signed URLs with 403 but serves fresh ones."""
+
+    def __init__(self):
+        self.requests: list = []  # token query param of each request
+        self._runner = None
+
+    async def _handle(self, request: web.Request) -> web.Response:
+        token = request.query.get("token", "")
+        self.requests.append(token)
+        if token != "fresh":
+            return web.Response(status=403, text="URL signature expired")
+        return web.Response(
+            status=200,
+            body=PAYLOAD,
+            headers={"Accept-Ranges": "bytes", "Content-Length": str(len(PAYLOAD))},
+        )
+
+    async def start(self) -> str:
+        app = web.Application()
+        app.router.add_get("/file", self._handle)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        port = _free_port()
+        site = web.TCPSite(self._runner, "127.0.0.1", port)
+        await site.start()
+        return f"http://127.0.0.1:{port}/file"
+
+    async def stop(self) -> None:
+        if self._runner:
+            await self._runner.cleanup()
+
+
+async def test_refreshes_url_and_retries_on_upstream_403():
+    """An expired signed URL (CDN 403) must trigger a forced refresh, not a 502."""
+    upstream = ExpiredUrlUpstream()
+    base_url = await upstream.start()
+
+    provider = MagicMock()
+    provider.get_streaming_url = AsyncMock(return_value=f"{base_url}?token=fresh")
+
+    port = _free_port()
+    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    await proxy.start()
+    try:
+        proxy.register_track("42", f"{base_url}?token=stale", "audio/flac")
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"http://127.0.0.1:{port}/audio/42.flac") as resp:
+                assert resp.status == 200
+                body = await resp.read()
+    finally:
+        await proxy.stop()
+        await upstream.stop()
+
+    assert body == PAYLOAD
+    assert upstream.requests == ["stale", "fresh"]
+    provider.get_streaming_url.assert_awaited_once_with("42", force=True)
+
+
+async def test_returns_502_when_refresh_fails_after_403():
+    """If no fresh URL can be fetched, the 403 surfaces as a single 502 (no retry loop)."""
+    upstream = ExpiredUrlUpstream()
+    base_url = await upstream.start()
+
+    provider = MagicMock()
+    provider.get_streaming_url = AsyncMock(side_effect=RuntimeError("no URL"))
+
+    port = _free_port()
+    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    await proxy.start()
+    try:
+        proxy.register_track("42", f"{base_url}?token=stale", "audio/flac")
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"http://127.0.0.1:{port}/audio/42.flac") as resp:
+                assert resp.status == 502
+    finally:
+        await proxy.stop()
+        await upstream.stop()
+
+    assert upstream.requests == ["stale"]
+
+
 async def test_resumes_upstream_after_midstream_failure():
     """A mid-stream upstream failure must not kill the renderer's stream."""
     upstream = FlakyUpstream()

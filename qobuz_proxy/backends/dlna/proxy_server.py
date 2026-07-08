@@ -215,15 +215,13 @@ class AudioProxyServer:
             logger.warning(f"Unknown track requested: {proxy_key}")
             return web.Response(status=404, text="Track not found")
 
-        # Check if URL needs refresh
+        # Check if URL needs refresh. force=True bypasses the metadata cache:
+        # its TTL is longer than the proxy's max age, so a plain fetch inside
+        # the overlap window would hand back the same dying URL while resetting
+        # url_fetched_at — making the proxy trust it for another full cycle.
         if track.is_url_expired(self._url_max_age):
             logger.info(f"Refreshing expired URL for track {track.track_id}")
-            try:
-                fresh_url = await self._url_provider.get_streaming_url(track.track_id)
-                track.qobuz_url = fresh_url
-                track.url_fetched_at = time.time()
-            except Exception as e:
-                logger.error(f"Failed to refresh URL for track {track.track_id}: {e}")
+            if not await self._refresh_track_url(track, force=True):
                 return web.Response(status=502, text="Failed to refresh streaming URL")
 
         # Forward request to Qobuz CDN
@@ -262,6 +260,7 @@ class AudioProxyServer:
         stream_start = time.monotonic()
         bytes_sent = 0
         retries = 0
+        expired_url_retry_done = False
 
         while True:
             upstream_headers = dict(headers)
@@ -279,6 +278,22 @@ class AudioProxyServer:
                         headers=upstream_headers,
                     ) as upstream_response:
                         if upstream_response.status not in (200, 206):
+                            # An expired signed URL surfaces as an error *status*
+                            # (401/403/410), not an exception — refresh and retry
+                            # once before failing the renderer's request.
+                            if (
+                                response is None
+                                and not expired_url_retry_done
+                                and upstream_response.status in (401, 403, 410)
+                            ):
+                                expired_url_retry_done = True
+                                logger.info(
+                                    f"Upstream {upstream_response.status} for track "
+                                    f"{track.track_id} — URL likely expired; fetching "
+                                    "a fresh URL and retrying"
+                                )
+                                if await self._refresh_track_url(track, force=True):
+                                    continue
                             logger.warning(
                                 f"Upstream error for track {track.track_id}: "
                                 f"{upstream_response.status}"
@@ -383,7 +398,7 @@ class AudioProxyServer:
                     f"reconnecting ({retries}/{MAX_UPSTREAM_RETRIES})"
                 )
                 await asyncio.sleep(UPSTREAM_RETRY_DELAY_SECONDS * retries)
-                await self._refresh_track_url(track)
+                await self._refresh_track_url(track, force=True)
             except (ConnectionResetError, ConnectionError) as e:
                 # Client disconnected - this is normal when Sonos probes or seeks
                 logger.debug(
@@ -400,16 +415,26 @@ class AudioProxyServer:
                     return response
                 return web.Response(status=502, text=f"Proxy error: {e}")
 
-    async def _refresh_track_url(self, track: RegisteredTrack) -> None:
-        """Fetch a fresh streaming URL before retrying (signed URLs can go stale)."""
+    async def _refresh_track_url(self, track: RegisteredTrack, force: bool = False) -> bool:
+        """Fetch a fresh streaming URL before retrying (signed URLs can go stale).
+
+        force=True bypasses the URL provider's cache — required whenever the
+        current URL is known or suspected dead, since a cached "valid" URL may
+        be the very one that just failed.
+
+        Returns:
+            True if a fresh URL was applied, False if the refresh failed.
+        """
         try:
-            fresh_url = await self._url_provider.get_streaming_url(track.track_id)
+            fresh_url = await self._url_provider.get_streaming_url(track.track_id, force=force)
             track.qobuz_url = fresh_url
             track.url_fetched_at = time.time()
+            return True
         except Exception as e:
             logger.warning(
                 f"Could not refresh URL for track {track.track_id}: {e}; retrying with old URL"
             )
+            return False
 
     def _log_stream_end(
         self,

@@ -30,12 +30,14 @@ class MetadataServiceURLProvider:
         """
         self._metadata_service = metadata_service
 
-    async def get_streaming_url(self, track_id: str) -> str:
+    async def get_streaming_url(self, track_id: str, force: bool = False) -> str:
         """
         Get a fresh streaming URL for a track.
 
         Args:
             track_id: Qobuz track ID
+            force: Invalidate the metadata cache first so a genuinely new URL
+                   is fetched even when the cached one hasn't hit its TTL yet.
 
         Returns:
             Fresh streaming URL
@@ -43,7 +45,10 @@ class MetadataServiceURLProvider:
         Raises:
             RuntimeError: If URL cannot be fetched
         """
-        url = await self._metadata_service.get_streaming_url(track_id)
+        if force:
+            url = await self._metadata_service.refresh_streaming_url(track_id)
+        else:
+            url = await self._metadata_service.get_streaming_url(track_id)
         if not url:
             raise RuntimeError(f"Failed to get streaming URL for track {track_id}")
         return url
