@@ -154,6 +154,46 @@ class TestPlayStateTransitions:
         await backend.disconnect()
 
 
+class TestTrackChangeSilencesOldAudio:
+    async def test_play_silences_previous_track_during_download(self) -> None:
+        """Regression for BUG-13: the old track must stop at the top of play(),
+        not keep draining the ring buffer through the new track's download."""
+        backend = await _create_connected_backend()
+
+        async def fake_download(url):
+            return FAKE_AUDIO_44100.copy(), 44100
+
+        backend._download_and_decode = fake_download
+        backend._stream.set_ring_buffer = MagicMock()
+        backend._stream.open = MagicMock()
+        backend._stream.start = MagicMock()
+        backend._stream.pause = MagicMock()
+
+        await backend.play("http://example.com/a.flac", _make_metadata())
+        await asyncio.sleep(0.05)  # let the feeder fill the buffer
+        old_buffer = backend._ring_buffer
+        assert old_buffer.available() > 0
+
+        download_entered = asyncio.Event()
+
+        async def slow_download(url):
+            download_entered.set()
+            await asyncio.sleep(0.05)
+            return FAKE_AUDIO_44100.copy(), 44100
+
+        backend._download_and_decode = slow_download
+        play_task = asyncio.create_task(backend.play("http://example.com/b.flac", _make_metadata()))
+        await download_entered.wait()
+
+        # While the new track downloads, the old audio is already silenced
+        assert old_buffer.available() == 0
+        backend._stream.pause.assert_called()
+
+        await play_task
+        await backend.stop()
+        await backend.disconnect()
+
+
 # ---------------------------------------------------------------------------
 # Tests: Pause / Resume
 # ---------------------------------------------------------------------------

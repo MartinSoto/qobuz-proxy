@@ -66,6 +66,14 @@ class LocalAudioBackend(AudioBackend):
         """Download FLAC, decode, and start playback."""
         await self._cancel_feeding()
 
+        # Silence the previous track immediately. Without this the callback
+        # keeps draining up to BUFFER_SECONDS of old audio through the whole
+        # download/decode, then cuts mid-note when the buffers are swapped.
+        if self._ring_buffer:
+            self._ring_buffer.clear()
+            if self._stream:
+                self._stream.pause()  # stream.start() below unpauses for the new track
+
         self._notify_state_change(PlaybackState.LOADING)
 
         try:
