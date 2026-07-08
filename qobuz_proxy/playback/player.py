@@ -1519,6 +1519,12 @@ class QobuzPlayer:
                         if self._paused_stop_polls >= _PAUSED_STOP_CONFIRMATIONS:
                             self._paused_stop_polls = 0
                             self._state = PlaybackState.STOPPED
+                            # Zero the position like _stop_playback_locked: a
+                            # stale pause-point position makes "previous" try a
+                            # restart-seek on a stopped renderer (a no-op)
+                            # instead of navigating.
+                            self._position_value_ms = 0
+                            self._position_timestamp_ms = int(time.time() * 1000)
                             await self._send_state_update()
                             await self._report_stopped()
                     else:

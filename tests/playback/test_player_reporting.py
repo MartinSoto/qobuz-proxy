@@ -194,12 +194,16 @@ class TestPlayerReporting:
         # confirmation threshold.
         player.backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
         player._paused_stop_polls = _PAUSED_STOP_CONFIRMATIONS - 1
+        player._position_value_ms = 60_000  # paused mid-track
 
         await self._run_monitor_briefly(player)
 
         assert player.state == PlaybackState.STOPPED
         api.report_streaming_end.assert_awaited_once()
         assert api.report_streaming_end.await_args.kwargs["track_id"] == "100"
+        # BUG-19: the stale pause-point must be cleared, or a later "previous"
+        # command takes the restart-seek branch on a stopped renderer (a no-op).
+        assert player.current_position_ms == 0
 
     async def test_single_transient_stop_while_paused_does_not_close(self) -> None:
         """A single STOPPED reading (e.g. a transient SOAP failure, which
