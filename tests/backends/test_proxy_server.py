@@ -77,6 +77,64 @@ class FlakyUpstream:
             await self._runner.cleanup()
 
 
+class MethodRecordingUpstream:
+    """Fake CDN that records the HTTP method of every request."""
+
+    def __init__(self):
+        self.methods: list = []
+        self._runner = None
+
+    async def _handle(self, request: web.Request) -> web.Response:
+        self.methods.append(request.method)
+        return web.Response(
+            status=200,
+            body=PAYLOAD,
+            headers={"Accept-Ranges": "bytes", "Content-Length": str(len(PAYLOAD))},
+        )
+
+    async def start(self) -> str:
+        app = web.Application()
+        app.router.add_get("/file", self._handle)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        port = _free_port()
+        site = web.TCPSite(self._runner, "127.0.0.1", port)
+        await site.start()
+        return f"http://127.0.0.1:{port}/file"
+
+    async def stop(self) -> None:
+        if self._runner:
+            await self._runner.cleanup()
+
+
+async def test_head_probe_does_not_download_the_track():
+    """Regression for BUG-29: a renderer HEAD probe must be answered from
+    upstream headers, not by streaming (and discarding) the whole file."""
+    upstream = MethodRecordingUpstream()
+    upstream_url = await upstream.start()
+
+    provider = MagicMock()
+    provider.get_streaming_url = AsyncMock(return_value=upstream_url)
+
+    port = _free_port()
+    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    await proxy.start()
+    try:
+        proxy.register_track("42", upstream_url, "audio/flac")
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.head(f"http://127.0.0.1:{port}/audio/42.flac") as resp:
+                assert resp.status == 200
+                assert resp.headers["Content-Type"] == "audio/flac"
+                assert resp.headers["Accept-Ranges"] == "bytes"
+    finally:
+        await proxy.stop()
+        await upstream.stop()
+
+    # The CDN saw only a HEAD — never a body-transferring GET
+    assert upstream.methods == ["HEAD"]
+
+
 class ExpiredUrlUpstream:
     """Fake CDN that rejects stale signed URLs with 403 but serves fresh ones."""
 
