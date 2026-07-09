@@ -20,6 +20,12 @@ from .proxy_server import AudioProxyServer, RegisteredTrack
 from .url_provider import StreamingURLProvider
 from .metadata_url_provider import MetadataServiceURLProvider
 from .discovery import DLNADiscovery, DiscoveredDevice, discover_dlna_devices
+from .sonos_topology import (
+    SonosZoneMember,
+    enrich_discovered_devices,
+    fetch_sonos_topology,
+    parse_zone_group_state,
+)
 
 __all__ = [
     "DLNABackend",
@@ -44,4 +50,8 @@ __all__ = [
     "DLNADiscovery",
     "DiscoveredDevice",
     "discover_dlna_devices",
+    "SonosZoneMember",
+    "enrich_discovered_devices",
+    "fetch_sonos_topology",
+    "parse_zone_group_state",
 ]
