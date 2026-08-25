@@ -37,7 +37,7 @@ class _Backend(AudioBackend):
     async def connect(self) -> bool:
         return True
 
-    async def disconnect(self) -> None: ...
+    async def disconnect(self, send_device_stop: bool = True) -> None: ...
 
 
 async def _coro(value):  # type: ignore[no-untyped-def]

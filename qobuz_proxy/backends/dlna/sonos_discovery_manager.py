@@ -108,15 +108,33 @@ class SonosRoom:
 # Returns True if the room was successfully turned into a running Speaker —
 # only then is it considered "known" until it's reported lost.
 RoomFoundCallback = Callable[[SonosRoom], Awaitable[bool]]
-RoomLostCallback = Callable[[str], Awaitable[None]]  # tracking_key
+# Args: (tracking_key, still_present). still_present is True when the
+# coordinator's own uuid is still visible somewhere in the current
+# topology — it just isn't a coordinator anymore, having been absorbed as
+# a plain member into another group. That device hasn't gone anywhere and
+# Sonos is already directing its audio, so tearing down its Speaker must
+# not also send it a live device stop (see Speaker.stop()) — that would
+# interrupt the very playback Sonos just set up. False means the device
+# genuinely dropped off the household (offline, powered down, etc.).
+RoomLostCallback = Callable[[str, bool], Awaitable[None]]
 # Returns True if the rename was applied — only then does the manager stop
 # retrying it on subsequent updates.
 RoomRenamedCallback = Callable[[SonosRoom], Awaitable[bool]]
 # Repoint the Speaker already tracked under this room's tracking_key at its
-# (possibly new) coordinator ip/port — the key itself never changes, so
+# (possibly new) coordinator ip/port — the key itself didn't change, so
 # there's no re-keying to do, just "the same group, new physical target."
 # Returns True if the retarget succeeded.
 RoomRetargetedCallback = Callable[[SonosRoom], Awaitable[bool]]
+# The *same* physical coordinator (uuid unchanged) is now tracked under a
+# different tracking_key — group_id is only confirmed stable across an
+# actual coordinator handoff, not across every topology mutation (e.g. a
+# plain membership change to an otherwise-untouched group can apparently
+# mint a fresh group_id too). Move the Speaker already running for
+# old_key to live under room.tracking_key instead of tearing it down and
+# starting a fresh one — the coordinator never actually changed, so
+# there's nothing here for a listener to even notice. Returns True if
+# applied.
+RoomRekeyedCallback = Callable[[str, SonosRoom], Awaitable[bool]]
 
 
 class SonosDiscoveryManager:
@@ -128,6 +146,7 @@ class SonosDiscoveryManager:
         on_room_lost: RoomLostCallback,
         on_room_renamed: RoomRenamedCallback,
         on_room_retargeted: RoomRetargetedCallback,
+        on_room_rekeyed: RoomRekeyedCallback,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         ssdp_timeout: float = DEFAULT_SSDP_TIMEOUT_SECONDS,
         event_subscriber: Optional[SonosEventSubscriber] = None,
@@ -151,6 +170,7 @@ class SonosDiscoveryManager:
         self._on_room_lost = on_room_lost
         self._on_room_renamed = on_room_renamed
         self._on_room_retargeted = on_room_retargeted
+        self._on_room_rekeyed = on_room_rekeyed
         self._poll_interval = poll_interval
         self._ssdp_timeout = ssdp_timeout
 
@@ -289,6 +309,12 @@ class SonosDiscoveryManager:
         # room plays). One group_id = one Qobuz renderer, for as long as
         # that group_id exists, regardless of who currently coordinates it
         # or how many members it has.
+        #
+        # That stability is only confirmed across an actual handoff, though
+        # — group_id can apparently also change on a plain membership
+        # change to a group whose coordinator never moved. The rekey pass
+        # below (see `rekeyed`) catches that case via the coordinator's own
+        # uuid, so it isn't misread as the group disappearing.
         current: dict[str, SonosRoom] = {}
         for g in groups:
             member = members.get(g.coordinator_uuid)
@@ -322,8 +348,28 @@ class SonosDiscoveryManager:
             )
             current[room.tracking_key] = room
 
-        removed = [key for key in self._known if key not in current]
-        added = [room for key, room in current.items() if key not in self._known]
+        removed_keys = [key for key in self._known if key not in current]
+        added_keys = [key for key in current if key not in self._known]
+
+        # A key disappearing and a *different* key appearing for the same
+        # physical coordinator (uuid unchanged) isn't a real loss — it's
+        # group_id churning for a reason other than a handoff (a plain
+        # membership change, most likely). Correlate by uuid within this
+        # one snapshot and rekey the existing Speaker in place instead of
+        # tearing it down and spinning up a fresh Qobuz Connect session
+        # (which, worse, sends the still-playing coordinator a real DLNA
+        # Stop as a side effect of tearing down the "lost" one).
+        removed_by_uuid = {self._known[key].uuid: key for key in removed_keys}
+        rekeyed: list[tuple[str, SonosRoom]] = []  # (old_key, new_room)
+        added: list[SonosRoom] = []
+        for key in added_keys:
+            room = current[key]
+            old_key = removed_by_uuid.pop(room.uuid, None)
+            if old_key is not None:
+                rekeyed.append((old_key, room))
+            else:
+                added.append(room)
+        removed = list(removed_by_uuid.values())
 
         # Same key (group_id) as before, but something about it changed.
         # Whoever's coordinating now (uuid/ip/port) is a physical-target
@@ -344,7 +390,14 @@ class SonosDiscoveryManager:
                 renamed.append(room)
 
         for key in removed:
-            await self._report_lost(key)
+            # Still visible in this snapshot's topology (just not a
+            # coordinator anymore) means it was absorbed as a plain member
+            # into another group, not that it went offline — see
+            # RoomLostCallback.
+            still_present = self._known[key].uuid in members
+            await self._report_lost(key, still_present)
+        for old_key, room in rekeyed:
+            await self._report_rekeyed(old_key, room)
         for room in added:
             await self._report_found(room)
         for room in renamed:
@@ -362,10 +415,10 @@ class SonosDiscoveryManager:
             self._known[room.tracking_key] = room
         # else: left out of _known, so it's retried as "newly found" next update
 
-    async def _report_lost(self, key: str) -> None:
+    async def _report_lost(self, key: str, still_present: bool) -> None:
         self._known.pop(key, None)
         try:
-            await self._on_room_lost(key)
+            await self._on_room_lost(key, still_present)
         except Exception as e:
             logger.warning(f"Sonos discovery: error stopping speaker for {key}: {e}")
 
@@ -378,6 +431,18 @@ class SonosDiscoveryManager:
         if renamed:
             self._known[room.tracking_key] = room
         # else: _known keeps the stale name, so the rename is retried next update
+
+    async def _report_rekeyed(self, old_key: str, room: SonosRoom) -> None:
+        try:
+            applied = await self._on_room_rekeyed(old_key, room)
+        except Exception as e:
+            logger.warning(f"Sonos discovery: error rekeying speaker for '{room.name}': {e}")
+            applied = False
+        if applied:
+            self._known.pop(old_key, None)
+            self._known[room.tracking_key] = room
+        # else: self._known keeps the stale entry under old_key, so this is
+        # retried next update — same free-retry pattern as found/renamed.
 
     async def _report_retargeted(self, room: SonosRoom) -> bool:
         try:

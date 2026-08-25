@@ -190,22 +190,41 @@ class TestRoomFoundAndLost:
         assert app._speakers == []
         assert "RINCON_A" not in app._sonos_speakers_by_group_id
 
-    async def test_room_lost_stops_and_removes_speaker(self) -> None:
+    async def test_room_lost_offline_stops_and_removes_speaker(self) -> None:
+        # The device genuinely went offline — tell it to stop too.
         app = QobuzProxy(_make_config())
         speaker = _mock_speaker("Kitchen")
         app._speakers.append(speaker)
         app._sonos_speakers_by_group_id["RINCON_A"] = speaker
 
-        await app._on_sonos_room_lost("RINCON_A")
+        await app._on_sonos_room_lost("RINCON_A", still_present=False)
 
-        speaker.stop.assert_awaited_once()
+        speaker.stop.assert_awaited_once_with(send_device_stop=True)
+        assert app._speakers == []
+        assert "RINCON_A" not in app._sonos_speakers_by_group_id
+
+    async def test_room_lost_absorbed_into_another_group_does_not_stop_the_device(
+        self,
+    ) -> None:
+        # Still present in the topology — just no longer a coordinator,
+        # because it joined another group as a plain member. Sonos is
+        # already directing its audio; sending it a device stop here would
+        # interrupt exactly that.
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        app._speakers.append(speaker)
+        app._sonos_speakers_by_group_id["RINCON_A"] = speaker
+
+        await app._on_sonos_room_lost("RINCON_A", still_present=True)
+
+        speaker.stop.assert_awaited_once_with(send_device_stop=False)
         assert app._speakers == []
         assert "RINCON_A" not in app._sonos_speakers_by_group_id
 
     async def test_room_lost_is_a_noop_for_unknown_uuid(self) -> None:
         app = QobuzProxy(_make_config())
 
-        await app._on_sonos_room_lost("RINCON_UNKNOWN")  # must not raise
+        await app._on_sonos_room_lost("RINCON_UNKNOWN", still_present=False)  # must not raise
 
 
 class TestRoomRenamed:
@@ -339,6 +358,65 @@ class TestRoomRetargeted:
 
         assert result is False
         assert app._sonos_speakers_by_group_id["RINCON_A:1"] is speaker  # unchanged
+
+
+class TestRoomRekeyed:
+    async def test_moves_speaker_to_the_new_key(self) -> None:
+        # The coordinator never moved (same uuid/ip/port) — its group_id
+        # just changed, most likely from a plain membership change. Must
+        # not touch the backend beyond a no-op retarget, and must not
+        # create/tear down anything.
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.retarget = AsyncMock(return_value=True)
+        speaker.rename = AsyncMock(return_value=True)
+        app._speakers.append(speaker)
+        app._sonos_speakers_by_group_id["RINCON_A:1"] = speaker
+
+        new_room = SonosRoom(
+            uuid="RINCON_A",
+            name="Kitchen",
+            ip="10.0.1.30",
+            port=1400,
+            is_stereo_pair=False,
+            member_names=("Kitchen", "Living Room"),
+            group_id="RINCON_A:2",
+        )
+        result = await app._on_sonos_room_rekeyed("RINCON_A:1", new_room)
+
+        assert result is True
+        speaker.retarget.assert_awaited_once_with("10.0.1.30", 1400)
+        speaker.rename.assert_awaited_once_with("Kitchen, Living Room")
+        assert "RINCON_A:1" not in app._sonos_speakers_by_group_id
+        assert app._sonos_speakers_by_group_id["RINCON_A:2"] is speaker
+
+    async def test_returns_false_when_speaker_not_running(self) -> None:
+        app = QobuzProxy(_make_config())
+
+        result = await app._on_sonos_room_rekeyed("RINCON_A:1", ROOM)
+
+        assert result is False
+
+    async def test_returns_false_when_backend_retarget_fails(self) -> None:
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.retarget = AsyncMock(return_value=False)
+        app._speakers.append(speaker)
+        app._sonos_speakers_by_group_id["RINCON_A:1"] = speaker
+
+        new_room = SonosRoom(
+            uuid="RINCON_A",
+            name="Kitchen",
+            ip="10.0.1.30",
+            port=1400,
+            is_stereo_pair=False,
+            group_id="RINCON_A:2",
+        )
+        result = await app._on_sonos_room_rekeyed("RINCON_A:1", new_room)
+
+        assert result is False
+        assert app._sonos_speakers_by_group_id["RINCON_A:1"] is speaker  # unchanged
+        assert "RINCON_A:2" not in app._sonos_speakers_by_group_id
 
 
 class TestAddSpeakerGuard:

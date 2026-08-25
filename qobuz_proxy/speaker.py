@@ -388,7 +388,7 @@ class Speaker:
             await self.stop()
             return False
 
-    async def stop(self) -> None:
+    async def stop(self, send_device_stop: bool = True) -> None:
         """
         Stop the speaker and all its components.
 
@@ -399,6 +399,15 @@ class Speaker:
         4. Stop discovery service
         5. Stop audio proxy
         6. Disconnect backend
+
+        Args:
+            send_device_stop: Whether the backend should send the physical
+                device an explicit stop command. Set False when the device
+                isn't actually going anywhere — e.g. a Sonos room that just
+                became a non-coordinator member of another group: we're
+                giving up *our* Speaker for it, not telling the device to
+                stop, since Sonos itself already redirected its audio and a
+                Stop here would just interrupt that.
         """
         logger.info(f"[{self.name}] Stopping speaker...")
         self._is_running = False
@@ -413,7 +422,7 @@ class Speaker:
         # 2. Stop player
         if self._player:
             try:
-                await self._player.stop()
+                await self._player.stop(send_device_stop=send_device_stop)
             except Exception as e:
                 logger.warning(f"[{self.name}] Error stopping player: {e}")
 
@@ -441,7 +450,7 @@ class Speaker:
         # 6. Disconnect backend
         if self._backend:
             try:
-                await self._backend.disconnect()
+                await self._backend.disconnect(send_device_stop=send_device_stop)
             except Exception as e:
                 logger.warning(f"[{self.name}] Error disconnecting backend: {e}")
 
