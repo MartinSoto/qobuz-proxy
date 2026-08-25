@@ -1,12 +1,24 @@
 """
 Continuous Sonos household discovery.
 
-Polls SSDP + the Sonos ZoneGroupTopology service on a fixed interval and
-reports group coordinators as they appear/disappear, so a caller (app.py)
-can start/stop a Speaker per room without any manual per-room
-configuration. Deliberately simple for a first cut: polling rather than
-UPnP (GENA) eventing, matching how the rest of this codebase watches
-device state (see DLNABackend's own state-poll loop).
+Watches SSDP + the Sonos ZoneGroupTopology service and reports group
+coordinators as they appear/disappear, so a caller (app.py) can start/stop
+a Speaker per room without any manual per-room configuration.
+
+Two complementary mechanisms feed the same topology-diffing logic
+(`_apply_topology`):
+
+- **Polling** (always active): a full SSDP scan + GetZoneGroupState fetch on
+  a fixed interval. Simple, matches how the rest of this codebase watches
+  device state (DLNABackend's own state-poll loop), and is the sole
+  mechanism if event subscription isn't set up or lapses.
+- **GENA eventing** (active when a `web_app`/`http_port` are supplied): a
+  SUBSCRIBE to one household member's ZoneGroupTopology event channel
+  (see sonos_events.py) pushes a NOTIFY the moment anything actually
+  changes, cutting detection latency from "up to one poll interval" to
+  near-instant. When a subscription is healthy, polling backs off to an
+  infrequent safety net instead of stopping — insurance against a missed
+  NOTIFY or a subscription that silently lapsed, not the primary signal.
 
 Only group *coordinators* are reported — a non-coordinator group member's
 AVTransport doesn't accept new sources while grouped (see sonos_topology's
@@ -16,26 +28,42 @@ group's coordinator, or stops being one) is expressed as a plain
 lost+found pair rather than an in-place update — simple, and safe, since
 Speaker start/stop is already idempotent lifecycle machinery.
 
-Resilience is intentionally conservative: a poll that finds no Sonos
-device, or whose topology can't be parsed, changes nothing — the previous
-snapshot is kept as-is rather than tearing every speaker down on a
-transient network hiccup. Similarly, a room whose Speaker fails to start
+Resilience is intentionally conservative: an update pass that finds no
+Sonos device, or whose topology can't be parsed, changes nothing — the
+previous snapshot is kept as-is rather than tearing every speaker down on
+a transient network hiccup. Similarly, a room whose Speaker fails to start
 is not recorded as "known", so it naturally reappears as newly-found on
-the next poll — a free retry loop with no separate backoff bookkeeping.
+the next update — a free retry loop with no separate backoff bookkeeping.
 """
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
-from .discovery import discover_dlna_devices
-from .sonos_topology import fetch_sonos_groups, fetch_sonos_topology
+from .discovery import DiscoveredDevice, discover_dlna_devices
+from .sonos_events import SonosEventSubscriber, get_local_ip
+from .sonos_topology import (
+    SonosGroup,
+    SonosZoneMember,
+    fetch_sonos_groups,
+    fetch_sonos_topology,
+    parse_zone_group_state,
+    parse_zone_groups,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_SECONDS = 30.0
 DEFAULT_SSDP_TIMEOUT_SECONDS = 3.0
+# How often the background loop wakes to check whether it's time to poll
+# and/or whether the event subscription needs renewal. Independent of the
+# actual poll cadence, which varies (see _effective_poll_interval).
+TICK_INTERVAL_SECONDS = 10.0
+# Poll cadence once a GENA subscription is healthy — a safety net, not the
+# primary change-detection mechanism, so it can be much less frequent.
+SAFETY_NET_POLL_INTERVAL_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -78,7 +106,7 @@ class SonosRoom:
 RoomFoundCallback = Callable[[SonosRoom], Awaitable[bool]]
 RoomLostCallback = Callable[[str], Awaitable[None]]  # sonos uuid
 # Returns True if the rename was applied — only then does the manager stop
-# retrying it on subsequent polls.
+# retrying it on subsequent updates.
 RoomRenamedCallback = Callable[[SonosRoom], Awaitable[bool]]
 
 
@@ -92,7 +120,23 @@ class SonosDiscoveryManager:
         on_room_renamed: RoomRenamedCallback,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         ssdp_timeout: float = DEFAULT_SSDP_TIMEOUT_SECONDS,
+        event_subscriber: Optional[SonosEventSubscriber] = None,
+        http_port: int = 0,
     ) -> None:
+        """
+        Args:
+            event_subscriber: A SonosEventSubscriber whose aiohttp route was
+                already registered before the app started serving (routes
+                can't be added afterwards — aiohttp freezes the router once
+                AppRunner.setup() runs, which happens well before a
+                SonosDiscoveryManager exists, since that's only created
+                after login). This manager claims it by setting its
+                `on_notify` for as long as it's running, releasing it on
+                stop(). Combined with `http_port`, enables event
+                subscription; omit either to fall back to polling only.
+            http_port: Port the subscriber's app is listening on — needed
+                to build the callback URL Sonos devices push NOTIFYs to.
+        """
         self._on_room_found = on_room_found
         self._on_room_lost = on_room_lost
         self._on_room_renamed = on_room_renamed
@@ -102,16 +146,37 @@ class SonosDiscoveryManager:
         self._known: dict[str, SonosRoom] = {}
         self._task: Optional[asyncio.Task[None]] = None
         self._running = False
+        self._last_poll_at: float = 0.0
+
+        self._subscriber: Optional[SonosEventSubscriber] = None
+        self._callback_url: Optional[str] = None
+        if event_subscriber is not None and http_port:
+            local_ip = get_local_ip()
+            if local_ip:
+                self._subscriber = event_subscriber
+                self._subscriber.on_notify = self._handle_notify
+                self._callback_url = (
+                    f"http://{local_ip}:{http_port}{event_subscriber.callback_path}"
+                )
+            else:
+                logger.warning(
+                    "Could not determine local IP — Sonos topology event "
+                    "subscription disabled, falling back to polling only"
+                )
 
     async def start(self) -> None:
-        """Run one poll synchronously (so speakers exist immediately), then
-        keep polling in the background."""
+        """Run one update pass synchronously (so speakers exist
+        immediately), attempt an event subscription if configured, then
+        keep watching in the background."""
         self._running = True
         await self._poll_once()
-        self._task = asyncio.create_task(self._poll_loop())
+        self._last_poll_at = time.monotonic()
+        if self._subscriber is not None:
+            await self._try_subscribe()
+        self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
-        """Stop polling. Does not tear down any speakers it created — the
+        """Stop watching. Does not tear down any speakers it created — the
         caller owns that lifecycle."""
         self._running = False
         if self._task:
@@ -121,28 +186,61 @@ class SonosDiscoveryManager:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._subscriber is not None:
+            await self._subscriber.unsubscribe()
+            self._subscriber.on_notify = None  # release the shared subscriber
         self._known.clear()
 
-    async def _poll_loop(self) -> None:
+    async def _loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(self._poll_interval)
+                await asyncio.sleep(TICK_INTERVAL_SECONDS)
                 if not self._running:
                     break
-                await self._poll_once()
+                await self._tick()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"Sonos discovery poll failed: {e}")
+                logger.warning(f"Sonos discovery tick failed: {e}")
 
-    async def _poll_once(self) -> None:
+    async def _tick(self) -> None:
+        subscription_healthy = False
+        if self._subscriber is not None:
+            sub = self._subscriber.subscription
+            if sub is None:
+                await self._try_subscribe()
+                sub = self._subscriber.subscription
+            elif sub.needs_renewal:
+                if await self._subscriber.renew():
+                    sub = self._subscriber.subscription
+                else:
+                    logger.info("Sonos discovery: event subscription lost, will retry")
+                    sub = None
+            subscription_healthy = sub is not None
+
+        interval = SAFETY_NET_POLL_INTERVAL_SECONDS if subscription_healthy else self._poll_interval
+        if time.monotonic() - self._last_poll_at >= interval:
+            await self._poll_once()
+            self._last_poll_at = time.monotonic()
+
+    async def _try_subscribe(self) -> None:
+        if self._subscriber is None or self._callback_url is None:
+            return
+        sonos_devices = await self._discover_sonos_devices()
+        if not sonos_devices:
+            return
+        await self._subscriber.subscribe(sonos_devices, self._callback_url)
+
+    async def _discover_sonos_devices(self) -> list[DiscoveredDevice]:
         try:
             devices = await discover_dlna_devices(timeout=self._ssdp_timeout)
         except Exception as e:
             logger.debug(f"Sonos discovery: SSDP scan failed: {e}")
-            return
+            return []
+        return [d for d in devices if "sonos" in d.manufacturer.lower()]
 
-        sonos_devices = [d for d in devices if "sonos" in d.manufacturer.lower()]
+    async def _poll_once(self) -> None:
+        sonos_devices = await self._discover_sonos_devices()
         if not sonos_devices:
             logger.debug("Sonos discovery: no Sonos devices found this cycle")
             return
@@ -153,6 +251,24 @@ class SonosDiscoveryManager:
             logger.debug("Sonos discovery: topology unavailable this cycle")
             return
 
+        await self._apply_topology(members, groups)
+
+    async def _handle_notify(self, body: str) -> None:
+        """Callback for SonosEventSubscriber: a GENA NOTIFY pushed fresh
+        topology directly, no SSDP scan or SOAP round trip needed."""
+        members = parse_zone_group_state(body)
+        groups = parse_zone_groups(body)
+        if not members or not groups:
+            logger.debug("Sonos discovery: NOTIFY body could not be parsed")
+            return
+        logger.debug("Sonos discovery: applying topology pushed via NOTIFY")
+        await self._apply_topology(members, groups)
+
+    async def _apply_topology(
+        self,
+        members: dict[str, SonosZoneMember],
+        groups: list[SonosGroup],
+    ) -> None:
         current: dict[str, SonosRoom] = {}
         for g in groups:
             member = members.get(g.coordinator_uuid)
@@ -236,7 +352,7 @@ class SonosDiscoveryManager:
             started = False
         if started:
             self._known[room.uuid] = room
-        # else: left out of _known, so it's retried as "newly found" next poll
+        # else: left out of _known, so it's retried as "newly found" next update
 
     async def _report_lost(self, uuid: str) -> None:
         self._known.pop(uuid, None)
@@ -253,7 +369,7 @@ class SonosDiscoveryManager:
             renamed = False
         if renamed:
             self._known[room.uuid] = room
-        # else: _known keeps the stale name, so the rename is retried next poll
+        # else: _known keeps the stale name, so the rename is retried next update
 
 
 __all__ = ["SonosRoom", "SonosDiscoveryManager"]

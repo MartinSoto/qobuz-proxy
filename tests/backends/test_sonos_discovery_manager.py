@@ -1,9 +1,17 @@
 """Tests for continuous Sonos household discovery (poll/diff/retry logic)."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+from xml.sax.saxutils import escape
+
+from aiohttp import web
 
 from qobuz_proxy.backends.dlna.discovery import DiscoveredDevice
-from qobuz_proxy.backends.dlna.sonos_discovery_manager import SonosDiscoveryManager, SonosRoom
+from qobuz_proxy.backends.dlna.sonos_discovery_manager import (
+    SAFETY_NET_POLL_INTERVAL_SECONDS,
+    SonosDiscoveryManager,
+    SonosRoom,
+)
+from qobuz_proxy.backends.dlna.sonos_events import SonosEventSubscriber
 from qobuz_proxy.backends.dlna.sonos_topology import SonosGroup, SonosZoneMember
 
 MODULE = "qobuz_proxy.backends.dlna.sonos_discovery_manager"
@@ -386,6 +394,7 @@ class TestPollOnce:
         kitchen_solo = next(r for r in found_calls if r.uuid == "RINCON_A")
         assert living_room.group_id == "RINCON_A:1"  # inherits the continuing group's id
         assert kitchen_solo.group_id == "RINCON_A:2"  # a distinct, new solo group
+        assert found_calls[0].uuid == "RINCON_B"
 
     async def test_stereo_pair_solo_display_name_has_no_duplicate(self) -> None:
         # A bonded pair's secondary is Invisible but still listed in
@@ -480,3 +489,191 @@ class TestStartStop:
 
         await manager.stop()
         assert manager._task is None
+
+
+def _notify_body(zone_group_state_xml: str) -> str:
+    return (
+        '<?xml version="1.0"?>'
+        '<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">'
+        "<e:property>"
+        f"<ZoneGroupState>{escape(zone_group_state_xml)}</ZoneGroupState>"
+        "</e:property>"
+        "</e:propertyset>"
+    )
+
+
+KITCHEN_ZONE_GROUP_STATE = (
+    "<ZoneGroups>"
+    '<ZoneGroup Coordinator="RINCON_A" ID="RINCON_A:1">'
+    '<ZoneGroupMember UUID="RINCON_A" '
+    'Location="http://10.0.1.30:1400/xml/device_description.xml" ZoneName="Kitchen"/>'
+    "</ZoneGroup>"
+    "</ZoneGroups>"
+)
+
+
+class TestEventSubscriptionWiring:
+    """SonosDiscoveryManager attaches to an already-registered
+    SonosEventSubscriber rather than registering its own route — routes
+    can't be added once aiohttp freezes the router, which happens well
+    before a manager exists (only created after login)."""
+
+    def test_no_subscriber_without_one_given(self) -> None:
+        manager, _, _, _ = _make_manager()
+
+        assert manager._subscriber is None
+
+    def test_attaches_to_a_pre_registered_subscriber(self) -> None:
+        app = web.Application()
+        subscriber = SonosEventSubscriber()
+        subscriber.register_route(app)  # as app.py does, before serving starts
+
+        async def on_found(room: SonosRoom) -> bool:
+            return True
+
+        async def on_lost(uuid: str) -> None:
+            pass
+
+        async def on_renamed(room: SonosRoom) -> bool:
+            return True
+
+        manager = SonosDiscoveryManager(
+            on_room_found=on_found,
+            on_room_lost=on_lost,
+            on_room_renamed=on_renamed,
+            event_subscriber=subscriber,
+            http_port=8689,
+        )
+
+        assert manager._subscriber is subscriber
+        assert subscriber.on_notify == manager._handle_notify
+        assert manager._callback_url is not None
+        assert manager._callback_url.endswith(subscriber.callback_path)
+        # The NOTIFY route really was registered on the given app.
+        assert any(
+            route.method == "NOTIFY" for resource in app.router.resources() for route in resource
+        )
+
+    def test_no_subscriber_when_local_ip_cannot_be_determined(self) -> None:
+        subscriber = SonosEventSubscriber()
+
+        async def on_found(room: SonosRoom) -> bool:
+            return True
+
+        async def on_lost(uuid: str) -> None:
+            pass
+
+        async def on_renamed(room: SonosRoom) -> bool:
+            return True
+
+        with patch(f"{MODULE}.get_local_ip", return_value=None):
+            manager = SonosDiscoveryManager(
+                on_room_found=on_found,
+                on_room_lost=on_lost,
+                on_room_renamed=on_renamed,
+                event_subscriber=subscriber,
+                http_port=8689,
+            )
+
+        assert manager._subscriber is None
+        assert subscriber.on_notify is None  # never claimed
+
+    async def test_stop_releases_the_shared_subscriber(self) -> None:
+        app = web.Application()
+        subscriber = SonosEventSubscriber()
+        subscriber.register_route(app)
+        manager, _, _, _ = _make_manager()
+        manager._subscriber = subscriber  # simulate a successful attach
+        subscriber.on_notify = manager._handle_notify
+
+        with patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[])):
+            await manager.start()
+        await manager.stop()
+
+        assert subscriber.on_notify is None
+
+
+class TestHandleNotify:
+    async def test_notify_body_is_parsed_and_applied(self) -> None:
+        manager, found_calls, _, _ = _make_manager()
+
+        await manager._handle_notify(_notify_body(KITCHEN_ZONE_GROUP_STATE))
+
+        assert len(found_calls) == 1
+        assert found_calls[0].name == "Kitchen"
+        assert found_calls[0].group_id == "RINCON_A:1"
+        assert "RINCON_A" in manager._known
+
+    async def test_unparseable_notify_body_is_ignored(self) -> None:
+        manager, found_calls, lost_calls, _ = _make_manager()
+
+        await manager._handle_notify("not xml at all")
+
+        assert found_calls == []
+        assert lost_calls == []
+
+
+class TestTickCadence:
+    async def test_polls_at_normal_interval_without_healthy_subscription(self) -> None:
+        manager, _, _, _ = _make_manager()
+        manager._poll_once = AsyncMock()
+        manager._last_poll_at = 0.0
+
+        with patch(f"{MODULE}.time") as mock_time:
+            mock_time.monotonic.return_value = manager._poll_interval + 1
+            await manager._tick()
+
+        manager._poll_once.assert_awaited_once()
+
+    async def test_safety_net_interval_used_once_subscription_is_healthy(self) -> None:
+        manager, _, _, _ = _make_manager()
+        manager._poll_once = AsyncMock()
+        manager._try_subscribe = AsyncMock()
+        manager._subscriber = MagicMock()
+        healthy_sub = MagicMock()
+        healthy_sub.needs_renewal = False
+        manager._subscriber.subscription = healthy_sub
+
+        # Short-interval elapsed (normal poll_interval would fire), but the
+        # much longer safety-net interval has not — must NOT poll.
+        manager._last_poll_at = 0.0
+        with patch(f"{MODULE}.time") as mock_time:
+            mock_time.monotonic.return_value = manager._poll_interval + 1
+            await manager._tick()
+        manager._poll_once.assert_not_called()
+
+        # Now the safety-net interval has elapsed too — must poll.
+        with patch(f"{MODULE}.time") as mock_time:
+            mock_time.monotonic.return_value = SAFETY_NET_POLL_INTERVAL_SECONDS + 1
+            await manager._tick()
+        manager._poll_once.assert_awaited_once()
+
+    async def test_tick_attempts_resubscribe_when_no_subscription(self) -> None:
+        manager, _, _, _ = _make_manager()
+        manager._poll_once = AsyncMock()
+        manager._try_subscribe = AsyncMock()
+        manager._subscriber = MagicMock()
+        manager._subscriber.subscription = None
+        manager._last_poll_at = 0.0
+
+        with patch(f"{MODULE}.time") as mock_time:
+            mock_time.monotonic.return_value = 0.0
+            await manager._tick()
+
+        manager._try_subscribe.assert_awaited_once()
+
+    async def test_tick_renews_subscription_needing_renewal(self) -> None:
+        manager, _, _, _ = _make_manager()
+        manager._poll_once = AsyncMock()
+        manager._subscriber = MagicMock()
+        stale_sub = MagicMock()
+        stale_sub.needs_renewal = True
+        manager._subscriber.subscription = stale_sub
+        manager._subscriber.renew = AsyncMock(return_value=True)
+        manager._last_poll_at = 0.0
+
+        with patch(f"{MODULE}.time") as mock_time:
+            mock_time.monotonic.return_value = 0.0
+            await manager._tick()
+
+        manager._subscriber.renew.assert_awaited_once()

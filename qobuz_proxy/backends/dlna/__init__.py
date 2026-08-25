@@ -30,6 +30,7 @@ from .sonos_topology import (
     parse_zone_groups,
 )
 from .sonos_discovery_manager import SonosRoom, SonosDiscoveryManager
+from .sonos_events import GenaSubscription, SonosEventSubscriber
 
 __all__ = [
     "DLNABackend",
@@ -63,4 +64,6 @@ __all__ = [
     "parse_zone_groups",
     "SonosRoom",
     "SonosDiscoveryManager",
+    "GenaSubscription",
+    "SonosEventSubscriber",
 ]

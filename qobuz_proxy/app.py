@@ -32,6 +32,7 @@ from qobuz_proxy.config import (
     slugify_name,
 )
 from qobuz_proxy.backends.dlna.sonos_discovery_manager import SonosDiscoveryManager, SonosRoom
+from qobuz_proxy.backends.dlna.sonos_events import SonosEventSubscriber
 from qobuz_proxy.speaker import Speaker
 from qobuz_proxy.webui.config_writer import save_config
 from qobuz_proxy.webui.routes import register_routes
@@ -79,6 +80,12 @@ class QobuzProxy:
         self._web_app: Optional[web.Application] = None
         self._web_runner: Optional[web.AppRunner] = None
         self._web_site: Optional[web.TCPSite] = None
+        # Its GENA NOTIFY route must be registered before the app starts
+        # serving (aiohttp freezes the router afterwards), but a
+        # SonosDiscoveryManager to actually use it only exists post-login —
+        # so this is created unconditionally in _start_web_server(), and
+        # SonosDiscoveryManager attaches/detaches as it starts/stops.
+        self._sonos_event_subscriber: Optional[SonosEventSubscriber] = None
 
         # Speakers
         self._speakers: list[Speaker] = []
@@ -467,6 +474,12 @@ class QobuzProxy:
 
         register_routes(self._web_app)
 
+        # Registered unconditionally (cheap — an idle route that 412s until
+        # a SonosDiscoveryManager claims it) since routes can't be added
+        # once the runner below freezes the router.
+        self._sonos_event_subscriber = SonosEventSubscriber()
+        self._sonos_event_subscriber.register_route(self._web_app)
+
         self._web_runner = web.AppRunner(self._web_app, access_log=None)
         await self._web_runner.setup()
         self._web_site = web.TCPSite(
@@ -562,6 +575,11 @@ class QobuzProxy:
             on_room_found=self._on_sonos_room_found,
             on_room_lost=self._on_sonos_room_lost,
             on_room_renamed=self._on_sonos_room_renamed,
+            # Enables GENA event subscription (near-instant topology change
+            # detection) on top of the polling fallback, via the route
+            # _start_web_server already registered on the shared app.
+            event_subscriber=self._sonos_event_subscriber,
+            http_port=self._config.server.http_port,
         )
         await self._sonos_discovery.start()
 
