@@ -494,6 +494,7 @@ async def run_discover_sonos(timeout: float, json_output: bool) -> int:
         output = {
             "groups": [
                 {
+                    "group_id": g.group_id,
                     "coordinator_uuid": g.coordinator_uuid,
                     "coordinator_name": (
                         members[g.coordinator_uuid].zone_name
@@ -535,7 +536,7 @@ async def run_discover_sonos(timeout: float, json_output: bool) -> int:
             coordinator_name = (
                 members[g.coordinator_uuid].zone_name if g.coordinator_uuid in members else "?"
             )
-            print(f"Group — coordinator: {coordinator_name}")
+            print(f"Group — coordinator: {coordinator_name}  [id: {g.group_id or '?'}]")
 
             quality = quality_by_coordinator.get(g.coordinator_uuid)
             if quality is None:

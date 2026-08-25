@@ -595,9 +595,15 @@ class QobuzProxy:
             )
             return False
 
+        # Identity is derived from the group's own id, not the coordinator's
+        # physical uuid: group_id is confirmed stable across a coordinator
+        # handoff, so a promoted coordinator taking over a continuing group
+        # computes the *same* device identity its predecessor had — the app
+        # sees a device it already knows reconnect. Falls back to the
+        # coordinator's own uuid if group_id is ever unavailable.
         sc = SpeakerConfig(
             name=display_name,
-            uuid=generate_sonos_speaker_uuid(room.uuid),
+            uuid=generate_sonos_speaker_uuid(room.group_id or room.uuid),
             backend_type="dlna",
             max_quality=AUTO_QUALITY,
             dlna_ip=room.ip,

@@ -234,6 +234,13 @@ class TestParseZoneGroups:
             "RINCON_BOOST",
         }
 
+    def test_group_id_is_captured(self) -> None:
+        groups = parse_zone_groups(soap_response(ZONE_GROUP_STATE))
+
+        assert groups is not None
+        kitchen = next(g for g in groups if g.coordinator_uuid == "RINCON_KITCHEN_LF")
+        assert kitchen.group_id == "RINCON_KITCHEN_LF:1"
+
     def test_stereo_pair_group_has_both_members_coordinator_first(self) -> None:
         groups = parse_zone_groups(soap_response(ZONE_GROUP_STATE))
 

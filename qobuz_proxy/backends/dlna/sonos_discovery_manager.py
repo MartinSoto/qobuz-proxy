@@ -53,6 +53,17 @@ class SonosRoom:
     # are invisible and never appear here, so a stereo pair still yields a
     # single-element tuple.
     member_names: tuple[str, ...] = ()
+    # The Sonos ZoneGroup's own id — confirmed stable across a coordinator
+    # handoff (verified against a real household). The caller should derive
+    # the Qobuz Connect device identity from this rather than `uuid`
+    # whenever it creates a new Speaker: a promoted coordinator taking over
+    # a continuing group shares its predecessor's group_id, so it
+    # transparently inherits the same device identity — the Qobuz app sees
+    # a device it already knows reconnect, not a stranger. This has no
+    # bearing on *tracking* (still keyed by coordinator `uuid`, which is
+    # what's actually proven stable across the milder solo<->grouped
+    # transitions the rename path already handles smoothly).
+    group_id: str = ""
 
     @property
     def display_name(self) -> str:
@@ -171,6 +182,7 @@ class SonosDiscoveryManager:
                 port=member.port,
                 is_stereo_pair=member.is_stereo_pair,
                 member_names=member_names,
+                group_id=g.group_id,
             )
 
         removed = [uuid for uuid in self._known if uuid not in current]

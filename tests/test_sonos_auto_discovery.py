@@ -85,6 +85,77 @@ class TestRoomFoundAndLost:
         assert sc.auto_managed is True
         assert sc.uuid  # deterministic uuid was assigned
 
+    async def test_room_found_derives_identity_from_group_id_not_coordinator_uuid(self) -> None:
+        # A coordinator handoff: two different physical rooms (different
+        # `uuid`/`ip`), same continuing group (same `group_id`) — the
+        # promoted coordinator must compute the SAME Qobuz Connect identity
+        # its predecessor had, so the app sees a reconnect of a device it
+        # already knows rather than a stranger.
+        from qobuz_proxy.config import generate_sonos_speaker_uuid
+
+        app = QobuzProxy(_make_config())
+        app._api_client = MagicMock()
+
+        old_coordinator = SonosRoom(
+            uuid="RINCON_KITCHEN",
+            name="Kitchen",
+            ip="10.0.1.30",
+            port=1400,
+            is_stereo_pair=False,
+            member_names=("Kitchen", "Living Room"),
+            group_id="RINCON_KITCHEN:1",
+        )
+        new_coordinator = SonosRoom(
+            uuid="RINCON_LIVINGROOM",
+            name="Living Room",
+            ip="10.0.1.31",
+            port=1400,
+            is_stereo_pair=False,
+            member_names=("Living Room",),
+            group_id="RINCON_KITCHEN:1",  # same continuing group
+        )
+
+        with patch("qobuz_proxy.app.Speaker", return_value=_mock_speaker()) as MockSpeaker:
+            await app._on_sonos_room_found(old_coordinator)
+            old_sc = MockSpeaker.call_args.kwargs["config"]
+
+        assert old_sc.uuid == generate_sonos_speaker_uuid("RINCON_KITCHEN:1")
+
+        # Simulate the handoff: the old Speaker is gone, a fresh one is
+        # created for the promoted coordinator (app._speakers reset here to
+        # isolate this from the name-collision guard, unrelated to identity).
+        app._speakers = []
+        app._sonos_speakers_by_uuid = {}
+
+        with patch("qobuz_proxy.app.Speaker", return_value=_mock_speaker()) as MockSpeaker:
+            await app._on_sonos_room_found(new_coordinator)
+            new_sc = MockSpeaker.call_args.kwargs["config"]
+
+        assert new_sc.uuid == old_sc.uuid  # same identity, inherited via group_id
+
+    async def test_room_found_different_group_id_gets_different_identity(self) -> None:
+        from qobuz_proxy.config import generate_sonos_speaker_uuid
+
+        app = QobuzProxy(_make_config())
+        app._api_client = MagicMock()
+
+        kitchen_solo = SonosRoom(
+            uuid="RINCON_KITCHEN",
+            name="Kitchen",
+            ip="10.0.1.30",
+            port=1400,
+            is_stereo_pair=False,
+            member_names=("Kitchen",),
+            group_id="RINCON_KITCHEN:2",  # a distinct, new solo group
+        )
+
+        with patch("qobuz_proxy.app.Speaker", return_value=_mock_speaker()) as MockSpeaker:
+            await app._on_sonos_room_found(kitchen_solo)
+            sc = MockSpeaker.call_args.kwargs["config"]
+
+        assert sc.uuid == generate_sonos_speaker_uuid("RINCON_KITCHEN:2")
+        assert sc.uuid != generate_sonos_speaker_uuid("RINCON_KITCHEN:1")
+
     async def test_room_found_returns_false_when_not_authenticated(self) -> None:
         app = QobuzProxy(_make_config())
         app._api_client = None

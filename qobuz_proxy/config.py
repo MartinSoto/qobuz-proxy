@@ -243,15 +243,18 @@ def generate_speaker_uuid(speaker_name: str) -> str:
     return str(uuid.uuid5(_SPEAKER_UUID_NAMESPACE, f"{platform.node()}:{speaker_name}"))
 
 
-def generate_sonos_speaker_uuid(sonos_uuid: str) -> str:
+def generate_sonos_speaker_uuid(sonos_identity_key: str) -> str:
     """Generate a deterministic UUID for an auto-discovered Sonos speaker.
 
-    Keyed by the Sonos player's own (stable, hostname- and name-independent)
-    UUID rather than `hostname:name` like generate_speaker_uuid — a room's
-    Qobuz Connect device identity must survive DHCP IP changes and renames,
-    neither of which affect this value.
+    Keyed by a stable Sonos-side identifier — a group's `group_id` (a
+    coordinator handoff keeps the same group_id, confirmed against a real
+    household, so the promoted coordinator's Speaker computes the same
+    device identity its predecessor had) or, failing that, a player's own
+    RINCON uuid — rather than `hostname:name` like generate_speaker_uuid.
+    Either way this must survive DHCP IP changes and renames, neither of
+    which affect the input.
     """
-    return str(uuid.uuid5(_SPEAKER_UUID_NAMESPACE, f"sonos:{sonos_uuid}"))
+    return str(uuid.uuid5(_SPEAKER_UUID_NAMESPACE, f"sonos:{sonos_identity_key}"))
 
 
 def slugify_name(name: str) -> str:

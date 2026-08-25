@@ -77,6 +77,14 @@ class SonosGroup:
 
     coordinator_uuid: str
     member_uuids: list[str]
+    # The ZoneGroup's own `ID` attribute (e.g. "RINCON_KITCHEN_LF:1").
+    # Confirmed stable across a coordinator handoff (verified against a
+    # real household: removing the coordinator itself, promoting a former
+    # peer, left the same group_id attached to the continuing group under
+    # its new coordinator) — a reliable anchor for correlating "this is
+    # still the same group" across polls, independent of coordinator_uuid.
+    # Nothing in this codebase uses it for that yet.
+    group_id: str = ""
 
 
 def _is_sonos(manufacturer: str) -> bool:
@@ -227,7 +235,13 @@ def parse_zone_groups(soap_response: str) -> list[SonosGroup] | None:
             if (uuid := member.get("UUID", ""))
         ]
         if coordinator_uuid and member_uuids:
-            groups.append(SonosGroup(coordinator_uuid=coordinator_uuid, member_uuids=member_uuids))
+            groups.append(
+                SonosGroup(
+                    coordinator_uuid=coordinator_uuid,
+                    member_uuids=member_uuids,
+                    group_id=group_elem.get("ID", ""),
+                )
+            )
 
     return groups or None
 

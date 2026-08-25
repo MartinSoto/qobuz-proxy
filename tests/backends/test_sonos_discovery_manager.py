@@ -340,7 +340,9 @@ class TestPollOnce:
         }
         groups_v1 = [
             SonosGroup(
-                coordinator_uuid="RINCON_A", member_uuids=["RINCON_A", "RINCON_B", "RINCON_C"]
+                coordinator_uuid="RINCON_A",
+                member_uuids=["RINCON_A", "RINCON_B", "RINCON_C"],
+                group_id="RINCON_A:1",
             )
         ]
         with (
@@ -354,10 +356,19 @@ class TestPollOnce:
         found_calls.clear()
 
         # Kitchen is removed from the group; Sonos promotes Living Room.
+        # Confirmed against a real household: the continuing group keeps
+        # the SAME group_id under its new coordinator; the now-solo Kitchen
+        # gets a different one (its own, separate, single-member group).
         topology_v2 = dict(topology_v1)
         groups_v2 = [
-            SonosGroup(coordinator_uuid="RINCON_B", member_uuids=["RINCON_B", "RINCON_C"]),
-            SonosGroup(coordinator_uuid="RINCON_A", member_uuids=["RINCON_A"]),
+            SonosGroup(
+                coordinator_uuid="RINCON_B",
+                member_uuids=["RINCON_B", "RINCON_C"],
+                group_id="RINCON_A:1",  # unchanged — same continuing group
+            ),
+            SonosGroup(
+                coordinator_uuid="RINCON_A", member_uuids=["RINCON_A"], group_id="RINCON_A:2"
+            ),
         ]
         with (
             patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
@@ -370,6 +381,11 @@ class TestPollOnce:
         assert lost_calls == ["RINCON_A"]  # demoted coordinator resets
         uuids_found = {r.uuid for r in found_calls}
         assert uuids_found == {"RINCON_A", "RINCON_B"}  # Kitchen re-found solo; Living Room new
+
+        living_room = next(r for r in found_calls if r.uuid == "RINCON_B")
+        kitchen_solo = next(r for r in found_calls if r.uuid == "RINCON_A")
+        assert living_room.group_id == "RINCON_A:1"  # inherits the continuing group's id
+        assert kitchen_solo.group_id == "RINCON_A:2"  # a distinct, new solo group
 
     async def test_stereo_pair_solo_display_name_has_no_duplicate(self) -> None:
         # A bonded pair's secondary is Invisible but still listed in
