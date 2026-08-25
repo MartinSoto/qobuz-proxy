@@ -22,9 +22,12 @@ from .metadata_url_provider import MetadataServiceURLProvider
 from .discovery import DLNADiscovery, DiscoveredDevice, discover_dlna_devices
 from .sonos_topology import (
     SonosZoneMember,
+    SonosGroup,
     enrich_discovered_devices,
     fetch_sonos_topology,
+    fetch_sonos_groups,
     parse_zone_group_state,
+    parse_zone_groups,
 )
 
 __all__ = [
@@ -51,7 +54,10 @@ __all__ = [
     "DiscoveredDevice",
     "discover_dlna_devices",
     "SonosZoneMember",
+    "SonosGroup",
     "enrich_discovered_devices",
     "fetch_sonos_topology",
+    "fetch_sonos_groups",
     "parse_zone_group_state",
+    "parse_zone_groups",
 ]

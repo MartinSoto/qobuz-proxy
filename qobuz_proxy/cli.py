@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
 Examples:
   qobuz-proxy --discover
   qobuz-proxy --discover --timeout 10 --json
+  qobuz-proxy --discover-sonos
   qobuz-proxy --config config.yaml
   qobuz-proxy --email user@example.com --auth-token TOKEN --user-id ID --dlna-ip 192.168.1.50
 
@@ -91,18 +92,23 @@ Environment Variables:
         help="Scan network for DLNA renderers and exit",
     )
     parser.add_argument(
+        "--discover-sonos",
+        action="store_true",
+        help="Scan for Sonos players and show household rooms/groups and exit",
+    )
+    parser.add_argument(
         "--timeout",
         "-t",
         type=float,
         default=3.0,
         metavar="SECONDS",
-        help="Discovery timeout in seconds (used with --discover)",
+        help="Discovery timeout in seconds (used with --discover/--discover-sonos)",
     )
     parser.add_argument(
         "--json",
         action="store_true",
         dest="json_output",
-        help="Output as JSON (used with --discover)",
+        help="Output as JSON (used with --discover/--discover-sonos)",
     )
     parser.add_argument(
         "--list-audio-devices",
@@ -362,6 +368,104 @@ async def run_discovery(timeout: float, json_output: bool) -> int:
     return EXIT_SUCCESS
 
 
+async def run_discover_sonos(timeout: float, json_output: bool) -> int:
+    """
+    Discover Sonos players and show household rooms/groups.
+
+    Runs plain SSDP discovery first (to find candidate IPs to query), then
+    fetches the household's ZoneGroupTopology from whichever Sonos device
+    answers first — this shows every room, marks bonded stereo
+    pairs/invisible members, and shows current dynamic groups with each
+    group's coordinator (the player that must be targeted to control
+    playback for the whole group).
+
+    Args:
+        timeout: SSDP discovery timeout in seconds
+        json_output: Output as JSON if True
+
+    Returns:
+        Exit code
+    """
+    from qobuz_proxy.backends.dlna.discovery import discover_dlna_devices
+    from qobuz_proxy.backends.dlna.sonos_topology import fetch_sonos_groups, fetch_sonos_topology
+
+    if not json_output:
+        print(f"Scanning for Sonos players ({timeout}s timeout)...")
+
+    # A plain SSDP scan just needs to find *some* reachable Sonos IP to query
+    # GetZoneGroupState on — that response then describes the whole household
+    # (including members SSDP alone would filter out), so this doesn't need
+    # to find every player.
+    devices = await discover_dlna_devices(timeout=timeout)
+    sonos_devices = [d for d in devices if "sonos" in d.manufacturer.lower()]
+
+    members = await fetch_sonos_topology(sonos_devices)
+    groups = await fetch_sonos_groups(sonos_devices)
+
+    if not members or not groups:
+        if json_output:
+            print(json.dumps({"groups": [], "count": 0}, indent=2))
+        else:
+            print("\nNo Sonos household found.")
+            print("\nTroubleshooting tips:")
+            print("  - Ensure your Sonos players are powered on and connected")
+            print("  - Try increasing timeout with --timeout 10")
+        return EXIT_SUCCESS
+
+    if json_output:
+        output = {
+            "groups": [
+                {
+                    "coordinator_uuid": g.coordinator_uuid,
+                    "coordinator_name": (
+                        members[g.coordinator_uuid].zone_name
+                        if g.coordinator_uuid in members
+                        else ""
+                    ),
+                    "members": [
+                        {
+                            "uuid": uuid,
+                            "zone_name": member.zone_name,
+                            "ip": member.ip,
+                            "is_coordinator": uuid == g.coordinator_uuid,
+                            "invisible": member.invisible,
+                            "is_stereo_pair": member.is_stereo_pair,
+                        }
+                        for uuid in g.member_uuids
+                        if (member := members.get(uuid)) is not None
+                    ],
+                }
+                for g in groups
+            ],
+            "count": len(groups),
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        print(f"\nSonos household: {len(groups)} group(s), {len(members)} player(s):\n")
+        for g in groups:
+            coordinator_name = (
+                members[g.coordinator_uuid].zone_name if g.coordinator_uuid in members else "?"
+            )
+            print(f"Group — coordinator: {coordinator_name}")
+            for uuid in g.member_uuids:
+                member = members.get(uuid)
+                if member is None:
+                    continue
+                tags = []
+                if uuid == g.coordinator_uuid:
+                    tags.append("coordinator")
+                if member.is_stereo_pair:
+                    tags.append("stereo pair")
+                if member.invisible:
+                    tags.append("hidden — bonded/satellite")
+                tag_str = f" ({', '.join(tags)})" if tags else ""
+                ip = member.ip or "?"
+                print(f"  • {member.zone_name or uuid:<20} {ip:<15}{tag_str}")
+            print()
+
+    return EXIT_SUCCESS
+
+
 def run_list_audio_devices() -> int:
     """List available audio output devices."""
     try:
@@ -449,6 +553,8 @@ def main() -> int:
 
     if args.discover:
         return asyncio.run(run_discovery(args.timeout, args.json_output))
+    elif args.discover_sonos:
+        return asyncio.run(run_discover_sonos(args.timeout, args.json_output))
     elif args.list_audio_devices:
         return run_list_audio_devices()
     else:

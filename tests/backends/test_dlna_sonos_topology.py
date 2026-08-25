@@ -8,8 +8,10 @@ from aiohttp import web
 from qobuz_proxy.backends.dlna.discovery import DiscoveredDevice
 from qobuz_proxy.backends.dlna.sonos_topology import (
     enrich_discovered_devices,
+    fetch_sonos_groups,
     fetch_sonos_topology,
     parse_zone_group_state,
+    parse_zone_groups,
 )
 
 # Modeled on a real GetZoneGroupState response (S2 firmware 95.1-78010):
@@ -102,6 +104,7 @@ class TestParseZoneGroupState:
         assert coordinator.zone_name == "Kitchen"
         assert coordinator.is_stereo_pair
         assert not coordinator.invisible
+        assert coordinator.ip == "10.0.1.30"
 
         pair_member = topology["RINCON_KITCHEN_RF"]
         assert pair_member.invisible
@@ -217,3 +220,78 @@ class TestFetchSonosTopology:
         devices = [sonos_device("127.0.0.1", "RINCON_KITCHEN_LF", port=_free_port())]
 
         assert await fetch_sonos_topology(devices, timeout=2.0) is None
+
+
+class TestParseZoneGroups:
+    def test_one_group_per_zone_group_element(self) -> None:
+        groups = parse_zone_groups(soap_response(ZONE_GROUP_STATE))
+
+        assert groups is not None
+        assert {g.coordinator_uuid for g in groups} == {
+            "RINCON_KITCHEN_LF",
+            "RINCON_BEDROOM",
+            "RINCON_DEN_BAR",
+            "RINCON_BOOST",
+        }
+
+    def test_stereo_pair_group_has_both_members_coordinator_first(self) -> None:
+        groups = parse_zone_groups(soap_response(ZONE_GROUP_STATE))
+
+        assert groups is not None
+        kitchen = next(g for g in groups if g.coordinator_uuid == "RINCON_KITCHEN_LF")
+        assert kitchen.member_uuids == ["RINCON_KITCHEN_LF", "RINCON_KITCHEN_RF"]
+
+    def test_satellite_is_not_a_group_member(self) -> None:
+        groups = parse_zone_groups(soap_response(ZONE_GROUP_STATE))
+
+        assert groups is not None
+        den = next(g for g in groups if g.coordinator_uuid == "RINCON_DEN_BAR")
+        # RINCON_DEN_SUB is nested as a <Satellite> of the ZoneGroupMember,
+        # not a sibling <ZoneGroupMember> — it must not appear here.
+        assert den.member_uuids == ["RINCON_DEN_BAR"]
+
+    def test_standalone_room_is_its_own_single_member_group(self) -> None:
+        groups = parse_zone_groups(soap_response(ZONE_GROUP_STATE))
+
+        assert groups is not None
+        bedroom = next(g for g in groups if g.coordinator_uuid == "RINCON_BEDROOM")
+        assert bedroom.member_uuids == ["RINCON_BEDROOM"]
+
+    def test_invalid_xml_returns_none(self) -> None:
+        assert parse_zone_groups("not xml at all") is None
+
+    def test_empty_zone_group_state_returns_none(self) -> None:
+        assert parse_zone_groups(soap_response("")) is None
+
+
+class TestFetchSonosGroups:
+    async def test_no_sonos_devices_returns_none(self) -> None:
+        denon = DiscoveredDevice(
+            friendly_name="Denon AVR-X1700H",
+            ip="10.0.1.99",
+            port=8080,
+            manufacturer="Denon",
+        )
+
+        assert await fetch_sonos_groups([denon]) is None
+
+    async def test_fetches_household_groups(self) -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(text=soap_response(ZONE_GROUP_STATE))
+
+        app = web.Application()
+        app.router.add_post("/ZoneGroupTopology/Control", handler)
+        port = _free_port()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", port)
+        await site.start()
+
+        try:
+            devices = [sonos_device("127.0.0.1", "RINCON_BEDROOM", port=port)]
+            groups = await fetch_sonos_groups(devices, timeout=2.0)
+
+            assert groups is not None
+            assert len(groups) == 4
+        finally:
+            await runner.cleanup()
