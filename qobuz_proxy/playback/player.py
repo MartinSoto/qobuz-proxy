@@ -93,6 +93,16 @@ class QobuzPlayer:
         # State
         self._state: PlaybackState = PlaybackState.STOPPED
 
+        # Whether the Qobuz server currently considers *this* renderer the
+        # active playback target (SrvrRndrSetActive) — the one authoritative
+        # signal for "is this the group the app is actually driving right
+        # now", used by Sonos group-departure handling to decide whether a
+        # member leaving this renderer's group should be stopped (see
+        # app.py's _on_sonos_room_members_departed). False until the server
+        # says otherwise — a freshly started renderer has no controller
+        # attached yet.
+        self._is_active_renderer: bool = False
+
         # Consecutive STOPPED polls seen while paused (external-stop detection).
         self._paused_stop_polls = 0
 
@@ -227,6 +237,11 @@ class QobuzPlayer:
         """Enable or disable fixed volume mode."""
         self._fixed_volume = enabled
         logger.info(f"Fixed volume mode: {enabled}")
+
+    def set_active_renderer(self, active: bool) -> None:
+        """Record whether the Qobuz server currently considers this
+        renderer the active playback target (see SrvrRndrSetActive)."""
+        self._is_active_renderer = active
 
     def set_next_track_callbacks(
         self,
@@ -1590,6 +1605,12 @@ class QobuzPlayer:
     def state(self) -> PlaybackState:
         """Get current playback state."""
         return self._state
+
+    @property
+    def is_active_renderer(self) -> bool:
+        """Whether the Qobuz server currently considers this renderer the
+        active playback target (see SrvrRndrSetActive in command_handler.py)."""
+        return self._is_active_renderer
 
     @property
     def current_track(self) -> Optional[QueueTrack]:

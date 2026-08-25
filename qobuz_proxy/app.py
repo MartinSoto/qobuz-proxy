@@ -31,7 +31,12 @@ from qobuz_proxy.config import (
     generate_sonos_speaker_uuid,
     slugify_name,
 )
-from qobuz_proxy.backends.dlna.sonos_discovery_manager import SonosDiscoveryManager, SonosRoom
+from qobuz_proxy.backends.dlna.client import DLNAClient
+from qobuz_proxy.backends.dlna.sonos_discovery_manager import (
+    DepartedMember,
+    SonosDiscoveryManager,
+    SonosRoom,
+)
 from qobuz_proxy.backends.dlna.sonos_events import SonosEventSubscriber
 from qobuz_proxy.speaker import Speaker
 from qobuz_proxy.webui.config_writer import save_config
@@ -579,6 +584,7 @@ class QobuzProxy:
             on_room_renamed=self._on_sonos_room_renamed,
             on_room_retargeted=self._on_sonos_room_retargeted,
             on_room_rekeyed=self._on_sonos_room_rekeyed,
+            on_room_members_departed=self._on_sonos_room_members_departed,
             # Enables GENA event subscription (near-instant topology change
             # detection) on top of the polling fallback, via the route
             # _start_web_server already registered on the shared app.
@@ -732,6 +738,37 @@ class QobuzProxy:
         self._sonos_speakers_by_group_id[room.tracking_key] = speaker
         logger.info(f"Sonos discovery: re-keyed speaker '{speaker.name}'")
         return True
+
+    async def _on_sonos_room_members_departed(
+        self, tracking_key: str, departed: tuple[DepartedMember, ...]
+    ) -> None:
+        """Called by SonosDiscoveryManager whenever a still-tracked group's
+        membership shrinks — for *any* group, whether we're playing to it
+        or not (SonosDiscoveryManager has no notion of Qobuz playback
+        state at all). Only the group we're actively playing to is our
+        business: a device leaving it needs to be told to stop, since it's
+        no longer part of what the Qobuz app thinks it's driving and
+        nothing else will ever tell it to stop. A device leaving any other
+        (merely discovered, not playing) group is Sonos's own business —
+        touching it risks exactly the play/mute race fixed for the
+        absorbed-into-another-group case (see _on_sonos_room_lost)."""
+        speaker = self._sonos_speakers_by_group_id.get(tracking_key)
+        if speaker is None or not speaker.is_active:
+            return
+
+        for member in departed:
+            logger.info(
+                f"Sonos discovery: '{member.uuid}' left the active group "
+                f"'{speaker.name}' — stopping it directly"
+            )
+            client = DLNAClient(member.ip, member.port)
+            try:
+                await client.connect()
+                await client.stop()
+            except Exception as e:
+                logger.debug(f"Could not stop departed device {member.ip}: {e}")
+            finally:
+                await client.disconnect()
 
     def _schedule_speaker_retry(self, config: SpeakerConfig) -> None:
         """Start (or keep) a background task retrying a failed speaker."""

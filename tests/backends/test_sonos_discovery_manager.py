@@ -32,13 +32,19 @@ def _member(
 
 
 def _make_manager(
-    on_found=None, on_lost=None, on_renamed=None, on_retargeted=None, on_rekeyed=None
-) -> tuple[SonosDiscoveryManager, list, list, list, list, list]:
+    on_found=None,
+    on_lost=None,
+    on_renamed=None,
+    on_retargeted=None,
+    on_rekeyed=None,
+    on_members_departed=None,
+) -> tuple[SonosDiscoveryManager, list, list, list, list, list, list]:
     found_calls: list = []
     lost_calls: list = []
     renamed_calls: list = []
     retargeted_calls: list = []
     rekeyed_calls: list = []
+    departed_calls: list = []
 
     async def default_on_found(room: SonosRoom) -> bool:
         found_calls.append(room)
@@ -59,19 +65,31 @@ def _make_manager(
         rekeyed_calls.append((old_key, room))
         return True
 
+    async def default_on_members_departed(tracking_key: str, departed) -> None:  # type: ignore[no-untyped-def]
+        departed_calls.append((tracking_key, departed))
+
     manager = SonosDiscoveryManager(
         on_room_found=on_found or default_on_found,
         on_room_lost=on_lost or default_on_lost,
         on_room_renamed=on_renamed or default_on_renamed,
         on_room_retargeted=on_retargeted or default_on_retargeted,
         on_room_rekeyed=on_rekeyed or default_on_rekeyed,
+        on_room_members_departed=on_members_departed or default_on_members_departed,
     )
-    return manager, found_calls, lost_calls, renamed_calls, retargeted_calls, rekeyed_calls
+    return (
+        manager,
+        found_calls,
+        lost_calls,
+        renamed_calls,
+        retargeted_calls,
+        rekeyed_calls,
+        departed_calls,
+    )
 
 
 class TestPollOnce:
     async def test_new_room_reported_found(self) -> None:
-        manager, found_calls, lost_calls, _renamed_calls, _, _ = _make_manager()
+        manager, found_calls, lost_calls, _renamed_calls, _, _, _ = _make_manager()
 
         with (
             patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
@@ -98,13 +116,14 @@ class TestPollOnce:
             port=1400,
             is_stereo_pair=False,
             member_names=("Kitchen",),
+            member_uuids=("RINCON_A",),
         )
         assert found_calls[0].display_name == "Kitchen"
         assert lost_calls == []
         assert "RINCON_A" in manager._known
 
     async def test_no_devices_found_keeps_previous_state(self) -> None:
-        manager, found_calls, lost_calls, _renamed_calls, _, _ = _make_manager()
+        manager, found_calls, lost_calls, _renamed_calls, _, _, _ = _make_manager()
         manager._known = {
             "RINCON_A": SonosRoom("RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",))
         }
@@ -117,7 +136,7 @@ class TestPollOnce:
         assert "RINCON_A" in manager._known  # untouched, not torn down
 
     async def test_topology_unavailable_keeps_previous_state(self) -> None:
-        manager, found_calls, lost_calls, _renamed_calls, _, _ = _make_manager()
+        manager, found_calls, lost_calls, _renamed_calls, _, _, _ = _make_manager()
         manager._known = {
             "RINCON_A": SonosRoom("RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",))
         }
@@ -141,7 +160,7 @@ class TestPollOnce:
             calls.append(room)
             return results.pop(0)
 
-        manager, _, _, _renamed_calls, _, _ = _make_manager(on_found=flaky_on_found)
+        manager, _, _, _renamed_calls, _, _, _ = _make_manager(on_found=flaky_on_found)
 
         with (
             patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
@@ -168,7 +187,7 @@ class TestPollOnce:
     async def test_room_removed_reports_lost(self) -> None:
         # Realistic partial removal: RINCON_B went offline, but RINCON_A is
         # still around to answer the topology query and no longer lists it.
-        manager, found_calls, lost_calls, _renamed_calls, _, _ = _make_manager()
+        manager, found_calls, lost_calls, _renamed_calls, _, _, _ = _make_manager()
         manager._known = {
             "RINCON_A": SonosRoom("RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",)),
             "RINCON_B": SonosRoom("RINCON_B", "Bedroom", "10.0.1.31", 1400, False, ("Bedroom",)),
@@ -194,7 +213,9 @@ class TestPollOnce:
         assert lost_calls == [("RINCON_B", False)]  # genuinely gone, not just re-grouped
         assert found_calls == []  # RINCON_A was already known, nothing changed about it
         assert manager._known == {
-            "RINCON_A": SonosRoom("RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",))
+            "RINCON_A": SonosRoom(
+                "RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",), ("RINCON_A",)
+            )
         }
 
     async def test_room_absorbed_into_another_group_reports_lost_but_still_present(
@@ -206,7 +227,7 @@ class TestPollOnce:
         # never went anywhere and Sonos is already directing its audio, so
         # this must be flagged still_present=True: the caller must not send
         # it a live device stop (that would interrupt Sonos's own handoff).
-        manager, found_calls, lost_calls, renamed_calls, _, _ = _make_manager()
+        manager, found_calls, lost_calls, renamed_calls, _, _, _ = _make_manager()
         manager._known = {
             "RINCON_A": SonosRoom("RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",)),
             "RINCON_B": SonosRoom("RINCON_B", "Bedroom", "10.0.1.31", 1400, False, ("Bedroom",)),
@@ -246,7 +267,7 @@ class TestPollOnce:
         # Same physical coordinator (same uuid), just a new address (e.g.
         # DHCP renewal) — no pairing needed, no reason to drop the Qobuz
         # session either.
-        manager, found_calls, lost_calls, _renamed_calls, retargeted_calls, _ = _make_manager()
+        manager, found_calls, lost_calls, _renamed_calls, retargeted_calls, _, _ = _make_manager()
         manager._known = {
             "RINCON_A": SonosRoom("RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",))
         }
@@ -277,7 +298,7 @@ class TestPollOnce:
         assert manager._known["RINCON_A"].ip == "10.0.1.99"
 
     async def test_active_group_gets_comma_joined_display_name(self) -> None:
-        manager, found_calls, _, _renamed_calls, _, _ = _make_manager()
+        manager, found_calls, _, _renamed_calls, _, _, _ = _make_manager()
 
         with (
             patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
@@ -313,7 +334,7 @@ class TestPollOnce:
         # Coordinator is "Office" — must stay first even though it wouldn't
         # sort first alphabetically; the other two must be alphabetized
         # regardless of the order the topology happens to list them in.
-        manager, found_calls, _, _renamed_calls, _, _ = _make_manager()
+        manager, found_calls, _, _renamed_calls, _, _, _ = _make_manager()
 
         with (
             patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
@@ -350,7 +371,7 @@ class TestPollOnce:
         # leaves. The coordinator's ip/port never changed, so it must be
         # renamed in place — never lost+found (which would kill its
         # WebSocket session and lose playback position).
-        manager, found_calls, lost_calls, renamed_calls, _, _ = _make_manager()
+        manager, found_calls, lost_calls, renamed_calls, _, _, _ = _make_manager()
 
         topology_v1 = {
             "RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30"),
@@ -406,7 +427,7 @@ class TestPollOnce:
         # continuing group's group_id, the existing Speaker is retargeted
         # to it (keeping the Qobuz session alive) instead — and Kitchen,
         # now solo, gets a fresh Speaker of its own in the same pass.
-        manager, found_calls, lost_calls, renamed_calls, retargeted_calls, _ = _make_manager()
+        manager, found_calls, lost_calls, renamed_calls, retargeted_calls, _, _ = _make_manager()
 
         topology_v1 = {
             "RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30"),
@@ -480,7 +501,7 @@ class TestPollOnce:
         # plain in-place rename, not a lost+found (which would drop the
         # Qobuz session for no reason). The departed peer, now solo for the
         # first time, gets a brand new group_id of its own.
-        manager, found_calls, lost_calls, renamed_calls, _, _ = _make_manager()
+        manager, found_calls, lost_calls, renamed_calls, _, _, _ = _make_manager()
 
         topology_v1 = {
             "RINCON_A": _member("RINCON_A", "Cuarto", "10.0.1.30"),
@@ -539,7 +560,7 @@ class TestPollOnce:
         # test above). This must be a rekey, not a lost+found: a lost+found
         # would send the still-playing coordinator a real DLNA Stop (via
         # Speaker.stop() -> ... -> DLNABackend.disconnect()) for no reason.
-        manager, found_calls, lost_calls, renamed_calls, retargeted_calls, rekeyed_calls = (
+        manager, found_calls, lost_calls, renamed_calls, retargeted_calls, rekeyed_calls, _ = (
             _make_manager()
         )
 
@@ -601,10 +622,16 @@ class TestPollOnce:
             calls.append((old_key, room))
             return results.pop(0)
 
-        manager, found_calls, lost_calls, _, _, _ = _make_manager(on_rekeyed=flaky_on_rekeyed)
+        manager, found_calls, lost_calls, _, _, _, _ = _make_manager(on_rekeyed=flaky_on_rekeyed)
         manager._known = {
             "RINCON_A:1": SonosRoom(
-                "RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",), "RINCON_A:1"
+                "RINCON_A",
+                "Kitchen",
+                "10.0.1.30",
+                1400,
+                False,
+                ("Kitchen",),
+                group_id="RINCON_A:1",
             )
         }
 
@@ -630,10 +657,143 @@ class TestPollOnce:
         assert len(calls) == 2  # retried automatically, no separate backoff needed
         assert set(manager._known) == {"RINCON_A:2"}
 
+    async def test_peer_leaving_a_group_reports_members_departed(self) -> None:
+        # Bedroom leaves Kitchen's group. The coordinator (Kitchen) itself
+        # is unaffected (renamed in place, per the existing rename test),
+        # but this is also the manager's only way to say *who* left — it
+        # has no idea whether the caller cares (only Qobuz playback state,
+        # which this manager knows nothing about, decides that).
+        manager, *_, departed_calls = _make_manager()
+        manager._known = {
+            "RINCON_A": SonosRoom(
+                "RINCON_A",
+                "Kitchen",
+                "10.0.1.30",
+                1400,
+                False,
+                ("Kitchen", "Bedroom"),
+                ("RINCON_A", "RINCON_B"),
+            )
+        }
+
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(
+                f"{MODULE}.fetch_sonos_topology",
+                AsyncMock(
+                    return_value={
+                        "RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30"),
+                        "RINCON_B": _member("RINCON_B", "Bedroom", "10.0.1.31"),
+                    }
+                ),
+            ),
+            patch(
+                f"{MODULE}.fetch_sonos_groups",
+                AsyncMock(
+                    return_value=[
+                        SonosGroup(coordinator_uuid="RINCON_A", member_uuids=["RINCON_A"]),
+                        SonosGroup(coordinator_uuid="RINCON_B", member_uuids=["RINCON_B"]),
+                    ]
+                ),
+            ),
+        ):
+            await manager._poll_once()
+
+        assert len(departed_calls) == 1
+        tracking_key, departed = departed_calls[0]
+        assert tracking_key == "RINCON_A"
+        assert len(departed) == 1
+        assert departed[0].uuid == "RINCON_B"
+        assert departed[0].ip == "10.0.1.31"
+        assert departed[0].port == 1400
+
+    async def test_no_departure_reported_when_membership_unchanged(self) -> None:
+        manager, *_, departed_calls = _make_manager()
+        manager._known = {
+            "RINCON_A": SonosRoom(
+                "RINCON_A", "Kitchen", "10.0.1.99", 1400, False, ("Kitchen",), ("RINCON_A",)
+            )
+        }
+
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(
+                f"{MODULE}.fetch_sonos_topology",
+                AsyncMock(return_value={"RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30")}),
+            ),
+            patch(
+                f"{MODULE}.fetch_sonos_groups",
+                AsyncMock(
+                    return_value=[
+                        SonosGroup(coordinator_uuid="RINCON_A", member_uuids=["RINCON_A"])
+                    ]
+                ),
+            ),
+        ):
+            await manager._poll_once()  # only the ip changed (retargeted) — no departure
+
+        assert departed_calls == []
+
+    async def test_departure_reported_for_the_old_key_on_a_rekey(self) -> None:
+        # Membership shrinks *and* group_id churns in the same update (a
+        # peer leaving apparently can bump the coordinator's own group_id
+        # too, per the rekey tests above) — departure must still be keyed
+        # by whichever tracking_key the caller currently has this Speaker
+        # registered under (pre-rekey), not the new one.
+        manager, *_, departed_calls = _make_manager()
+        manager._known = {
+            "RINCON_A:1": SonosRoom(
+                "RINCON_A",
+                "Kitchen",
+                "10.0.1.30",
+                1400,
+                False,
+                ("Kitchen", "Bedroom"),
+                ("RINCON_A", "RINCON_B"),
+                group_id="RINCON_A:1",
+            )
+        }
+
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(
+                f"{MODULE}.fetch_sonos_topology",
+                AsyncMock(
+                    return_value={
+                        "RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30"),
+                        "RINCON_B": _member("RINCON_B", "Bedroom", "10.0.1.31"),
+                    }
+                ),
+            ),
+            patch(
+                f"{MODULE}.fetch_sonos_groups",
+                AsyncMock(
+                    return_value=[
+                        SonosGroup(
+                            coordinator_uuid="RINCON_A",
+                            member_uuids=["RINCON_A"],
+                            group_id="RINCON_A:2",
+                        ),
+                        SonosGroup(
+                            coordinator_uuid="RINCON_B",
+                            member_uuids=["RINCON_B"],
+                            group_id="RINCON_B:1",
+                        ),
+                    ]
+                ),
+            ),
+        ):
+            await manager._poll_once()
+
+        assert len(departed_calls) == 1
+        tracking_key, departed = departed_calls[0]
+        assert tracking_key == "RINCON_A:1"  # the pre-rekey key
+        assert departed[0].uuid == "RINCON_B"
+
     async def test_stereo_pair_solo_display_name_has_no_duplicate(self) -> None:
         # A bonded pair's secondary is Invisible but still listed in
         # g.member_uuids — it must not turn "Kitchen" into "Kitchen, Kitchen".
-        manager, found_calls, _, _renamed_calls, _, _ = _make_manager()
+        manager, found_calls, _, _renamed_calls, _, _, _ = _make_manager()
 
         with (
             patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
@@ -662,7 +822,7 @@ class TestPollOnce:
         assert found_calls[0].display_name == "Kitchen"
 
     async def test_invisible_coordinator_is_skipped(self) -> None:
-        manager, found_calls, lost_calls, _renamed_calls, _, _ = _make_manager()
+        manager, found_calls, lost_calls, _renamed_calls, _, _, _ = _make_manager()
 
         with (
             patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
@@ -695,7 +855,7 @@ class TestTopologyChangeLogging:
     live household's exact behavior against what we assumed it would do."""
 
     async def test_logs_full_topology_and_diff_on_change(self, caplog) -> None:  # type: ignore[no-untyped-def]
-        manager, *_ = _make_manager()
+        manager, *_, _ = _make_manager()
 
         with (
             caplog.at_level(logging.DEBUG, logger=MODULE),
@@ -731,13 +891,21 @@ class TestTopologyChangeLogging:
             "added": ["RINCON_A:1"],
             "renamed": [],
             "retargeted": [],
+            "members_departed": {},
         }
 
     async def test_no_log_when_nothing_changed(self, caplog) -> None:  # type: ignore[no-untyped-def]
-        manager, *_ = _make_manager()
+        manager, *_, _ = _make_manager()
         manager._known = {
             "RINCON_A:1": SonosRoom(
-                "RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",), "RINCON_A:1"
+                "RINCON_A",
+                "Kitchen",
+                "10.0.1.30",
+                1400,
+                False,
+                ("Kitchen",),
+                ("RINCON_A",),
+                group_id="RINCON_A:1",
             )
         }
 
@@ -768,7 +936,7 @@ class TestTopologyChangeLogging:
 
 class TestStartStop:
     async def test_start_polls_once_immediately(self) -> None:
-        manager, found_calls, _, _renamed_calls, _, _ = _make_manager()
+        manager, found_calls, _, _renamed_calls, _, _, _ = _make_manager()
 
         with (
             patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
@@ -792,7 +960,7 @@ class TestStartStop:
                 await manager.stop()
 
     async def test_stop_cancels_background_loop(self) -> None:
-        manager, _, _, _renamed_calls, _, _ = _make_manager()
+        manager, _, _, _renamed_calls, _, _, _ = _make_manager()
 
         with patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[])):
             await manager.start()
@@ -830,7 +998,7 @@ class TestEventSubscriptionWiring:
     before a manager exists (only created after login)."""
 
     def test_no_subscriber_without_one_given(self) -> None:
-        manager, _, _, _, _, _ = _make_manager()
+        manager, _, _, _, _, _, _ = _make_manager()
 
         assert manager._subscriber is None
 
@@ -854,12 +1022,16 @@ class TestEventSubscriptionWiring:
         async def on_rekeyed(old_key: str, room: SonosRoom) -> bool:
             return True
 
+        async def on_members_departed(tracking_key: str, departed) -> None:  # type: ignore[no-untyped-def]
+            pass
+
         manager = SonosDiscoveryManager(
             on_room_found=on_found,
             on_room_lost=on_lost,
             on_room_renamed=on_renamed,
             on_room_retargeted=on_retargeted,
             on_room_rekeyed=on_rekeyed,
+            on_room_members_departed=on_members_departed,
             event_subscriber=subscriber,
             http_port=8689,
         )
@@ -891,6 +1063,9 @@ class TestEventSubscriptionWiring:
         async def on_rekeyed(old_key: str, room: SonosRoom) -> bool:
             return True
 
+        async def on_members_departed(tracking_key: str, departed) -> None:  # type: ignore[no-untyped-def]
+            pass
+
         with patch(f"{MODULE}.get_local_ip", return_value=None):
             manager = SonosDiscoveryManager(
                 on_room_found=on_found,
@@ -898,6 +1073,7 @@ class TestEventSubscriptionWiring:
                 on_room_renamed=on_renamed,
                 on_room_retargeted=on_retargeted,
                 on_room_rekeyed=on_rekeyed,
+                on_room_members_departed=on_members_departed,
                 event_subscriber=subscriber,
                 http_port=8689,
             )
@@ -909,7 +1085,7 @@ class TestEventSubscriptionWiring:
         app = web.Application()
         subscriber = SonosEventSubscriber()
         subscriber.register_route(app)
-        manager, _, _, _, _, _ = _make_manager()
+        manager, _, _, _, _, _, _ = _make_manager()
         manager._subscriber = subscriber  # simulate a successful attach
         subscriber.on_notify = manager._handle_notify
 
@@ -922,7 +1098,7 @@ class TestEventSubscriptionWiring:
 
 class TestHandleNotify:
     async def test_notify_body_is_parsed_and_applied(self) -> None:
-        manager, found_calls, _, _, _, _ = _make_manager()
+        manager, found_calls, _, _, _, _, _ = _make_manager()
 
         await manager._handle_notify(_notify_body(KITCHEN_ZONE_GROUP_STATE))
 
@@ -932,7 +1108,7 @@ class TestHandleNotify:
         assert "RINCON_A:1" in manager._known
 
     async def test_unparseable_notify_body_is_ignored(self) -> None:
-        manager, found_calls, lost_calls, _, _, _ = _make_manager()
+        manager, found_calls, lost_calls, _, _, _, _ = _make_manager()
 
         await manager._handle_notify("not xml at all")
 
@@ -942,7 +1118,7 @@ class TestHandleNotify:
 
 class TestTickCadence:
     async def test_polls_at_normal_interval_without_healthy_subscription(self) -> None:
-        manager, _, _, _, _, _ = _make_manager()
+        manager, _, _, _, _, _, _ = _make_manager()
         manager._poll_once = AsyncMock()
         manager._last_poll_at = 0.0
 
@@ -953,7 +1129,7 @@ class TestTickCadence:
         manager._poll_once.assert_awaited_once()
 
     async def test_safety_net_interval_used_once_subscription_is_healthy(self) -> None:
-        manager, _, _, _, _, _ = _make_manager()
+        manager, _, _, _, _, _, _ = _make_manager()
         manager._poll_once = AsyncMock()
         manager._try_subscribe = AsyncMock()
         manager._subscriber = MagicMock()
@@ -976,7 +1152,7 @@ class TestTickCadence:
         manager._poll_once.assert_awaited_once()
 
     async def test_tick_attempts_resubscribe_when_no_subscription(self) -> None:
-        manager, _, _, _, _, _ = _make_manager()
+        manager, _, _, _, _, _, _ = _make_manager()
         manager._poll_once = AsyncMock()
         manager._try_subscribe = AsyncMock()
         manager._subscriber = MagicMock()
@@ -990,7 +1166,7 @@ class TestTickCadence:
         manager._try_subscribe.assert_awaited_once()
 
     async def test_tick_renews_subscription_needing_renewal(self) -> None:
-        manager, _, _, _, _, _ = _make_manager()
+        manager, _, _, _, _, _, _ = _make_manager()
         manager._poll_once = AsyncMock()
         manager._subscriber = MagicMock()
         stale_sub = MagicMock()

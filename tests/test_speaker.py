@@ -710,3 +710,26 @@ class TestSpeakerRetarget:
         result = await speaker.retarget("10.0.1.31", 1400)
 
         assert result is False
+
+
+class TestSpeakerIsActive:
+    def _make_speaker(self) -> Speaker:
+        return Speaker(
+            config=_make_speaker_config(name="Kitchen", dlna_ip="10.0.1.30"),
+            api_client=_make_api_client(),
+            app_id="app-id",
+        )
+
+    def test_false_before_player_exists(self):
+        speaker = self._make_speaker()
+        assert speaker._player is None
+
+        assert speaker.is_active is False
+
+    def test_reflects_the_players_active_renderer_flag(self):
+        speaker = self._make_speaker()
+        speaker._player = MagicMock(is_active_renderer=True)
+        assert speaker.is_active is True
+
+        speaker._player.is_active_renderer = False
+        assert speaker.is_active is False

@@ -22,11 +22,10 @@ Two complementary mechanisms feed the same topology-diffing logic
 
 Only group *coordinators* are reported — a non-coordinator group member's
 AVTransport doesn't accept new sources while grouped (see sonos_topology's
-module docstring), so it isn't a valid independent playback target.
-Coordinator-only reporting also means dynamic regrouping (a room becomes a
-group's coordinator, or stops being one) is expressed as a plain
-lost+found pair rather than an in-place update — simple, and safe, since
-Speaker start/stop is already idempotent lifecycle machinery.
+module docstring), so it isn't a valid independent playback target. A
+room becoming a coordinator, or stopping being one, is reported as
+found/lost/retargeted/rekeyed as appropriate (see those callbacks' own
+docs) rather than always torn down and rebuilt.
 
 Resilience is intentionally conservative: an update pass that finds no
 Sonos device, or whose topology can't be parsed, changes nothing — the
@@ -34,6 +33,15 @@ previous snapshot is kept as-is rather than tearing every speaker down on
 a transient network hiccup. Similarly, a room whose Speaker fails to start
 is not recorded as "known", so it naturally reappears as newly-found on
 the next update — a free retry loop with no separate backoff bookkeeping.
+
+**"Active" is a Qobuz Connect concept, not a Sonos one.** This manager
+only ever sees Sonos topology — it has no idea whether any of the groups
+it's watching are actually playing Qobuz content right now (the Qobuz
+server tells each Speaker that directly, via SRVR_RNDR_SET_ACTIVE). At
+most one group is ever "the" active one at a time, but this manager can't
+tell which, so on_room_members_departed reports every departure equally
+and leaves it to the caller (app.py) to act only when it's the active
+group that lost a member — see Speaker.is_active.
 """
 
 import asyncio
@@ -82,6 +90,11 @@ class SonosRoom:
     # are invisible and never appear here, so a stereo pair still yields a
     # single-element tuple.
     member_names: tuple[str, ...] = ()
+    # Same members, same order, as their own uuids instead of display names
+    # — lets a diff against a previous snapshot's member_uuids tell exactly
+    # *which* device left a group (member_names alone only says the name
+    # changed), which is what departure detection needs.
+    member_uuids: tuple[str, ...] = ()
     # The Sonos ZoneGroup's own id — confirmed stable across a coordinator
     # handoff, and this is the actual tracking identity (see tracking_key):
     # one group_id = one Qobuz renderer, for as long as that group_id
@@ -105,6 +118,40 @@ class SonosRoom:
         room name when not grouped with anything else."""
         return ", ".join(self.member_names) if self.member_names else self.name
 
+
+@dataclass(frozen=True)
+class DepartedMember:
+    """A device that just left a group it was (visibly) a member of, still
+    reachable at this ip/port as of the snapshot that noticed it leaving."""
+
+    uuid: str
+    ip: str
+    port: int
+
+
+def _departed_members(
+    old: SonosRoom, new: SonosRoom, members: dict[str, SonosZoneMember]
+) -> tuple[DepartedMember, ...]:
+    """uuids in old.member_uuids but not new.member_uuids — i.e. members of
+    *this* group that just left it — paired with their current ip/port
+    from this snapshot's fresh topology (skipped if a departed uuid isn't
+    in it at all, i.e. it went offline in the very same snapshot)."""
+    result = []
+    for uuid in set(old.member_uuids) - set(new.member_uuids):
+        m = members.get(uuid)
+        if m is not None and m.ip:
+            result.append(DepartedMember(uuid=uuid, ip=m.ip, port=m.port))
+    return tuple(result)
+
+
+# Called when a still-tracked group's membership shrinks (its coordinator's
+# own uuid/ip/port may or may not have also changed — orthogonal to
+# found/lost/renamed/retargeted/rekeyed, which only look at the
+# coordinator). Args: (tracking_key, departed members). It's the caller's
+# job to decide whether tracking_key is the group it's actively playing to
+# — see the module docstring's note on "active" — since this manager has
+# no notion of Qobuz playback state at all, only Sonos topology.
+RoomMembersDepartedCallback = Callable[[str, tuple[DepartedMember, ...]], Awaitable[None]]
 
 # Returns True if the room was successfully turned into a running Speaker —
 # only then is it considered "known" until it's reported lost.
@@ -148,6 +195,7 @@ class SonosDiscoveryManager:
         on_room_renamed: RoomRenamedCallback,
         on_room_retargeted: RoomRetargetedCallback,
         on_room_rekeyed: RoomRekeyedCallback,
+        on_room_members_departed: RoomMembersDepartedCallback,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         ssdp_timeout: float = DEFAULT_SSDP_TIMEOUT_SECONDS,
         event_subscriber: Optional[SonosEventSubscriber] = None,
@@ -172,6 +220,7 @@ class SonosDiscoveryManager:
         self._on_room_renamed = on_room_renamed
         self._on_room_retargeted = on_room_retargeted
         self._on_room_rekeyed = on_room_rekeyed
+        self._on_room_members_departed = on_room_members_departed
         self._poll_interval = poll_interval
         self._ssdp_timeout = ssdp_timeout
 
@@ -327,16 +376,18 @@ class SonosDiscoveryManager:
             # HT satellite) is part of g.member_uuids too, but Invisible, so
             # it must not turn a solo room's display name into "X, X".
             # Coordinator first (matches how the Sonos app itself orders a
-            # group's name), remaining rooms alphabetical.
-            other_names = sorted(
-                m.zone_name
+            # group's name), remaining rooms alphabetical — uuids sorted
+            # alongside so member_uuids[i] is member_names[i]'s own uuid.
+            other = sorted(
+                (m.zone_name, uuid)
                 for uuid in g.member_uuids
                 if uuid != g.coordinator_uuid
                 and (m := members.get(uuid)) is not None
                 and not m.invisible
                 and m.zone_name
             )
-            member_names = (room_name, *other_names)
+            member_names = (room_name, *(name for name, _ in other))
+            member_uuids = (g.coordinator_uuid, *(uuid for _, uuid in other))
 
             room = SonosRoom(
                 uuid=g.coordinator_uuid,
@@ -345,6 +396,7 @@ class SonosDiscoveryManager:
                 port=member.port,
                 is_stereo_pair=member.is_stereo_pair,
                 member_names=member_names,
+                member_uuids=member_uuids,
                 group_id=g.group_id,
             )
             current[room.tracking_key] = room
@@ -377,8 +429,17 @@ class SonosDiscoveryManager:
         # change — retarget in place, keeping the Qobuz Connect session
         # alive throughout (Sonos already migrates the audio itself).
         # Anything else (membership, name) is cosmetic — rename in place.
+        #
+        # Orthogonally, whenever a persisting entity's membership shrinks —
+        # whether it was classified retargeted, renamed, or rekeyed above —
+        # report exactly who left. This manager has no idea whether that
+        # matters (only the caller knows which group, if any, is actively
+        # playing — see the module docstring), so every departure is
+        # reported equally; deciding what to do about it is the caller's
+        # job entirely.
         retargeted: list[SonosRoom] = []
         renamed: list[SonosRoom] = []
+        departures: list[tuple[str, tuple[DepartedMember, ...]]] = []
         for key, room in current.items():
             if key not in self._known:
                 continue
@@ -389,6 +450,13 @@ class SonosDiscoveryManager:
                 retargeted.append(room)
             else:
                 renamed.append(room)
+            departed = _departed_members(old, room, members)
+            if departed:
+                departures.append((key, departed))
+        for old_key, room in rekeyed:
+            departed = _departed_members(self._known[old_key], room, members)
+            if departed:
+                departures.append((old_key, departed))
 
         changed = bool(removed or rekeyed or added or renamed or retargeted)
         if changed and logger.isEnabledFor(logging.DEBUG):
@@ -408,6 +476,9 @@ class SonosDiscoveryManager:
                             "added": [room.tracking_key for room in added],
                             "renamed": [room.tracking_key for room in renamed],
                             "retargeted": [room.tracking_key for room in retargeted],
+                            "members_departed": {
+                                key: [d.uuid for d in departed] for key, departed in departures
+                            },
                         },
                     },
                     indent=2,
@@ -415,6 +486,8 @@ class SonosDiscoveryManager:
                 )
             )
 
+        for key, departed in departures:
+            await self._report_members_departed(key, departed)
         for key in removed:
             # Still visible in this snapshot's topology (just not a
             # coordinator anymore) means it was absorbed as a plain member
@@ -430,6 +503,19 @@ class SonosDiscoveryManager:
             await self._report_renamed(room)
         for room in retargeted:
             await self._report_retargeted(room)
+
+    async def _report_members_departed(
+        self, tracking_key: str, departed: tuple[DepartedMember, ...]
+    ) -> None:
+        # Purely informational — doesn't touch self._known, since it has no
+        # bearing on the coordinator entity's own found/lost/renamed/
+        # retargeted/rekeyed status (that's tracked independently above).
+        try:
+            await self._on_room_members_departed(tracking_key, departed)
+        except Exception as e:
+            logger.warning(
+                f"Sonos discovery: error reporting members departed from {tracking_key}: {e}"
+            )
 
     async def _report_found(self, room: SonosRoom) -> None:
         try:
@@ -483,4 +569,4 @@ class SonosDiscoveryManager:
         return retargeted
 
 
-__all__ = ["SonosRoom", "SonosDiscoveryManager"]
+__all__ = ["SonosRoom", "DepartedMember", "SonosDiscoveryManager"]

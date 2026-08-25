@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from qobuz_proxy.app import QobuzProxy
-from qobuz_proxy.backends.dlna.sonos_discovery_manager import SonosRoom
+from qobuz_proxy.backends.dlna.sonos_discovery_manager import DepartedMember, SonosRoom
 from qobuz_proxy.config import Config, QobuzConfig, SpeakerConfig
 
 
@@ -22,6 +22,7 @@ def _mock_speaker(name: str = "Kitchen", starts: bool = True) -> MagicMock:
     speaker.start = AsyncMock(return_value=starts)
     speaker.stop = AsyncMock()
     speaker.name = name
+    speaker.is_active = False  # explicit default — a MagicMock attribute is truthy otherwise
     return speaker
 
 
@@ -417,6 +418,96 @@ class TestRoomRekeyed:
         assert result is False
         assert app._sonos_speakers_by_group_id["RINCON_A:1"] is speaker  # unchanged
         assert "RINCON_A:2" not in app._sonos_speakers_by_group_id
+
+
+class TestRoomMembersDeparted:
+    """The central rule from live testing: a device leaving the group we're
+    actively playing to must be stopped directly (nothing else will ever
+    tell it to); a device leaving any other, merely-discovered group must
+    never be touched — see Speaker.is_active and _on_sonos_room_lost's
+    still_present handling for the sibling case (a group's coordinator
+    itself being absorbed elsewhere)."""
+
+    def _mock_dlna_client(self):  # type: ignore[no-untyped-def]
+        client = MagicMock()
+        client.connect = AsyncMock()
+        client.stop = AsyncMock()
+        client.disconnect = AsyncMock()
+        return client
+
+    async def test_stops_a_device_leaving_the_active_group(self) -> None:
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.is_active = True
+        app._sonos_speakers_by_group_id["RINCON_A"] = speaker
+
+        client = self._mock_dlna_client()
+        with patch("qobuz_proxy.app.DLNAClient", return_value=client) as MockClient:
+            await app._on_sonos_room_members_departed(
+                "RINCON_A", (DepartedMember(uuid="RINCON_B", ip="10.0.1.31", port=1400),)
+            )
+
+        MockClient.assert_called_once_with("10.0.1.31", 1400)
+        client.connect.assert_awaited_once()
+        client.stop.assert_awaited_once()
+        client.disconnect.assert_awaited_once()
+
+    async def test_stops_every_departed_device(self) -> None:
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.is_active = True
+        app._sonos_speakers_by_group_id["RINCON_A"] = speaker
+
+        with patch("qobuz_proxy.app.DLNAClient", return_value=self._mock_dlna_client()) as Mock:
+            await app._on_sonos_room_members_departed(
+                "RINCON_A",
+                (
+                    DepartedMember(uuid="RINCON_B", ip="10.0.1.31", port=1400),
+                    DepartedMember(uuid="RINCON_C", ip="10.0.1.32", port=1400),
+                ),
+            )
+
+        assert Mock.call_count == 2
+
+    async def test_ignores_departure_from_a_group_that_is_not_active(self) -> None:
+        # Central rule: never touch a device leaving a group we're not
+        # playing to — Sonos is handling its own regrouping.
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.is_active = False
+        app._sonos_speakers_by_group_id["RINCON_A"] = speaker
+
+        with patch("qobuz_proxy.app.DLNAClient") as MockClient:
+            await app._on_sonos_room_members_departed(
+                "RINCON_A", (DepartedMember(uuid="RINCON_B", ip="10.0.1.31", port=1400),)
+            )
+
+        MockClient.assert_not_called()
+
+    async def test_ignores_departure_for_unknown_tracking_key(self) -> None:
+        app = QobuzProxy(_make_config())
+
+        with patch("qobuz_proxy.app.DLNAClient") as MockClient:
+            await app._on_sonos_room_members_departed(
+                "RINCON_UNKNOWN", (DepartedMember(uuid="RINCON_B", ip="10.0.1.31", port=1400),)
+            )
+
+        MockClient.assert_not_called()
+
+    async def test_a_failed_stop_does_not_raise(self) -> None:
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.is_active = True
+        app._sonos_speakers_by_group_id["RINCON_A"] = speaker
+
+        client = self._mock_dlna_client()
+        client.connect.side_effect = OSError("unreachable")
+        with patch("qobuz_proxy.app.DLNAClient", return_value=client):
+            await app._on_sonos_room_members_departed(
+                "RINCON_A", (DepartedMember(uuid="RINCON_B", ip="10.0.1.31", port=1400),)
+            )  # must not raise
+
+        client.disconnect.assert_awaited_once()  # still cleaned up
 
 
 class TestAddSpeakerGuard:
