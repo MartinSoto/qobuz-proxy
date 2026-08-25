@@ -201,7 +201,9 @@ class TestRetarget:
         assert backend._port == 1400
         assert backend._client is new_client
         assert backend.name == "Living Room"
-        old_client.stop.assert_awaited_once()
+        # Not stopped here — that's app.py's _on_sonos_room_members_departed's
+        # job, gated on whether this was actually the active group.
+        old_client.stop.assert_not_called()
         old_client.disconnect.assert_awaited_once()
 
     async def test_retarget_clears_gapless_state(self):

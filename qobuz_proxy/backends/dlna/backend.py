@@ -209,15 +209,15 @@ class DLNABackend(AudioBackend):
         await self._discover_capabilities(device_info)
 
         if old_client is not None:
-            # We were the one driving this device (queue-based playback in
-            # particular leaves our track sitting in *its own* local queue,
-            # per _play_via_queue) — without an explicit stop it can keep
-            # playing on its own indefinitely after we walk away, since
-            # nothing else ever tells it to stop.
-            try:
-                await old_client.stop()
-            except Exception as e:
-                logger.debug(f"Failed to stop the previous target during retarget: {e}")
+            # Just release the connection here — whether the old device
+            # should also be told to stop depends on Qobuz playback state
+            # (is the group we're leaving the one we're actually playing
+            # to?), which this backend has no visibility into at all.
+            # That's handled uniformly, for every kind of departure, by
+            # app.py's _on_sonos_room_members_departed instead — see its
+            # docstring. Doing it here too would both duplicate that stop
+            # for the active group and, worse, wrongly stop the old device
+            # of a group we were never even playing to.
             try:
                 await old_client.disconnect()
             except Exception:
