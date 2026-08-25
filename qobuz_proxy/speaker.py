@@ -152,6 +152,31 @@ class Speaker:
             logger.info(f"[{new_name}] Renamed")
         return ok
 
+    async def retarget(self, ip: str, port: int) -> bool:
+        """
+        Repoint this speaker's DLNA backend at a different physical device,
+        in place — the Qobuz Connect session (WebSocket, mDNS registration)
+        is untouched. Used for a Sonos group coordinator handoff: Sonos
+        already migrates the audio itself, so only where control commands
+        go and where state is polled from actually needs to change.
+
+        No-op (returns False) for a non-DLNA backend — retargeting is a
+        DLNA-specific concept.
+
+        Returns:
+            True if the retarget succeeded.
+        """
+        from qobuz_proxy.backends.dlna import DLNABackend
+
+        if not isinstance(self._backend, DLNABackend):
+            return False
+
+        ok = await self._backend.retarget(ip, port)
+        if ok:
+            self._config.dlna_ip = ip
+            self._config.dlna_port = port
+        return ok
+
     def get_status(self) -> dict:
         """Return rich status dict for API responses."""
         from qobuz_proxy.config import slugify_name

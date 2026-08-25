@@ -158,3 +158,101 @@ class TestSonosGaplessQueue:
         await backend.clear_next_track()
 
         client.remove_track_from_queue.assert_not_called()
+
+
+class TestRetarget:
+    """DLNABackend.retarget() — repoint at a new DLNA endpoint in place,
+    without dropping whatever Qobuz Connect session this backend's Speaker
+    is part of (that's owned by Speaker/WsManager, untouched here)."""
+
+    def _make_device_info(self, **kwargs):  # type: ignore[no-untyped-def]
+        from qobuz_proxy.backends.dlna.client import DLNADeviceInfo
+
+        defaults = dict(
+            friendly_name="Living Room",
+            manufacturer="Sonos, Inc.",
+            model_name="Sonos Five",
+            udn="uuid:RINCON_LIVINGROOM",
+            av_transport_url="http://10.0.1.31:1400/MediaRenderer/AVTransport/Control",
+            rendering_control_url="http://10.0.1.31:1400/MediaRenderer/RenderingControl/Control",
+            connection_manager_url="http://10.0.1.31:1400/MediaRenderer/ConnectionManager/Control",
+        )
+        defaults.update(kwargs)
+        return DLNADeviceInfo(**defaults)
+
+    async def test_retarget_swaps_client_ip_and_name_on_success(self):
+        from unittest.mock import AsyncMock, patch
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        old_client = AsyncMock()
+        old_client.disconnect = AsyncMock()
+        backend._client = old_client
+        backend._is_connected = True
+
+        new_client = AsyncMock()
+        new_client.connect = AsyncMock(return_value=self._make_device_info())
+        new_client.get_protocol_info = AsyncMock(return_value=None)
+
+        with patch("qobuz_proxy.backends.dlna.backend.DLNAClient", return_value=new_client):
+            result = await backend.retarget("10.0.1.31", 1400)
+
+        assert result is True
+        assert backend._ip == "10.0.1.31"
+        assert backend._port == 1400
+        assert backend._client is new_client
+        assert backend.name == "Living Room"
+        old_client.stop.assert_awaited_once()
+        old_client.disconnect.assert_awaited_once()
+
+    async def test_retarget_clears_gapless_state(self):
+        from unittest.mock import AsyncMock, patch
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = AsyncMock()
+        backend._next_track_proxy_url = "http://proxy/audio/1.flac"
+        backend._next_track_metadata = _make_metadata(track_id="1")
+        backend._next_track_queue_nr = 3
+
+        new_client = AsyncMock()
+        new_client.connect = AsyncMock(return_value=self._make_device_info())
+        new_client.get_protocol_info = AsyncMock(return_value=None)
+
+        with patch("qobuz_proxy.backends.dlna.backend.DLNAClient", return_value=new_client):
+            await backend.retarget("10.0.1.31", 1400)
+
+        assert backend._next_track_proxy_url is None
+        assert backend._next_track_metadata is None
+        assert backend._next_track_queue_nr is None
+
+    async def test_retarget_keeps_old_target_on_connect_failure(self):
+        from unittest.mock import AsyncMock, patch
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        old_client = AsyncMock()
+        backend._client = old_client
+
+        new_client = AsyncMock()
+        new_client.connect = AsyncMock(side_effect=ConnectionError("unreachable"))
+        new_client.disconnect = AsyncMock()
+
+        with patch("qobuz_proxy.backends.dlna.backend.DLNAClient", return_value=new_client):
+            result = await backend.retarget("10.0.1.31", 1400)
+
+        assert result is False
+        assert backend._ip == "10.0.1.30"
+        assert backend._client is old_client
+        old_client.disconnect.assert_not_called()
+
+    async def test_retarget_to_same_target_is_a_noop(self):
+        from unittest.mock import AsyncMock, patch
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        old_client = AsyncMock()
+        backend._client = old_client
+
+        with patch("qobuz_proxy.backends.dlna.backend.DLNAClient") as MockClient:
+            result = await backend.retarget("10.0.1.30", 1400)
+
+        assert result is True
+        MockClient.assert_not_called()
+        assert backend._client is old_client

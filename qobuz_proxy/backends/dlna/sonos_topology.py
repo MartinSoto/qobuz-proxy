@@ -83,7 +83,7 @@ class SonosGroup:
     # peer, left the same group_id attached to the continuing group under
     # its new coordinator) — a reliable anchor for correlating "this is
     # still the same group" across polls, independent of coordinator_uuid.
-    # Nothing in this codebase uses it for that yet.
+    # This is SonosDiscoveryManager's primary tracking key (SonosRoom.tracking_key).
     group_id: str = ""
 
 

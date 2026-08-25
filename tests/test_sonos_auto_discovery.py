@@ -76,7 +76,7 @@ class TestRoomFoundAndLost:
 
         assert result is True
         assert app._speakers == [speaker]
-        assert app._sonos_speakers_by_uuid["RINCON_A"] is speaker
+        assert app._sonos_speakers_by_group_id["RINCON_A"] is speaker
 
         sc = MockSpeaker.call_args.kwargs["config"]
         assert sc.name == "Kitchen"
@@ -125,7 +125,7 @@ class TestRoomFoundAndLost:
         # created for the promoted coordinator (app._speakers reset here to
         # isolate this from the name-collision guard, unrelated to identity).
         app._speakers = []
-        app._sonos_speakers_by_uuid = {}
+        app._sonos_speakers_by_group_id = {}
 
         with patch("qobuz_proxy.app.Speaker", return_value=_mock_speaker()) as MockSpeaker:
             await app._on_sonos_room_found(new_coordinator)
@@ -188,19 +188,19 @@ class TestRoomFoundAndLost:
 
         assert result is False
         assert app._speakers == []
-        assert "RINCON_A" not in app._sonos_speakers_by_uuid
+        assert "RINCON_A" not in app._sonos_speakers_by_group_id
 
     async def test_room_lost_stops_and_removes_speaker(self) -> None:
         app = QobuzProxy(_make_config())
         speaker = _mock_speaker("Kitchen")
         app._speakers.append(speaker)
-        app._sonos_speakers_by_uuid["RINCON_A"] = speaker
+        app._sonos_speakers_by_group_id["RINCON_A"] = speaker
 
         await app._on_sonos_room_lost("RINCON_A")
 
         speaker.stop.assert_awaited_once()
         assert app._speakers == []
-        assert "RINCON_A" not in app._sonos_speakers_by_uuid
+        assert "RINCON_A" not in app._sonos_speakers_by_group_id
 
     async def test_room_lost_is_a_noop_for_unknown_uuid(self) -> None:
         app = QobuzProxy(_make_config())
@@ -214,7 +214,7 @@ class TestRoomRenamed:
         speaker = _mock_speaker("Kitchen")
         speaker.rename = AsyncMock(return_value=True)
         app._speakers.append(speaker)
-        app._sonos_speakers_by_uuid["RINCON_A"] = speaker
+        app._sonos_speakers_by_group_id["RINCON_A"] = speaker
 
         grouped_room = SonosRoom(
             uuid="RINCON_A",
@@ -241,7 +241,7 @@ class TestRoomRenamed:
         speaker = _mock_speaker("Kitchen")
         speaker.rename = AsyncMock(return_value=True)
         app._speakers.append(speaker)
-        app._sonos_speakers_by_uuid["RINCON_A"] = speaker
+        app._sonos_speakers_by_group_id["RINCON_A"] = speaker
 
         other = _mock_speaker("Kitchen, Living Room")
         app._speakers.append(other)
@@ -260,6 +260,87 @@ class TestRoomRenamed:
         speaker.rename.assert_not_called()
 
 
+class TestRoomRetargeted:
+    async def test_retargets_running_speaker_in_place(self) -> None:
+        # A genuine handoff: the Speaker keeps its identity — tracked by the
+        # group's stable tracking_key (group_id) — even though the physical
+        # coordinator moved to Living Room's ip/port. No re-keying needed.
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.retarget = AsyncMock(return_value=True)
+        speaker.rename = AsyncMock(return_value=True)
+        app._speakers.append(speaker)
+        app._sonos_speakers_by_group_id["RINCON_A:1"] = speaker
+
+        new_room = SonosRoom(
+            uuid="RINCON_B",
+            name="Living Room",
+            ip="10.0.1.31",
+            port=1400,
+            is_stereo_pair=False,
+            member_names=("Living Room", "Bedroom"),
+            group_id="RINCON_A:1",  # same continuing group
+        )
+        result = await app._on_sonos_room_retargeted(new_room)
+
+        assert result is True
+        speaker.retarget.assert_awaited_once_with("10.0.1.31", 1400)
+        speaker.rename.assert_awaited_once_with("Living Room, Bedroom")
+        assert app._sonos_speakers_by_group_id["RINCON_A:1"] is speaker  # key unchanged
+
+    async def test_ip_only_change_retargets_without_rename(self) -> None:
+        # A plain IP change (e.g. DHCP) for the same coordinator — no
+        # rename needed, display name is unchanged.
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.retarget = AsyncMock(return_value=True)
+        speaker.rename = AsyncMock(return_value=True)
+        app._speakers.append(speaker)
+        app._sonos_speakers_by_group_id["RINCON_A"] = speaker
+
+        new_room = SonosRoom(
+            uuid="RINCON_A",
+            name="Kitchen",
+            ip="10.0.1.99",
+            port=1400,
+            is_stereo_pair=False,
+            member_names=("Kitchen",),
+        )
+        result = await app._on_sonos_room_retargeted(new_room)
+
+        assert result is True
+        speaker.retarget.assert_awaited_once_with("10.0.1.99", 1400)
+        speaker.rename.assert_not_called()  # display name unchanged
+        assert app._sonos_speakers_by_group_id["RINCON_A"] is speaker
+
+    async def test_returns_false_when_speaker_not_running(self) -> None:
+        app = QobuzProxy(_make_config())
+
+        result = await app._on_sonos_room_retargeted(ROOM)
+
+        assert result is False
+
+    async def test_returns_false_when_backend_retarget_fails(self) -> None:
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.retarget = AsyncMock(return_value=False)
+        app._speakers.append(speaker)
+        app._sonos_speakers_by_group_id["RINCON_A:1"] = speaker
+
+        new_room = SonosRoom(
+            uuid="RINCON_B",
+            name="Living Room",
+            ip="10.0.1.31",
+            port=1400,
+            is_stereo_pair=False,
+            group_id="RINCON_A:1",
+        )
+        result = await app._on_sonos_room_retargeted(new_room)
+
+        assert result is False
+        assert app._sonos_speakers_by_group_id["RINCON_A:1"] is speaker  # unchanged
+
+
 class TestAddSpeakerGuard:
     async def test_manual_add_rejected_while_auto_discover_enabled(self) -> None:
         app = QobuzProxy(_make_config(sonos_auto_discover=True))
@@ -274,10 +355,10 @@ class TestStopSpeakers:
         mock_manager = MagicMock()
         mock_manager.stop = AsyncMock()
         app._sonos_discovery = mock_manager
-        app._sonos_speakers_by_uuid["RINCON_A"] = _mock_speaker()
+        app._sonos_speakers_by_group_id["RINCON_A"] = _mock_speaker()
 
         await app._stop_speakers()
 
         mock_manager.stop.assert_awaited_once()
         assert app._sonos_discovery is None
-        assert app._sonos_speakers_by_uuid == {}
+        assert app._sonos_speakers_by_group_id == {}

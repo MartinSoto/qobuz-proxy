@@ -82,16 +82,20 @@ class SonosRoom:
     # single-element tuple.
     member_names: tuple[str, ...] = ()
     # The Sonos ZoneGroup's own id — confirmed stable across a coordinator
-    # handoff (verified against a real household). The caller should derive
-    # the Qobuz Connect device identity from this rather than `uuid`
-    # whenever it creates a new Speaker: a promoted coordinator taking over
-    # a continuing group shares its predecessor's group_id, so it
-    # transparently inherits the same device identity — the Qobuz app sees
-    # a device it already knows reconnect, not a stranger. This has no
-    # bearing on *tracking* (still keyed by coordinator `uuid`, which is
-    # what's actually proven stable across the milder solo<->grouped
-    # transitions the rename path already handles smoothly).
+    # handoff, and this is the actual tracking identity (see tracking_key):
+    # one group_id = one Qobuz renderer, for as long as that group_id
+    # exists, regardless of which physical player currently coordinates it
+    # or how many members it has. A demotion/promotion is therefore just an
+    # ordinary in-place update to the one entity tracked under this key —
+    # nothing to correlate across separate rooms.
     group_id: str = ""
+
+    @property
+    def tracking_key(self) -> str:
+        """The identity SonosDiscoveryManager tracks this room under.
+        group_id, falling back to the coordinator's own uuid on the
+        (unexpected) chance group_id is unavailable."""
+        return self.group_id or self.uuid
 
     @property
     def display_name(self) -> str:
@@ -104,10 +108,15 @@ class SonosRoom:
 # Returns True if the room was successfully turned into a running Speaker —
 # only then is it considered "known" until it's reported lost.
 RoomFoundCallback = Callable[[SonosRoom], Awaitable[bool]]
-RoomLostCallback = Callable[[str], Awaitable[None]]  # sonos uuid
+RoomLostCallback = Callable[[str], Awaitable[None]]  # tracking_key
 # Returns True if the rename was applied — only then does the manager stop
 # retrying it on subsequent updates.
 RoomRenamedCallback = Callable[[SonosRoom], Awaitable[bool]]
+# Repoint the Speaker already tracked under this room's tracking_key at its
+# (possibly new) coordinator ip/port — the key itself never changes, so
+# there's no re-keying to do, just "the same group, new physical target."
+# Returns True if the retarget succeeded.
+RoomRetargetedCallback = Callable[[SonosRoom], Awaitable[bool]]
 
 
 class SonosDiscoveryManager:
@@ -118,6 +127,7 @@ class SonosDiscoveryManager:
         on_room_found: RoomFoundCallback,
         on_room_lost: RoomLostCallback,
         on_room_renamed: RoomRenamedCallback,
+        on_room_retargeted: RoomRetargetedCallback,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         ssdp_timeout: float = DEFAULT_SSDP_TIMEOUT_SECONDS,
         event_subscriber: Optional[SonosEventSubscriber] = None,
@@ -140,6 +150,7 @@ class SonosDiscoveryManager:
         self._on_room_found = on_room_found
         self._on_room_lost = on_room_lost
         self._on_room_renamed = on_room_renamed
+        self._on_room_retargeted = on_room_retargeted
         self._poll_interval = poll_interval
         self._ssdp_timeout = ssdp_timeout
 
@@ -269,6 +280,15 @@ class SonosDiscoveryManager:
         members: dict[str, SonosZoneMember],
         groups: list[SonosGroup],
     ) -> None:
+        # Tracked by group_id (SonosRoom.tracking_key), not by coordinator
+        # uuid: a group's coordinator changing is then just an ordinary
+        # in-place update to the one entity already tracked under that key
+        # — never two separate rooms to correlate, whether the change
+        # arrives in one topology snapshot or is spread across several
+        # (e.g. a user's two separate taps in the Sonos app to swap which
+        # room plays). One group_id = one Qobuz renderer, for as long as
+        # that group_id exists, regardless of who currently coordinates it
+        # or how many members it has.
         current: dict[str, SonosRoom] = {}
         for g in groups:
             member = members.get(g.coordinator_uuid)
@@ -291,7 +311,7 @@ class SonosDiscoveryManager:
             )
             member_names = (room_name, *other_names)
 
-            current[g.coordinator_uuid] = SonosRoom(
+            room = SonosRoom(
                 uuid=g.coordinator_uuid,
                 name=room_name,
                 ip=member.ip,
@@ -300,55 +320,37 @@ class SonosDiscoveryManager:
                 member_names=member_names,
                 group_id=g.group_id,
             )
+            current[room.tracking_key] = room
 
-        removed = [uuid for uuid in self._known if uuid not in current]
-        added = [room for uuid, room in current.items() if uuid not in self._known]
+        removed = [key for key in self._known if key not in current]
+        added = [room for key, room in current.items() if key not in self._known]
 
-        # A coordinator's IP/port is its physical identity — the DLNA target
-        # a Speaker actually talks to. Membership shrinking/growing (even
-        # all the way down to solo) is normally cosmetic and must not
-        # disrupt playback — just rename in place. The one case that
-        # genuinely needs a reset is a real demotion: the coordinator I
-        # used to be is now led by someone else. That's not detectable by
-        # comparing a room's own before/after peers — "I lost my last
-        # peer" and "I was demoted, a peer took over" both leave *my own*
-        # new_peers empty; they're indistinguishable from my own
-        # perspective alone. group_id is the actual signal: confirmed
-        # stable across a genuine handoff (verified against a real
-        # household), and NOT carried over when a group merely shrinks —
-        # so a demotion is precisely "some other coordinator in the new
-        # snapshot now holds my old group_id".
-        current_group_owners = {
-            room.group_id: uuid for uuid, room in current.items() if room.group_id
-        }
-
-        identity_changed: list[SonosRoom] = []
+        # Same key (group_id) as before, but something about it changed.
+        # Whoever's coordinating now (uuid/ip/port) is a physical-target
+        # change — retarget in place, keeping the Qobuz Connect session
+        # alive throughout (Sonos already migrates the audio itself).
+        # Anything else (membership, name) is cosmetic — rename in place.
+        retargeted: list[SonosRoom] = []
         renamed: list[SonosRoom] = []
-        for uuid, room in current.items():
-            if uuid not in self._known:
+        for key, room in current.items():
+            if key not in self._known:
                 continue
-            old = self._known[uuid]
+            old = self._known[key]
             if old == room:
                 continue
-            if old.ip != room.ip or old.port != room.port:
-                identity_changed.append(room)
-                continue
-
-            successor_uuid = current_group_owners.get(old.group_id)
-            demoted = successor_uuid is not None and successor_uuid != uuid
-            if demoted:
-                identity_changed.append(room)
+            if old.uuid != room.uuid or old.ip != room.ip or old.port != room.port:
+                retargeted.append(room)
             else:
                 renamed.append(room)
 
-        for uuid in removed:
-            await self._report_lost(uuid)
-        for room in identity_changed:
-            await self._report_lost(room.uuid)
-        for room in added + identity_changed:
+        for key in removed:
+            await self._report_lost(key)
+        for room in added:
             await self._report_found(room)
         for room in renamed:
             await self._report_renamed(room)
+        for room in retargeted:
+            await self._report_retargeted(room)
 
     async def _report_found(self, room: SonosRoom) -> None:
         try:
@@ -357,15 +359,15 @@ class SonosDiscoveryManager:
             logger.warning(f"Sonos discovery: error starting speaker for '{room.name}': {e}")
             started = False
         if started:
-            self._known[room.uuid] = room
+            self._known[room.tracking_key] = room
         # else: left out of _known, so it's retried as "newly found" next update
 
-    async def _report_lost(self, uuid: str) -> None:
-        self._known.pop(uuid, None)
+    async def _report_lost(self, key: str) -> None:
+        self._known.pop(key, None)
         try:
-            await self._on_room_lost(uuid)
+            await self._on_room_lost(key)
         except Exception as e:
-            logger.warning(f"Sonos discovery: error stopping speaker for {uuid}: {e}")
+            logger.warning(f"Sonos discovery: error stopping speaker for {key}: {e}")
 
     async def _report_renamed(self, room: SonosRoom) -> None:
         try:
@@ -374,8 +376,20 @@ class SonosDiscoveryManager:
             logger.warning(f"Sonos discovery: error renaming speaker for '{room.name}': {e}")
             renamed = False
         if renamed:
-            self._known[room.uuid] = room
+            self._known[room.tracking_key] = room
         # else: _known keeps the stale name, so the rename is retried next update
+
+    async def _report_retargeted(self, room: SonosRoom) -> bool:
+        try:
+            retargeted = await self._on_room_retargeted(room)
+        except Exception as e:
+            logger.warning(f"Sonos discovery: error retargeting speaker for '{room.name}': {e}")
+            retargeted = False
+        if retargeted:
+            self._known[room.tracking_key] = room
+        # else: _known keeps the stale entry, so this is retried next
+        # update — same free-retry pattern as found/renamed.
+        return retargeted
 
 
 __all__ = ["SonosRoom", "SonosDiscoveryManager"]

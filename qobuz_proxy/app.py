@@ -96,9 +96,11 @@ class QobuzProxy:
         # Sonos auto-discovery (mutually exclusive with config.speakers —
         # see _start_speakers). Running speakers it created are still just
         # entries in self._speakers; this index is only for matching a
-        # Sonos coordinator UUID back to its Speaker on room-lost.
+        # SonosRoom.tracking_key (its group_id) back to its Speaker on
+        # lost/renamed/retargeted — the key never changes across a
+        # coordinator handoff, only what it points at does.
         self._sonos_discovery: Optional[SonosDiscoveryManager] = None
-        self._sonos_speakers_by_uuid: dict[str, Speaker] = {}
+        self._sonos_speakers_by_group_id: dict[str, Speaker] = {}
 
     # ------------------------------------------------------------------
     # Public interface
@@ -575,6 +577,7 @@ class QobuzProxy:
             on_room_found=self._on_sonos_room_found,
             on_room_lost=self._on_sonos_room_lost,
             on_room_renamed=self._on_sonos_room_renamed,
+            on_room_retargeted=self._on_sonos_room_retargeted,
             # Enables GENA event subscription (near-instant topology change
             # detection) on top of the polling fallback, via the route
             # _start_web_server already registered on the shared app.
@@ -638,14 +641,14 @@ class QobuzProxy:
             return False
 
         self._speakers.append(speaker)
-        self._sonos_speakers_by_uuid[room.uuid] = speaker
+        self._sonos_speakers_by_group_id[room.tracking_key] = speaker
         logger.info(f"Sonos discovery: added speaker '{display_name}' ({room.ip})")
         return True
 
-    async def _on_sonos_room_lost(self, sonos_uuid: str) -> None:
-        """Called by SonosDiscoveryManager when a group coordinator disappears
-        (device went offline, or stopped being a coordinator when regrouped)."""
-        speaker = self._sonos_speakers_by_uuid.pop(sonos_uuid, None)
+    async def _on_sonos_room_lost(self, tracking_key: str) -> None:
+        """Called by SonosDiscoveryManager when a group disappears entirely
+        (its last device went offline)."""
+        speaker = self._sonos_speakers_by_group_id.pop(tracking_key, None)
         if speaker is None:
             return
         if speaker in self._speakers:
@@ -654,12 +657,11 @@ class QobuzProxy:
         await speaker.stop()
 
     async def _on_sonos_room_renamed(self, room: SonosRoom) -> bool:
-        """Called by SonosDiscoveryManager when a group coordinator's display
-        name changes (regrouping, or a room renamed in the Sonos app) but its
-        network identity (ip/port) didn't — e.g. another room joined or left
-        its group. Renames the existing Speaker in place instead of
-        restarting it, so playback and position survive."""
-        speaker = self._sonos_speakers_by_uuid.get(room.uuid)
+        """Called by SonosDiscoveryManager when a group's display name
+        changes (regrouping, or a room renamed in the Sonos app) but its
+        coordinator/network identity didn't. Renames the existing Speaker in
+        place instead of restarting it, so playback and position survive."""
+        speaker = self._sonos_speakers_by_group_id.get(room.tracking_key)
         if speaker is None:
             return False  # not currently running; a found/lost pair will handle it
 
@@ -673,6 +675,28 @@ class QobuzProxy:
             return False
 
         return await speaker.rename(new_name)
+
+    async def _on_sonos_room_retargeted(self, room: SonosRoom) -> bool:
+        """Called by SonosDiscoveryManager when a group's coordinator (and/or
+        its address) changed — repoints the existing Speaker's DLNA backend
+        at the new target instead of tearing it down, so the Qobuz Connect
+        session (WebSocket, mDNS registration) survives untouched. Sonos
+        already migrates the audio itself on a handoff; this just moves
+        where future commands go and where state is polled from. The
+        group's tracking_key never changes, so there's no re-keying to do."""
+        speaker = self._sonos_speakers_by_group_id.get(room.tracking_key)
+        if speaker is None:
+            return False  # not currently running; a found/lost pair will handle it
+
+        if not await speaker.retarget(room.ip, room.port):
+            return False
+
+        new_name = room.display_name
+        if new_name != speaker.name:
+            await speaker.rename(new_name)
+
+        logger.info(f"Sonos discovery: retargeted speaker '{speaker.name}' to {room.ip}")
+        return True
 
     def _schedule_speaker_retry(self, config: SpeakerConfig) -> None:
         """Start (or keep) a background task retrying a failed speaker."""
@@ -742,7 +766,7 @@ class QobuzProxy:
         if self._sonos_discovery is not None:
             await self._sonos_discovery.stop()
             self._sonos_discovery = None
-        self._sonos_speakers_by_uuid.clear()
+        self._sonos_speakers_by_group_id.clear()
 
         if self._speakers:
             await asyncio.gather(*[s.stop() for s in self._speakers], return_exceptions=True)
