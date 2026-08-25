@@ -40,6 +40,13 @@ _HANDOFF_POSITION_THRESHOLD_MS = 5000
 # prematurely stop a normal paused track or lose its resume position.
 _PAUSED_STOP_CONFIRMATIONS = 3
 
+# While playing, how many 0.5s poll cycles between hijack checks (is another
+# source now playing to this renderer instead of us — see
+# AudioBackend.is_playing_our_content()). Costs an extra device round trip,
+# unlike the state/position poll every cycle already does, so this is
+# throttled independently — detection within a few seconds is plenty.
+_HIJACK_CHECK_INTERVAL_POLLS = 6
+
 # After a WebSocket reconnect, the Qobuz server replays its last-known session
 # snapshot via SET_STATE — typically PAUSED at a position from before the drop.
 # If the renderer is actually still playing further along the same track, treat
@@ -105,6 +112,12 @@ class QobuzPlayer:
 
         # Consecutive STOPPED polls seen while paused (external-stop detection).
         self._paused_stop_polls = 0
+
+        # Cycles since the last hijack check (external-takeover detection
+        # while PLAYING) — throttled independently of the 0.5s poll cadence
+        # since it costs an extra device round trip, unlike the plain
+        # state/position poll every cycle already does.
+        self._hijack_check_countdown = 0
 
         # Playback command serialization. A track switch in the Qobuz app sends
         # a burst of SET_STATE messages; without this lock the resulting
@@ -1519,6 +1532,28 @@ class QobuzPlayer:
                         # Stop the played-time clock so this pause is excluded
                         # from the reported duration, like an app-driven pause.
                         self._report_paused()
+                    elif backend_state == PlaybackState.PLAYING:
+                        # Still genuinely "playing" from the transport's own
+                        # perspective — but that's exactly what a hijack (a
+                        # different source now playing to this renderer,
+                        # e.g. someone grouping into it via the Sonos app)
+                        # looks like too; get_state() alone can't tell them
+                        # apart. Throttled — an extra device round trip on
+                        # top of the plain state/position poll every cycle.
+                        self._hijack_check_countdown -= 1
+                        if self._hijack_check_countdown <= 0:
+                            self._hijack_check_countdown = _HIJACK_CHECK_INTERVAL_POLLS
+                            if not await self.backend.is_playing_our_content():
+                                logger.info(
+                                    "External takeover detected on this renderer — "
+                                    "treating as stopped"
+                                )
+                                self._state = PlaybackState.STOPPED
+                                self._position_value_ms = 0
+                                self._position_timestamp_ms = int(time.time() * 1000)
+                                await self._send_state_update()
+                                await self._report_stopped()
+                                continue
 
                     # Update position from backend
                     position = await self.backend.get_position()
@@ -1553,6 +1588,7 @@ class QobuzPlayer:
 
                 else:
                     self._paused_stop_polls = 0
+                    self._hijack_check_countdown = 0
 
             except asyncio.CancelledError:
                 break

@@ -256,3 +256,63 @@ class TestRetarget:
         assert result is True
         MockClient.assert_not_called()
         assert backend._client is old_client
+
+
+class TestIsPlayingOurContent:
+    """Detects an external takeover (another source now playing to this
+    renderer) — get_state() alone reports PLAYING either way, so this
+    compares the device's actual current track URI against the one we
+    last set."""
+
+    def _make_backend(self, proxy_url: str = "http://proxy/track.flac") -> DLNABackend:
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend.__new__(DLNABackend)
+        backend._client = AsyncMock()
+        backend._current_proxy_url = proxy_url
+        backend._next_track_proxy_url = None
+        backend._is_sonos = True
+        return backend
+
+    async def test_true_when_uri_matches(self):
+        backend = self._make_backend()
+        backend._client.get_track_uri.return_value = "http://proxy/track.flac"
+
+        assert await backend.is_playing_our_content() is True
+
+    async def test_false_when_uri_does_not_match(self):
+        backend = self._make_backend()
+        backend._client.get_track_uri.return_value = "http://someone-else/spotify-stream"
+
+        assert await backend.is_playing_our_content() is False
+
+    async def test_true_when_uri_matches_the_armed_next_track(self):
+        # A gapless transition already in flight is a legitimate URI
+        # change, not a takeover.
+        backend = self._make_backend()
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._client.get_track_uri.return_value = "http://proxy/next.flac"
+
+        assert await backend.is_playing_our_content() is True
+
+    async def test_true_when_nothing_of_ours_playing_yet(self):
+        backend = self._make_backend(proxy_url="")
+        backend._current_proxy_url = None
+
+        assert await backend.is_playing_our_content() is True
+        backend._client.get_track_uri.assert_not_called()
+
+    async def test_true_on_transient_read_failure(self):
+        backend = self._make_backend()
+        backend._client.get_track_uri.return_value = None
+
+        assert await backend.is_playing_our_content() is True
+
+    async def test_uses_get_media_info_for_non_sonos_devices(self):
+        backend = self._make_backend()
+        backend._is_sonos = False
+        backend._client.get_media_info.return_value = "http://proxy/track.flac"
+
+        assert await backend.is_playing_our_content() is True
+        backend._client.get_media_info.assert_awaited_once()
+        backend._client.get_track_uri.assert_not_called()

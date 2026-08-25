@@ -497,6 +497,30 @@ class DLNABackend(AudioBackend):
 
         return PlaybackState.STOPPED
 
+    async def is_playing_our_content(self) -> bool:
+        """Compare the device's actual current track URI against the one we
+        last set — a shared DLNA/Sonos renderer can be handed to a
+        completely different source (another app, someone grouping into
+        it via the Sonos app) while still reporting PLAYING throughout, so
+        get_state() alone can't detect this."""
+        if not self._client or not self._current_proxy_url:
+            return True  # nothing of ours to have been displaced yet
+
+        # Same URI-fetch split as the gapless transition check above: Sonos
+        # queue playback's GetMediaInfo.CurrentURI is the queue URI, not
+        # the track URL, so GetPositionInfo.TrackURI is used instead.
+        if self._is_sonos:
+            current_uri = await self._client.get_track_uri()
+        else:
+            current_uri = await self._client.get_media_info()
+
+        if current_uri is None:
+            return True  # transient read failure — don't false-positive
+
+        # A gapless transition already armed by us is a legitimate URI
+        # change in flight, not a takeover.
+        return current_uri in (self._current_proxy_url, self._next_track_proxy_url)
+
     async def get_buffer_status(self) -> BufferStatus:
         """Get buffer status (always OK for DLNA)."""
         return BufferStatus.OK
