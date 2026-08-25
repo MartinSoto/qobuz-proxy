@@ -61,6 +61,7 @@ class SonosZoneMember:
     invisible: bool
     is_stereo_pair: bool
     ip: str = ""
+    port: int = 1400
 
 
 @dataclass
@@ -190,12 +191,14 @@ def parse_zone_group_state(soap_response: str) -> dict[str, SonosZoneMember] | N
         uuid = elem.get("UUID", "")
         if not uuid:
             continue
+        location = urlparse(elem.get("Location", ""))
         members[uuid] = SonosZoneMember(
             uuid=uuid,
             zone_name=elem.get("ZoneName", ""),
             invisible=elem.get("Invisible") == "1",
             is_stereo_pair=bool(elem.get("ChannelMapSet")),
-            ip=urlparse(elem.get("Location", "")).hostname or "",
+            ip=location.hostname or "",
+            port=location.port or 1400,
         )
     return members or None
 

@@ -9,8 +9,9 @@ import asyncio
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from qobuz_proxy import __commit__, __version__
 from qobuz_proxy.config import Config, ConfigError, load_config, AUTO_QUALITY
@@ -368,6 +369,58 @@ async def run_discovery(timeout: float, json_output: bool) -> int:
     return EXIT_SUCCESS
 
 
+# Quality ID -> display name, matching speaker.py's quality_names mapping
+QUALITY_NAMES = {5: "MP3", 6: "CD (FLAC 16/44)", 7: "Hi-Res (24/96)", 27: "Hi-Res (24/192)"}
+
+
+@dataclass
+class _CoordinatorQuality:
+    """Max streamable quality for one group's coordinator.
+
+    ``advertised`` is what the device's own GetProtocolInfo Sink claims;
+    ``effective`` is after known-device overrides (see DEVICE_OVERRIDES in
+    capabilities.py — e.g. Sonos is conservatively capped) are applied,
+    i.e. what QobuzProxy would actually use for this device. They differ
+    exactly when an override kicked in.
+    """
+
+    advertised: int
+    effective: int
+    confirmed: bool
+
+
+async def _fetch_coordinator_quality(ip: str, port: int) -> Optional[_CoordinatorQuality]:
+    """Query a group coordinator's max streamable quality via GetProtocolInfo.
+
+    Returns None if the device couldn't be reached or queried.
+    """
+    from qobuz_proxy.backends.dlna.capabilities import (
+        apply_device_overrides,
+        parse_protocol_info_sink,
+    )
+    from qobuz_proxy.backends.dlna.client import DLNAClient
+
+    client = DLNAClient(ip, port)
+    try:
+        device_info = await client.connect()
+        sink = await client.get_protocol_info()
+        if not sink:
+            return None
+        advertised = parse_protocol_info_sink(sink)
+        effective = parse_protocol_info_sink(sink)
+        apply_device_overrides(effective, device_info.manufacturer, device_info.model_name)
+        return _CoordinatorQuality(
+            advertised=advertised.max_quality,
+            effective=effective.max_quality,
+            confirmed=advertised.format_info_confirmed,
+        )
+    except Exception as e:
+        logger.debug(f"Quality query failed for {ip}:{port}: {e}")
+        return None
+    finally:
+        await client.disconnect()
+
+
 async def run_discover_sonos(timeout: float, json_output: bool) -> int:
     """
     Discover Sonos players and show household rooms/groups.
@@ -412,6 +465,21 @@ async def run_discover_sonos(timeout: float, json_output: bool) -> int:
             print("  - Try increasing timeout with --timeout 10")
         return EXIT_SUCCESS
 
+    # Query each group's coordinator for its max streamable quality — that's
+    # the only member whose format ceiling matters, since audio reaches the
+    # whole group through it. Concurrent: each is its own SOAP round trip.
+    quality_by_coordinator: dict[str, Optional[_CoordinatorQuality]] = {}
+    coordinators_to_query = {
+        g.coordinator_uuid: members[g.coordinator_uuid]
+        for g in groups
+        if g.coordinator_uuid in members and members[g.coordinator_uuid].ip
+    }
+    if coordinators_to_query:
+        results = await asyncio.gather(
+            *[_fetch_coordinator_quality(m.ip, m.port) for m in coordinators_to_query.values()]
+        )
+        quality_by_coordinator = dict(zip(coordinators_to_query.keys(), results))
+
     if json_output:
         output = {
             "groups": [
@@ -421,6 +489,17 @@ async def run_discover_sonos(timeout: float, json_output: bool) -> int:
                         members[g.coordinator_uuid].zone_name
                         if g.coordinator_uuid in members
                         else ""
+                    ),
+                    "max_quality": (
+                        {
+                            "advertised": q.advertised,
+                            "advertised_name": QUALITY_NAMES.get(q.advertised, str(q.advertised)),
+                            "effective": q.effective,
+                            "effective_name": QUALITY_NAMES.get(q.effective, str(q.effective)),
+                            "confirmed": q.confirmed,
+                        }
+                        if (q := quality_by_coordinator.get(g.coordinator_uuid))
+                        else None
                     ),
                     "members": [
                         {
@@ -447,6 +526,25 @@ async def run_discover_sonos(timeout: float, json_output: bool) -> int:
                 members[g.coordinator_uuid].zone_name if g.coordinator_uuid in members else "?"
             )
             print(f"Group — coordinator: {coordinator_name}")
+
+            quality = quality_by_coordinator.get(g.coordinator_uuid)
+            if quality is None:
+                print("  Max quality: unknown (coordinator unreachable)")
+            elif quality.effective != quality.advertised:
+                print(
+                    f"  Max quality: {QUALITY_NAMES.get(quality.effective, quality.effective)}"
+                    f" (device advertises {QUALITY_NAMES.get(quality.advertised, quality.advertised)}"
+                    f", capped by a known-device override — see DEVICE_OVERRIDES)"
+                )
+            else:
+                confirmed_note = (
+                    "" if quality.confirmed else " — not confirmed by device, conservative default"
+                )
+                print(
+                    f"  Max quality: {QUALITY_NAMES.get(quality.effective, quality.effective)}"
+                    f"{confirmed_note}"
+                )
+
             for uuid in g.member_uuids:
                 member = members.get(uuid)
                 if member is None:
