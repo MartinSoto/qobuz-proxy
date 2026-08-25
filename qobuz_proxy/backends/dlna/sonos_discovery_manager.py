@@ -177,10 +177,16 @@ class SonosDiscoveryManager:
         added = [room for uuid, room in current.items() if uuid not in self._known]
 
         # A coordinator's IP/port is its physical identity — the DLNA target
-        # a Speaker actually talks to. Anything else changing (member_names,
-        # room name, pairing) is cosmetic and must not disrupt playback:
-        # only an identity change needs a full stop/start; a cosmetic change
-        # is renamed in place.
+        # a Speaker actually talks to. Membership shrinking/growing is
+        # normally cosmetic (a peer joined/left) and must not disrupt
+        # playback — just rename in place. But if this coordinator kept
+        # NONE of its previous groupmates, it wasn't a peaceful partial
+        # departure: Sonos demoted it and promoted a former groupmate to
+        # coordinate what continues as "the same" group elsewhere (this is
+        # exactly what happens when you remove the *coordinator* itself
+        # from a group). Renaming in place here would be actively wrong —
+        # this Speaker no longer corresponds to whatever is still playing,
+        # so it must reset (full stop/start) rather than relabel.
         identity_changed: list[SonosRoom] = []
         renamed: list[SonosRoom] = []
         for uuid, room in current.items():
@@ -190,6 +196,13 @@ class SonosDiscoveryManager:
             if old == room:
                 continue
             if old.ip != room.ip or old.port != room.port:
+                identity_changed.append(room)
+                continue
+
+            old_peers = set(old.member_names) - {old.name}
+            new_peers = set(room.member_names) - {room.name}
+            demoted = bool(old_peers) and old_peers.isdisjoint(new_peers)
+            if demoted:
                 identity_changed.append(room)
             else:
                 renamed.append(room)

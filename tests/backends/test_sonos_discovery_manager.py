@@ -322,6 +322,55 @@ class TestPollOnce:
         assert found_calls[0].uuid == "RINCON_C"
         assert found_calls[0].display_name == "Bedroom"
 
+    async def test_coordinator_itself_removed_resets_rather_than_renames(self) -> None:
+        # Reproduces the harder reported bug: 3 rooms grouped, the
+        # *coordinator* is removed from the group. Sonos promotes a former
+        # peer (Living Room) to coordinate what continues playing; Kitchen
+        # is left solo. Same ip/port as before, so this must NOT be
+        # silently renamed to "Kitchen" alone — that would leave a stale
+        # Speaker impersonating a group that has actually moved elsewhere
+        # (the exact split-brain symptom reported: Qobuz stays bound to
+        # Kitchen while Sonos audio has moved to Living Room+Bedroom).
+        manager, found_calls, lost_calls, renamed_calls = _make_manager()
+
+        topology_v1 = {
+            "RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30"),
+            "RINCON_B": _member("RINCON_B", "Living Room", "10.0.1.31"),
+            "RINCON_C": _member("RINCON_C", "Bedroom", "10.0.1.32"),
+        }
+        groups_v1 = [
+            SonosGroup(
+                coordinator_uuid="RINCON_A", member_uuids=["RINCON_A", "RINCON_B", "RINCON_C"]
+            )
+        ]
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(f"{MODULE}.fetch_sonos_topology", AsyncMock(return_value=topology_v1)),
+            patch(f"{MODULE}.fetch_sonos_groups", AsyncMock(return_value=groups_v1)),
+        ):
+            await manager._poll_once()
+
+        assert len(found_calls) == 1
+        found_calls.clear()
+
+        # Kitchen is removed from the group; Sonos promotes Living Room.
+        topology_v2 = dict(topology_v1)
+        groups_v2 = [
+            SonosGroup(coordinator_uuid="RINCON_B", member_uuids=["RINCON_B", "RINCON_C"]),
+            SonosGroup(coordinator_uuid="RINCON_A", member_uuids=["RINCON_A"]),
+        ]
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(f"{MODULE}.fetch_sonos_topology", AsyncMock(return_value=topology_v2)),
+            patch(f"{MODULE}.fetch_sonos_groups", AsyncMock(return_value=groups_v2)),
+        ):
+            await manager._poll_once()
+
+        assert renamed_calls == []  # never silently relabeled
+        assert lost_calls == ["RINCON_A"]  # demoted coordinator resets
+        uuids_found = {r.uuid for r in found_calls}
+        assert uuids_found == {"RINCON_A", "RINCON_B"}  # Kitchen re-found solo; Living Room new
+
     async def test_stereo_pair_solo_display_name_has_no_duplicate(self) -> None:
         # A bonded pair's secondary is Invisible but still listed in
         # g.member_uuids — it must not turn "Kitchen" into "Kitchen, Kitchen".
