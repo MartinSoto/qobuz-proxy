@@ -29,6 +29,7 @@ from .sonos_topology import (
     parse_zone_group_state,
     parse_zone_groups,
 )
+from .sonos_discovery_manager import SonosRoom, SonosDiscoveryManager
 
 __all__ = [
     "DLNABackend",
@@ -60,4 +61,6 @@ __all__ = [
     "fetch_sonos_groups",
     "parse_zone_group_state",
     "parse_zone_groups",
+    "SonosRoom",
+    "SonosDiscoveryManager",
 ]

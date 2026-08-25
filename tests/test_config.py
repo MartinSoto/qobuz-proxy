@@ -11,6 +11,7 @@ from qobuz_proxy.config import (
     QobuzConfig,
     SpeakerConfig,
     dict_to_config,
+    generate_sonos_speaker_uuid,
     slugify_name,
     speaker_config_to_dict,
     validate_config,
@@ -260,3 +261,44 @@ class TestSpeakerConfigToDict:
         d = speaker_config_to_dict(sc)
         assert d["max_quality"] == 6
         assert isinstance(d["max_quality"], int)
+
+
+class TestSpeakerConfigAutoManaged:
+    def test_defaults_to_false(self) -> None:
+        assert SpeakerConfig(name="Kitchen").auto_managed is False
+
+
+class TestSonosAutoDiscoverConfig:
+    def test_defaults_to_false(self) -> None:
+        assert Config().sonos_auto_discover is False
+
+    def test_dict_to_config_reads_true(self) -> None:
+        config = dict_to_config({"sonos_auto_discover": True})
+        assert config.sonos_auto_discover is True
+
+    def test_dict_to_config_absent_key_keeps_default(self) -> None:
+        config = dict_to_config({})
+        assert config.sonos_auto_discover is False
+
+
+class TestGenerateSonosSpeakerUuid:
+    def test_deterministic_for_same_sonos_uuid(self) -> None:
+        a = generate_sonos_speaker_uuid("RINCON_ABC123")
+        b = generate_sonos_speaker_uuid("RINCON_ABC123")
+        assert a == b
+
+    def test_different_for_different_sonos_uuid(self) -> None:
+        a = generate_sonos_speaker_uuid("RINCON_ABC123")
+        b = generate_sonos_speaker_uuid("RINCON_XYZ789")
+        assert a != b
+
+    def test_independent_of_hostname(self) -> None:
+        # Unlike generate_speaker_uuid, this must not depend on platform.node()
+        # — a room's Connect identity must survive running on a different host.
+        with_patch_a = generate_sonos_speaker_uuid("RINCON_ABC123")
+        import platform
+        from unittest.mock import patch
+
+        with patch.object(platform, "node", return_value="a-different-hostname"):
+            with_patch_b = generate_sonos_speaker_uuid("RINCON_ABC123")
+        assert with_patch_a == with_patch_b

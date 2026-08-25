@@ -28,8 +28,10 @@ from qobuz_proxy.config import (
     SpeakerConfig,
     _assign_ports,
     _generate_uuids,
+    generate_sonos_speaker_uuid,
     slugify_name,
 )
+from qobuz_proxy.backends.dlna.sonos_discovery_manager import SonosDiscoveryManager, SonosRoom
 from qobuz_proxy.speaker import Speaker
 from qobuz_proxy.webui.config_writer import save_config
 from qobuz_proxy.webui.routes import register_routes
@@ -83,6 +85,13 @@ class QobuzProxy:
         # Background retry tasks for speakers that failed to start, keyed by
         # slugified speaker name. Also keeps strong references to the tasks.
         self._speaker_retry_tasks: dict[str, asyncio.Task[None]] = {}
+
+        # Sonos auto-discovery (mutually exclusive with config.speakers —
+        # see _start_speakers). Running speakers it created are still just
+        # entries in self._speakers; this index is only for matching a
+        # Sonos coordinator UUID back to its Speaker on room-lost.
+        self._sonos_discovery: Optional[SonosDiscoveryManager] = None
+        self._sonos_speakers_by_uuid: dict[str, Speaker] = {}
 
     # ------------------------------------------------------------------
     # Public interface
@@ -257,16 +266,27 @@ class QobuzProxy:
 
     async def _on_add_speaker(self, body: dict) -> dict:
         """Add a new speaker at runtime."""
+        if self._config.sonos_auto_discover:
+            # A manually-added speaker would run until the next restart, then
+            # silently vanish — auto-discovery skips config.speakers on boot,
+            # so it's never read back. Reject rather than trap the user.
+            raise ValueError(
+                "Manual speaker configuration is disabled while sonos_auto_discover is enabled"
+            )
+
         name = body["name"].strip()
         backend_type = body.get("backend", "dlna")
 
         # Check for duplicate names against the config — a speaker can exist in
         # config without running (e.g. its device is offline), and a duplicate
-        # name in the saved config prevents the app from booting.
+        # name in the saved config prevents the app from booting. Also check
+        # currently running speakers, which can include ones not in config.
         new_id = slugify_name(name)
         for sc_existing in self._config.speakers:
             if slugify_name(sc_existing.name) == new_id:
                 raise ValueError(f"Speaker '{name}' already exists")
+        if any(slugify_name(s.name) == new_id for s in self._speakers):
+            raise ValueError(f"Speaker '{name}' already exists")
 
         # Build SpeakerConfig
         quality_raw = body.get("max_quality", "auto")
@@ -480,6 +500,14 @@ class QobuzProxy:
         """
         assert self._api_client is not None
 
+        if self._config.sonos_auto_discover:
+            if self._config.speakers:
+                logger.warning(
+                    "sonos_auto_discover is enabled — ignoring the configured 'speakers' list"
+                )
+            await self._start_sonos_auto_discovery()
+            return
+
         if not self._config.speakers:
             port = self._config.server.http_port
             logger.info(f"No speakers configured — add speakers at http://localhost:{port}")
@@ -520,6 +548,85 @@ class QobuzProxy:
         port = self._config.server.http_port
         logger.info(f"qobuz-proxy ready — {len(self._speakers)} speaker(s): {names}")
         logger.info(f"Web UI: http://localhost:{port}")
+
+    # ------------------------------------------------------------------
+    # Sonos auto-discovery
+    # ------------------------------------------------------------------
+
+    async def _start_sonos_auto_discovery(self) -> None:
+        """Start continuous Sonos household discovery in place of config.speakers."""
+        if self._sonos_discovery is not None:
+            return  # already running (e.g. re-login after logout)
+
+        self._sonos_discovery = SonosDiscoveryManager(
+            on_room_found=self._on_sonos_room_found,
+            on_room_lost=self._on_sonos_room_lost,
+        )
+        await self._sonos_discovery.start()
+
+        port = self._config.server.http_port
+        if self._speakers:
+            names = ", ".join(s.name for s in self._speakers)
+            logger.info(f"Sonos auto-discovery ready — {len(self._speakers)} room(s): {names}")
+        else:
+            logger.info("Sonos auto-discovery started — no rooms found yet, will keep polling")
+        logger.info(f"Web UI: http://localhost:{port}")
+
+    async def _on_sonos_room_found(self, room: SonosRoom) -> bool:
+        """Called by SonosDiscoveryManager when a new group coordinator appears.
+
+        Returns True only once the Speaker is actually running — the caller
+        treats False as "not yet known", so a failure here is naturally
+        retried on the next poll with no extra bookkeeping.
+        """
+        if self._api_client is None:
+            return False  # not logged in yet
+
+        # display_name is comma-joined member room names for an active
+        # group ("Kitchen, Living Room"), matching how the Sonos app itself
+        # labels a group — just the room name when playing solo.
+        display_name = room.display_name
+        new_id = slugify_name(display_name)
+        if any(slugify_name(s.name) == new_id for s in self._speakers):
+            logger.warning(
+                f"Sonos discovery: room '{display_name}' name collides with an "
+                "existing speaker — skipping"
+            )
+            return False
+
+        sc = SpeakerConfig(
+            name=display_name,
+            uuid=generate_sonos_speaker_uuid(room.uuid),
+            backend_type="dlna",
+            max_quality=AUTO_QUALITY,
+            dlna_ip=room.ip,
+            dlna_port=room.port,
+            auto_managed=True,
+        )
+        all_configs = [s._config for s in self._speakers] + [sc]
+        _assign_ports(all_configs, webui_port=self._config.server.http_port)
+
+        speaker = Speaker(config=sc, api_client=self._api_client, app_id=self._app_id)
+        started = await speaker.start()
+        if not started:
+            logger.warning(f"Sonos discovery: '{display_name}' failed to start")
+            return False
+
+        self._speakers.append(speaker)
+        self._sonos_speakers_by_uuid[room.uuid] = speaker
+        logger.info(f"Sonos discovery: added speaker '{display_name}' ({room.ip})")
+        return True
+
+    async def _on_sonos_room_lost(self, sonos_uuid: str) -> None:
+        """Called by SonosDiscoveryManager when a group coordinator disappears
+        (device went offline, or stopped being a coordinator when regrouped)."""
+        speaker = self._sonos_speakers_by_uuid.pop(sonos_uuid, None)
+        if speaker is None:
+            return
+        if speaker in self._speakers:
+            self._speakers.remove(speaker)
+        logger.info(f"Sonos discovery: removing speaker '{speaker.name}'")
+        await speaker.stop()
 
     def _schedule_speaker_retry(self, config: SpeakerConfig) -> None:
         """Start (or keep) a background task retrying a failed speaker."""
@@ -585,6 +692,11 @@ class QobuzProxy:
         for task in list(self._speaker_retry_tasks.values()):
             task.cancel()
         self._speaker_retry_tasks.clear()
+
+        if self._sonos_discovery is not None:
+            await self._sonos_discovery.stop()
+            self._sonos_discovery = None
+        self._sonos_speakers_by_uuid.clear()
 
         if self._speakers:
             await asyncio.gather(*[s.stop() for s in self._speakers], return_exceptions=True)

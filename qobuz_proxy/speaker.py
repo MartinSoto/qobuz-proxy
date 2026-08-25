@@ -162,6 +162,7 @@ class Speaker:
             "status": playback_status,
             "config": config_dict,
             "now_playing": now_playing,
+            "auto_managed": self._config.auto_managed,
         }
 
     def _build_component_config(self) -> Config:

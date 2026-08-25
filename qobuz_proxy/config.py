@@ -61,6 +61,8 @@ ENV_MAPPINGS = {
     "QOBUZPROXY_PROXY_PORT": ("backend", "dlna", "proxy_port"),
     # Logging
     "QOBUZPROXY_LOG_LEVEL": ("logging", "level"),
+    # Sonos auto-discovery (replaces the `speakers` list when enabled)
+    "QOBUZPROXY_SONOS_AUTO_DISCOVER": ("sonos_auto_discover",),
 }
 
 
@@ -152,6 +154,10 @@ class SpeakerConfig:
     proxy_port: int = 0  # 0 = auto-assign
     audio_device: str = "default"
     audio_buffer_size: int = 2048
+    # True for speakers created by SonosDiscoveryManager rather than user
+    # config. Never appended to Config.speakers / persisted to config.yaml —
+    # they're re-derived from the network on every poll instead.
+    auto_managed: bool = False
 
 
 @dataclass
@@ -164,6 +170,10 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     speakers: list[SpeakerConfig] = field(default_factory=list)
+    # When True, speakers come from continuous Sonos household discovery
+    # instead of the `speakers` list above (which is ignored, with a
+    # warning, if also set) — no manual per-room configuration needed.
+    sonos_auto_discover: bool = False
     config_path: Optional[Path] = None  # Set by load_config() when loading from file
 
 
@@ -231,6 +241,17 @@ def validate_config(config: Config) -> None:
 def generate_speaker_uuid(speaker_name: str) -> str:
     """Generate a deterministic UUID for a speaker based on hostname and name."""
     return str(uuid.uuid5(_SPEAKER_UUID_NAMESPACE, f"{platform.node()}:{speaker_name}"))
+
+
+def generate_sonos_speaker_uuid(sonos_uuid: str) -> str:
+    """Generate a deterministic UUID for an auto-discovered Sonos speaker.
+
+    Keyed by the Sonos player's own (stable, hostname- and name-independent)
+    UUID rather than `hostname:name` like generate_speaker_uuid — a room's
+    Qobuz Connect device identity must survive DHCP IP changes and renames,
+    neither of which affect this value.
+    """
+    return str(uuid.uuid5(_SPEAKER_UUID_NAMESPACE, f"sonos:{sonos_uuid}"))
 
 
 def slugify_name(name: str) -> str:
@@ -549,7 +570,7 @@ def load_env_config() -> dict:
                     logger.warning(f"Invalid integer for {env_var}: {value}")
                     continue
             # Convert boolean values
-            elif env_var == "QOBUZPROXY_DLNA_FIXED_VOLUME":
+            elif env_var in ("QOBUZPROXY_DLNA_FIXED_VOLUME", "QOBUZPROXY_SONOS_AUTO_DISCOVER"):
                 value = value.lower() in ("true", "1", "yes", "on")
 
             # Set nested value
@@ -642,6 +663,10 @@ def dict_to_config(d: dict) -> Config:
     # Logging
     if "logging" in d:
         config.logging.level = d["logging"].get("level", config.logging.level)
+
+    # Sonos auto-discovery
+    if "sonos_auto_discover" in d:
+        config.sonos_auto_discover = bool(d["sonos_auto_discover"])
 
     return config
 

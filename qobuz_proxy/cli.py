@@ -69,6 +69,7 @@ Examples:
   qobuz-proxy --discover
   qobuz-proxy --discover --timeout 10 --json
   qobuz-proxy --discover-sonos
+  qobuz-proxy --sonos-auto-discover
   qobuz-proxy --config config.yaml
   qobuz-proxy --email user@example.com --auth-token TOKEN --user-id ID --dlna-ip 192.168.1.50
 
@@ -208,6 +209,11 @@ Environment Variables:
         metavar="TYPE",
         help="Audio backend type: dlna or local",
     )
+    parser.add_argument(
+        "--sonos-auto-discover",
+        action="store_true",
+        help="Continuously discover Sonos rooms/groups instead of configured speakers",
+    )
 
     # Server
     server_group = parser.add_argument_group("Server")
@@ -270,14 +276,18 @@ def args_to_dict(args: argparse.Namespace) -> dict:
         "proxy_port": ("backend", "dlna", "proxy_port"),
         "bind": ("server", "bind_address"),
         "log_level": ("logging", "level"),
+        "sonos_auto_discover": ("sonos_auto_discover",),
     }
+
+    # store_true flags: only set (and thus override lower-priority sources)
+    # when the user explicitly passed them, never for their False default.
+    store_true_flags = {"fixed_volume", "sonos_auto_discover"}
 
     for arg_name, path in mappings.items():
         value = getattr(args, arg_name, None)
-        # Skip None values and False for fixed_volume (only set if explicitly True)
         if value is None:
             continue
-        if arg_name == "fixed_volume" and not value:
+        if arg_name in store_true_flags and not value:
             continue
         _set_nested(result, path, value)
 
