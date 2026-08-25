@@ -1,5 +1,7 @@
 """Tests for continuous Sonos household discovery (poll/diff/retry logic)."""
 
+import json
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 from xml.sax.saxutils import escape
 
@@ -685,6 +687,83 @@ class TestPollOnce:
 
         assert found_calls == []
         assert lost_calls == []
+
+
+class TestTopologyChangeLogging:
+    """A full JSON dump of the topology (and our diff of it) at DEBUG level
+    whenever something actually changes — the main tool for diagnosing a
+    live household's exact behavior against what we assumed it would do."""
+
+    async def test_logs_full_topology_and_diff_on_change(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        manager, *_ = _make_manager()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=MODULE),
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(
+                f"{MODULE}.fetch_sonos_topology",
+                AsyncMock(return_value={"RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30")}),
+            ),
+            patch(
+                f"{MODULE}.fetch_sonos_groups",
+                AsyncMock(
+                    return_value=[
+                        SonosGroup(
+                            coordinator_uuid="RINCON_A",
+                            member_uuids=["RINCON_A"],
+                            group_id="RINCON_A:1",
+                        )
+                    ]
+                ),
+            ),
+        ):
+            await manager._poll_once()
+
+        records = [r for r in caplog.records if "topology changed" in r.message]
+        assert len(records) == 1
+        payload = json.loads(records[0].message.split("\n", 1)[1])
+        assert payload["members"]["RINCON_A"]["zone_name"] == "Kitchen"
+        assert payload["groups"][0]["group_id"] == "RINCON_A:1"
+        assert payload["known_before"] == {}
+        assert payload["diff"] == {
+            "removed": [],
+            "rekeyed": [],
+            "added": ["RINCON_A:1"],
+            "renamed": [],
+            "retargeted": [],
+        }
+
+    async def test_no_log_when_nothing_changed(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        manager, *_ = _make_manager()
+        manager._known = {
+            "RINCON_A:1": SonosRoom(
+                "RINCON_A", "Kitchen", "10.0.1.30", 1400, False, ("Kitchen",), "RINCON_A:1"
+            )
+        }
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=MODULE),
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(
+                f"{MODULE}.fetch_sonos_topology",
+                AsyncMock(return_value={"RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30")}),
+            ),
+            patch(
+                f"{MODULE}.fetch_sonos_groups",
+                AsyncMock(
+                    return_value=[
+                        SonosGroup(
+                            coordinator_uuid="RINCON_A",
+                            member_uuids=["RINCON_A"],
+                            group_id="RINCON_A:1",
+                        )
+                    ]
+                ),
+            ),
+        ):
+            await manager._poll_once()
+
+        assert not any("topology changed" in r.message for r in caplog.records)
 
 
 class TestStartStop:

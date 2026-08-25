@@ -37,9 +37,10 @@ the next update — a free retry loop with no separate backoff bookkeeping.
 """
 
 import asyncio
+import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Awaitable, Callable, Optional
 
 from .discovery import DiscoveredDevice, discover_dlna_devices
@@ -388,6 +389,31 @@ class SonosDiscoveryManager:
                 retargeted.append(room)
             else:
                 renamed.append(room)
+
+        changed = bool(removed or rekeyed or added or renamed or retargeted)
+        if changed and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Sonos discovery: topology changed:\n"
+                + json.dumps(
+                    {
+                        "members": {uuid: asdict(m) for uuid, m in members.items()},
+                        "groups": [asdict(g) for g in groups],
+                        "known_before": {key: asdict(room) for key, room in self._known.items()},
+                        "diff": {
+                            "removed": removed,
+                            "rekeyed": [
+                                {"old_key": old_key, "new_key": room.tracking_key}
+                                for old_key, room in rekeyed
+                            ],
+                            "added": [room.tracking_key for room in added],
+                            "renamed": [room.tracking_key for room in renamed],
+                            "retargeted": [room.tracking_key for room in retargeted],
+                        },
+                    },
+                    indent=2,
+                    default=str,
+                )
+            )
 
         for key in removed:
             # Still visible in this snapshot's topology (just not a
