@@ -305,16 +305,23 @@ class SonosDiscoveryManager:
         added = [room for uuid, room in current.items() if uuid not in self._known]
 
         # A coordinator's IP/port is its physical identity — the DLNA target
-        # a Speaker actually talks to. Membership shrinking/growing is
-        # normally cosmetic (a peer joined/left) and must not disrupt
-        # playback — just rename in place. But if this coordinator kept
-        # NONE of its previous groupmates, it wasn't a peaceful partial
-        # departure: Sonos demoted it and promoted a former groupmate to
-        # coordinate what continues as "the same" group elsewhere (this is
-        # exactly what happens when you remove the *coordinator* itself
-        # from a group). Renaming in place here would be actively wrong —
-        # this Speaker no longer corresponds to whatever is still playing,
-        # so it must reset (full stop/start) rather than relabel.
+        # a Speaker actually talks to. Membership shrinking/growing (even
+        # all the way down to solo) is normally cosmetic and must not
+        # disrupt playback — just rename in place. The one case that
+        # genuinely needs a reset is a real demotion: the coordinator I
+        # used to be is now led by someone else. That's not detectable by
+        # comparing a room's own before/after peers — "I lost my last
+        # peer" and "I was demoted, a peer took over" both leave *my own*
+        # new_peers empty; they're indistinguishable from my own
+        # perspective alone. group_id is the actual signal: confirmed
+        # stable across a genuine handoff (verified against a real
+        # household), and NOT carried over when a group merely shrinks —
+        # so a demotion is precisely "some other coordinator in the new
+        # snapshot now holds my old group_id".
+        current_group_owners = {
+            room.group_id: uuid for uuid, room in current.items() if room.group_id
+        }
+
         identity_changed: list[SonosRoom] = []
         renamed: list[SonosRoom] = []
         for uuid, room in current.items():
@@ -327,9 +334,8 @@ class SonosDiscoveryManager:
                 identity_changed.append(room)
                 continue
 
-            old_peers = set(old.member_names) - {old.name}
-            new_peers = set(room.member_names) - {room.name}
-            demoted = bool(old_peers) and old_peers.isdisjoint(new_peers)
+            successor_uuid = current_group_owners.get(old.group_id)
+            demoted = successor_uuid is not None and successor_uuid != uuid
             if demoted:
                 identity_changed.append(room)
             else:

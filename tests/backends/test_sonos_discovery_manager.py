@@ -394,6 +394,60 @@ class TestPollOnce:
         kitchen_solo = next(r for r in found_calls if r.uuid == "RINCON_A")
         assert living_room.group_id == "RINCON_A:1"  # inherits the continuing group's id
         assert kitchen_solo.group_id == "RINCON_A:2"  # a distinct, new solo group
+
+    async def test_last_peer_leaving_a_2room_group_renames_not_resets(self) -> None:
+        # Regression: a 2-room group's coordinator, after its *only* peer
+        # leaves, ends up solo — new_peers is empty, exactly like a real
+        # demotion looks from the coordinator's own perspective. The two
+        # must not be conflated: nobody else took over group_id "RINCON_A:1"
+        # here (the departed peer got its own distinct group_id, it didn't
+        # inherit this one), so this is a peaceful shrink, not a handoff.
+        manager, found_calls, lost_calls, renamed_calls = _make_manager()
+
+        topology_v1 = {
+            "RINCON_A": _member("RINCON_A", "Cuarto", "10.0.1.30"),
+            "RINCON_B": _member("RINCON_B", "Cocina", "10.0.1.31"),
+        }
+        groups_v1 = [
+            SonosGroup(
+                coordinator_uuid="RINCON_A",
+                member_uuids=["RINCON_A", "RINCON_B"],
+                group_id="RINCON_A:1",
+            )
+        ]
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(f"{MODULE}.fetch_sonos_topology", AsyncMock(return_value=topology_v1)),
+            patch(f"{MODULE}.fetch_sonos_groups", AsyncMock(return_value=groups_v1)),
+        ):
+            await manager._poll_once()
+
+        assert len(found_calls) == 1
+        found_calls.clear()
+
+        # Cocina leaves; Cuarto is left solo, still coordinating (itself).
+        topology_v2 = dict(topology_v1)
+        groups_v2 = [
+            SonosGroup(
+                coordinator_uuid="RINCON_A", member_uuids=["RINCON_A"], group_id="RINCON_A:2"
+            ),
+            SonosGroup(
+                coordinator_uuid="RINCON_B", member_uuids=["RINCON_B"], group_id="RINCON_B:1"
+            ),
+        ]
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(f"{MODULE}.fetch_sonos_topology", AsyncMock(return_value=topology_v2)),
+            patch(f"{MODULE}.fetch_sonos_groups", AsyncMock(return_value=groups_v2)),
+        ):
+            await manager._poll_once()
+
+        assert lost_calls == []  # Cuarto's Speaker was never torn down
+        assert len(renamed_calls) == 1
+        assert renamed_calls[0].uuid == "RINCON_A"
+        assert renamed_calls[0].display_name == "Cuarto"
+        assert len(found_calls) == 1  # Cocina, now solo, gets its own new Speaker
+        assert found_calls[0].uuid == "RINCON_B"
         assert found_calls[0].uuid == "RINCON_B"
 
     async def test_stereo_pair_solo_display_name_has_no_duplicate(self) -> None:
