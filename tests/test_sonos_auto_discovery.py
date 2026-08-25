@@ -137,6 +137,58 @@ class TestRoomFoundAndLost:
         await app._on_sonos_room_lost("RINCON_UNKNOWN")  # must not raise
 
 
+class TestRoomRenamed:
+    async def test_renames_running_speaker_in_place(self) -> None:
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.rename = AsyncMock(return_value=True)
+        app._speakers.append(speaker)
+        app._sonos_speakers_by_uuid["RINCON_A"] = speaker
+
+        grouped_room = SonosRoom(
+            uuid="RINCON_A",
+            name="Kitchen",
+            ip="10.0.1.30",
+            port=1400,
+            is_stereo_pair=False,
+            member_names=("Kitchen", "Living Room"),
+        )
+        result = await app._on_sonos_room_renamed(grouped_room)
+
+        assert result is True
+        speaker.rename.assert_awaited_once_with("Kitchen, Living Room")
+
+    async def test_returns_false_when_speaker_not_running(self) -> None:
+        app = QobuzProxy(_make_config())
+
+        result = await app._on_sonos_room_renamed(ROOM)
+
+        assert result is False
+
+    async def test_returns_false_on_name_collision(self) -> None:
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.rename = AsyncMock(return_value=True)
+        app._speakers.append(speaker)
+        app._sonos_speakers_by_uuid["RINCON_A"] = speaker
+
+        other = _mock_speaker("Kitchen, Living Room")
+        app._speakers.append(other)
+
+        grouped_room = SonosRoom(
+            uuid="RINCON_A",
+            name="Kitchen",
+            ip="10.0.1.30",
+            port=1400,
+            is_stereo_pair=False,
+            member_names=("Kitchen", "Living Room"),
+        )
+        result = await app._on_sonos_room_renamed(grouped_room)
+
+        assert result is False
+        speaker.rename.assert_not_called()
+
+
 class TestAddSpeakerGuard:
     async def test_manual_add_rejected_while_auto_discover_enabled(self) -> None:
         app = QobuzProxy(_make_config(sonos_auto_discover=True))

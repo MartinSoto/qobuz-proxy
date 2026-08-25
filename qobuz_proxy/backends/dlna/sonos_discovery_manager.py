@@ -66,6 +66,9 @@ class SonosRoom:
 # only then is it considered "known" until it's reported lost.
 RoomFoundCallback = Callable[[SonosRoom], Awaitable[bool]]
 RoomLostCallback = Callable[[str], Awaitable[None]]  # sonos uuid
+# Returns True if the rename was applied — only then does the manager stop
+# retrying it on subsequent polls.
+RoomRenamedCallback = Callable[[SonosRoom], Awaitable[bool]]
 
 
 class SonosDiscoveryManager:
@@ -75,11 +78,13 @@ class SonosDiscoveryManager:
         self,
         on_room_found: RoomFoundCallback,
         on_room_lost: RoomLostCallback,
+        on_room_renamed: RoomRenamedCallback,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         ssdp_timeout: float = DEFAULT_SSDP_TIMEOUT_SECONDS,
     ) -> None:
         self._on_room_found = on_room_found
         self._on_room_lost = on_room_lost
+        self._on_room_renamed = on_room_renamed
         self._poll_interval = poll_interval
         self._ssdp_timeout = ssdp_timeout
 
@@ -170,20 +175,33 @@ class SonosDiscoveryManager:
 
         removed = [uuid for uuid in self._known if uuid not in current]
         added = [room for uuid, room in current.items() if uuid not in self._known]
-        changed = [
-            room
-            for uuid, room in current.items()
-            if uuid in self._known and self._known[uuid] != room
-        ]
+
+        # A coordinator's IP/port is its physical identity — the DLNA target
+        # a Speaker actually talks to. Anything else changing (member_names,
+        # room name, pairing) is cosmetic and must not disrupt playback:
+        # only an identity change needs a full stop/start; a cosmetic change
+        # is renamed in place.
+        identity_changed: list[SonosRoom] = []
+        renamed: list[SonosRoom] = []
+        for uuid, room in current.items():
+            if uuid not in self._known:
+                continue
+            old = self._known[uuid]
+            if old == room:
+                continue
+            if old.ip != room.ip or old.port != room.port:
+                identity_changed.append(room)
+            else:
+                renamed.append(room)
 
         for uuid in removed:
             await self._report_lost(uuid)
-        for room in changed:
-            # Coordinator moved IP or was renamed — treat as lost+found
-            # rather than patching a live Speaker in place.
+        for room in identity_changed:
             await self._report_lost(room.uuid)
-        for room in added + changed:
+        for room in added + identity_changed:
             await self._report_found(room)
+        for room in renamed:
+            await self._report_renamed(room)
 
     async def _report_found(self, room: SonosRoom) -> None:
         try:
@@ -201,6 +219,16 @@ class SonosDiscoveryManager:
             await self._on_room_lost(uuid)
         except Exception as e:
             logger.warning(f"Sonos discovery: error stopping speaker for {uuid}: {e}")
+
+    async def _report_renamed(self, room: SonosRoom) -> None:
+        try:
+            renamed = await self._on_room_renamed(room)
+        except Exception as e:
+            logger.warning(f"Sonos discovery: error renaming speaker for '{room.name}': {e}")
+            renamed = False
+        if renamed:
+            self._known[room.uuid] = room
+        # else: _known keeps the stale name, so the rename is retried next poll
 
 
 __all__ = ["SonosRoom", "SonosDiscoveryManager"]

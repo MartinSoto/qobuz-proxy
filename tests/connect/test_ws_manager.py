@@ -289,6 +289,24 @@ class TestMessageQueueing:
         assert result is False
         assert len(ws_manager._pending_messages) == 1
 
+    @pytest.mark.asyncio
+    async def test_send_device_info_updated_queues(self, ws_manager: WsManager) -> None:
+        """Test that a rename is queued when disconnected."""
+        result = await ws_manager.send_device_info_updated("Kitchen, Living Room")
+
+        assert result is False
+        assert len(ws_manager._pending_messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_send_device_info_updated_updates_config_name(
+        self, ws_manager: WsManager
+    ) -> None:
+        """A rename updates config.device.name even while disconnected, so a
+        future JOIN_SESSION on reconnect already carries the new name."""
+        await ws_manager.send_device_info_updated("Kitchen, Living Room")
+
+        assert ws_manager.config.device.name == "Kitchen, Living Room"
+
 
 class TestStartStop:
     """Tests for start/stop behavior."""

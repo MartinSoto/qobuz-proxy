@@ -561,6 +561,7 @@ class QobuzProxy:
         self._sonos_discovery = SonosDiscoveryManager(
             on_room_found=self._on_sonos_room_found,
             on_room_lost=self._on_sonos_room_lost,
+            on_room_renamed=self._on_sonos_room_renamed,
         )
         await self._sonos_discovery.start()
 
@@ -627,6 +628,27 @@ class QobuzProxy:
             self._speakers.remove(speaker)
         logger.info(f"Sonos discovery: removing speaker '{speaker.name}'")
         await speaker.stop()
+
+    async def _on_sonos_room_renamed(self, room: SonosRoom) -> bool:
+        """Called by SonosDiscoveryManager when a group coordinator's display
+        name changes (regrouping, or a room renamed in the Sonos app) but its
+        network identity (ip/port) didn't — e.g. another room joined or left
+        its group. Renames the existing Speaker in place instead of
+        restarting it, so playback and position survive."""
+        speaker = self._sonos_speakers_by_uuid.get(room.uuid)
+        if speaker is None:
+            return False  # not currently running; a found/lost pair will handle it
+
+        new_name = room.display_name
+        new_id = slugify_name(new_name)
+        if any(slugify_name(s.name) == new_id and s is not speaker for s in self._speakers):
+            logger.warning(
+                f"Sonos discovery: rename to '{new_name}' collides with an "
+                "existing speaker — skipping"
+            )
+            return False
+
+        return await speaker.rename(new_name)
 
     def _schedule_speaker_retry(self, config: SpeakerConfig) -> None:
         """Start (or keep) a background task retrying a failed speaker."""
