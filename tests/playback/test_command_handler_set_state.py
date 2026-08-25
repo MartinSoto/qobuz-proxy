@@ -7,6 +7,7 @@ sequence to player.apply_remote_state(), which applies it atomically.
 """
 
 import asyncio
+from unittest.mock import AsyncMock
 
 from qobuz_proxy.backends import PlaybackState
 from qobuz_proxy.playback.command_handler import PlaybackCommandHandler
@@ -133,3 +134,56 @@ class TestSetStateHandling:
         assert player.current_track is not None
         assert player.current_track.track_id == "1002"
         assert backend.played[-1] == "1002"
+
+
+class TestNoTrackSentinel:
+    """The server signals "no current/next track" with an all-bits-set
+    QueueTrackRef (fixed32 trackId, uint64 queueItemId all-1s) rather than
+    omitting the field — HasField() alone doesn't distinguish this from a
+    real track reference."""
+
+    async def test_current_queue_item_sentinel_does_not_start_playback(self) -> None:
+        # A freshly (re)connected renderer legitimately has an empty queue —
+        # this is exactly the state a just-reset Sonos coordinator's Speaker
+        # starts in, which is what first exposed this bug in practice.
+        player, backend = _make_player()
+        player.queue.get_current_track = AsyncMock(return_value=None)
+        player.queue.advance_to_next = AsyncMock(return_value=None)
+        handler = PlaybackCommandHandler(player)
+
+        msg = _set_state_msg(track_id=0xFFFFFFFF, queue_item_id=0xFFFFFFFFFFFFFFFF)
+        await handler._handle_set_state(msg)
+
+        assert player.current_track is None
+        assert backend.played == []
+
+    async def test_current_queue_item_sentinel_via_queue_item_id_alone(self) -> None:
+        # A real (small) trackId paired with the queueItemId sentinel must
+        # also be treated as "no track" — either field alone marks it.
+        player, backend = _make_player()
+        player.queue.get_current_track = AsyncMock(return_value=None)
+        player.queue.advance_to_next = AsyncMock(return_value=None)
+        handler = PlaybackCommandHandler(player)
+
+        msg = _set_state_msg(track_id=2001, queue_item_id=0xFFFFFFFFFFFFFFFF)
+        await handler._handle_set_state(msg)
+
+        assert player.current_track is None
+        assert backend.played == []
+
+    async def test_next_queue_item_sentinel_clears_stored_next_track(self) -> None:
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+
+        real_next = _set_state_msg(track_id=1001, queue_item_id=1)
+        real_next.srvrRndrSetState.nextQueueItem.queueItemId = 2
+        real_next.srvrRndrSetState.nextQueueItem.trackId = 1002
+        await handler._handle_set_state(real_next)
+        assert handler.get_next_track_info() is not None
+
+        sentinel_next = _set_state_msg(track_id=1001, queue_item_id=1)
+        sentinel_next.srvrRndrSetState.nextQueueItem.queueItemId = 0xFFFFFFFFFFFFFFFF
+        sentinel_next.srvrRndrSetState.nextQueueItem.trackId = 0xFFFFFFFF
+        await handler._handle_set_state(sentinel_next)
+
+        assert handler.get_next_track_info() is None
