@@ -127,6 +127,12 @@ async def test_head_probe_does_not_download_the_track():
                 assert resp.status == 200
                 assert resp.headers["Content-Type"] == "audio/flac"
                 assert resp.headers["Accept-Ranges"] == "bytes"
+                # Regression: web.Response computes Content-Length from its
+                # body automatically and raises if you assign to
+                # .content_length afterwards — that RuntimeError was
+                # silently swallowed here, so HEAD probes never actually
+                # reported a Content-Length at all.
+                assert resp.headers["Content-Length"] == str(len(PAYLOAD))
     finally:
         await proxy.stop()
         await upstream.stop()
