@@ -2,6 +2,7 @@
 
 from qobuz_proxy.backends.types import BackendTrackMetadata
 from qobuz_proxy.backends.dlna.backend import DLNABackend
+from qobuz_proxy.backends.dlna.capabilities import DLNACapabilities
 
 
 def _make_backend() -> DLNABackend:
@@ -258,3 +259,139 @@ class TestRetarget:
         assert result is True
         MockClient.assert_not_called()
         assert backend._client is old_client
+
+
+class TestTranscodeDecision:
+    """DLNABackend._transcode_sample_rate_for decides whether a specific
+    track needs on-the-fly downsampling — see TranscodingFlacReader and
+    capabilities.py's max_quality docstring for the full rationale.
+
+    hires_downsampling is experimental and opt-in (default off) — every
+    test below except the dedicated "flag off" ones explicitly enables it,
+    since that's the state actually being tested."""
+
+    def _make_backend(self) -> DLNABackend:
+        backend = _make_backend()
+        backend._hires_downsampling = True
+        return backend
+
+    def _caps(self, max_sample_rate: int, max_bit_depth: int) -> DLNACapabilities:
+        return DLNACapabilities(
+            supports_flac=True, max_sample_rate=max_sample_rate, max_bit_depth=max_bit_depth
+        )
+
+    def test_no_transcode_needed_when_track_fits_the_cap(self) -> None:
+        backend = self._make_backend()
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=24)
+        metadata = _make_metadata(sample_rate=44100, bit_depth=24)
+
+        assert backend._transcode_sample_rate_for(metadata) is None
+
+    def test_transcodes_when_track_exceeds_the_cap(self) -> None:
+        backend = self._make_backend()
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=24)
+        metadata = _make_metadata(sample_rate=96000, bit_depth=24)
+
+        assert backend._transcode_sample_rate_for(metadata) == 48000
+
+    def test_no_transcode_for_a_cd_only_device(self) -> None:
+        """A device without real 24-bit support (max_quality already falls
+        back to CD for it) never needs this — it never receives a track
+        that could exceed 44.1/16 in the first place."""
+        backend = self._make_backend()
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=16)
+        metadata = _make_metadata(sample_rate=44100, bit_depth=16)
+
+        assert backend._transcode_sample_rate_for(metadata) is None
+
+    def test_no_transcode_without_capabilities(self) -> None:
+        backend = self._make_backend()
+        backend._capabilities = None
+        metadata = _make_metadata(sample_rate=96000, bit_depth=24)
+
+        assert backend._transcode_sample_rate_for(metadata) is None
+
+    def test_no_transcode_when_track_sample_rate_is_unknown(self) -> None:
+        backend = self._make_backend()
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=24)
+        metadata = _make_metadata(sample_rate=0, bit_depth=0)
+
+        assert backend._transcode_sample_rate_for(metadata) is None
+
+    def test_content_type_becomes_wav_when_transcoding(self) -> None:
+        backend = self._make_backend()
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=24)
+        metadata = _make_metadata(sample_rate=96000, bit_depth=24)
+
+        content_type, rate = backend._resolve_content_type_and_transcode(
+            "http://cdn/track.flac", metadata
+        )
+
+        assert content_type == "audio/wav"
+        assert rate == 48000
+
+    def test_content_type_stays_flac_when_not_transcoding(self) -> None:
+        backend = self._make_backend()
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=24)
+        metadata = _make_metadata(sample_rate=44100, bit_depth=24)
+
+        content_type, rate = backend._resolve_content_type_and_transcode(
+            "http://cdn/track.flac", metadata
+        )
+
+        assert content_type == "audio/flac"
+        assert rate is None
+
+    def test_logs_downsampling_at_info(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        """The actual path taken (kept as-is vs. downsampled) must be
+        visible in the logs for every track, not just inferable from
+        content-type — see _resolve_content_type_and_transcode's docstring."""
+        backend = self._make_backend()
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=24)
+        metadata = _make_metadata(sample_rate=96000, bit_depth=24)
+
+        with caplog.at_level("INFO"):
+            backend._resolve_content_type_and_transcode("http://cdn/track.flac", metadata)
+
+        assert "downsampling" in caplog.text
+        assert "96000" in caplog.text
+        assert "48000" in caplog.text
+
+    def test_logs_keeping_native_rate_at_info(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        backend = self._make_backend()
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=24)
+        metadata = _make_metadata(sample_rate=44100, bit_depth=24)
+
+        with caplog.at_level("INFO"):
+            backend._resolve_content_type_and_transcode("http://cdn/track.flac", metadata)
+
+        assert "keeping" in caplog.text
+        assert "44100" in caplog.text
+        assert "downsampling" not in caplog.text
+
+    def test_logs_something_even_without_quality_info(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        backend = self._make_backend()
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=24)
+        metadata = _make_metadata(sample_rate=0, bit_depth=0)
+
+        with caplog.at_level("INFO"):
+            backend._resolve_content_type_and_transcode("http://cdn/track.flac", metadata)
+
+        assert "Track 1" in caplog.text
+
+    def test_flag_off_never_transcodes_even_with_24bit_capabilities(self) -> None:
+        """hires_downsampling defaults to off — this is the actual default
+        behavior for every speaker unless explicitly opted in via
+        config.yaml/QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING."""
+        backend = _make_backend()  # note: plain _make_backend(), not self._make_backend()
+        backend._hires_downsampling = False
+        backend._capabilities = self._caps(max_sample_rate=48000, max_bit_depth=24)
+        metadata = _make_metadata(sample_rate=96000, bit_depth=24)
+
+        assert backend._transcode_sample_rate_for(metadata) is None
+
+        content_type, rate = backend._resolve_content_type_and_transcode(
+            "http://cdn/track.flac", metadata
+        )
+        assert content_type == "audio/flac"
+        assert rate is None

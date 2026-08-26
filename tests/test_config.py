@@ -214,6 +214,7 @@ class TestSpeakerConfigToDict:
         assert d["dlna_ip"] == "192.168.1.100"
         assert d["dlna_port"] == 1400
         assert d["dlna_fixed_volume"] is False
+        assert d["dlna_hires_downsampling"] is False
 
     def test_dlna_speaker_omits_uuid_and_ports(self) -> None:
         sc = self._make_dlna_speaker()
@@ -248,6 +249,7 @@ class TestSpeakerConfigToDict:
         assert "dlna_ip" not in d
         assert "dlna_port" not in d
         assert "dlna_fixed_volume" not in d
+        assert "dlna_hires_downsampling" not in d
         assert "dlna_description_url" not in d
 
     def test_auto_quality_serialized_as_string(self) -> None:

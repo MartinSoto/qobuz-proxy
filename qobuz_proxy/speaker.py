@@ -251,6 +251,7 @@ class Speaker:
                     fixed_volume=self._config.dlna_fixed_volume,
                     proxy_port=self._config.proxy_port,
                     description_url=self._config.dlna_description_url,
+                    hires_downsampling=self._config.dlna_hires_downsampling,
                 ),
                 local=LocalConfig(
                     device=self._config.audio_device,
