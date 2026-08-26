@@ -100,6 +100,15 @@ class QobuzPlayer:
         # State
         self._state: PlaybackState = PlaybackState.STOPPED
 
+        # Whether the backend actually has the current track loaded/started —
+        # False right after a fresh load (e.g. we were just made the active
+        # renderer while the track was already paused on another renderer),
+        # True once _start_playback() has actually called backend.play().
+        # PAUSED can happen either way: a real pause (True, backend has
+        # something to resume) or a "cold" pause carried over from a load
+        # (False, nothing to resume — see _pause_locked and _play_locked).
+        self._backend_engaged: bool = False
+
         # Whether the Qobuz server currently considers *this* renderer the
         # active playback target (SrvrRndrSetActive) — the one authoritative
         # signal for "is this the group the app is actually driving right
@@ -560,7 +569,7 @@ class QobuzPlayer:
                 if playing_state == 2:
                     await self._play_locked(position_ms or 0)
                 elif playing_state == 3:
-                    await self._pause_locked()
+                    await self._pause_locked(position_ms)
                 elif playing_state == 1:
                     await self._stop_playback_locked()
 
@@ -627,8 +636,12 @@ class QobuzPlayer:
     async def _play_locked(self, position_ms: int = 0) -> bool:
         logger.debug(f"Play command, current state: {self._state}")
 
-        # Resume from pause
-        if self._state == PlaybackState.PAUSED:
+        # Resume from pause — only when the backend actually has something to
+        # resume. A "cold" pause (loaded but never started; see _pause_locked)
+        # falls through to the fresh-start path below instead, using the
+        # remembered position rather than backend.resume()-ing an idle,
+        # nothing-loaded transport.
+        if self._state == PlaybackState.PAUSED and self._backend_engaged:
             if not await self.backend.resume():
                 # The renderer rejected the resume (e.g. SOAP failure) — stay
                 # PAUSED rather than reporting PLAYING over a silent device, and
@@ -662,6 +675,12 @@ class QobuzPlayer:
                 logger.warning("No track to play - queue empty")
                 return False
             self._current_track = track
+
+        # A cold pause (see above) already has the resume position recorded
+        # in _position_value_ms — a plain PLAY with no explicit position
+        # means "continue from there", not "start over at 0".
+        if position_ms <= 0 and self._state == PlaybackState.PAUSED:
+            position_ms = self._position_value_ms
 
         # Set starting position
         if position_ms > 0:
@@ -747,7 +766,28 @@ class QobuzPlayer:
                 return False
             return await self._pause_locked()
 
-    async def _pause_locked(self) -> bool:
+    async def _pause_locked(self, position_ms: Optional[int] = None) -> bool:
+        if (
+            self._state == PlaybackState.STOPPED
+            and self._current_track
+            and not self._backend_engaged
+        ):
+            # A track was just loaded (e.g. we were made the active renderer
+            # while it was already paused on another renderer/the phone) but
+            # never actually started on this backend — there's nothing on the
+            # device to pause. Just remember where to resume from; the next
+            # play command starts it fresh at this position (_play_locked)
+            # instead of restarting at 0.
+            if position_ms is not None:
+                self._position_value_ms = position_ms
+                self._position_timestamp_ms = int(time.time() * 1000)
+            self._state = PlaybackState.PAUSED
+            await self._send_state_update()
+            logger.info(
+                f"Track loaded paused at {self._position_value_ms}ms (not started on backend)"
+            )
+            return True
+
         if self._state != PlaybackState.PLAYING:
             logger.debug(f"Cannot pause in state {self._state}")
             return False
@@ -789,6 +829,7 @@ class QobuzPlayer:
         await self.backend.stop()
 
         self._state = PlaybackState.STOPPED
+        self._backend_engaged = False
         self._position_value_ms = 0
         self._position_timestamp_ms = int(time.time() * 1000)
 
@@ -837,6 +878,9 @@ class QobuzPlayer:
             # Pause no longer ends the session, so a load-only track change (no
             # immediate play) would otherwise leave the previous play unreported.
             await self._report_stopped()
+
+        # This is a fresh load — the backend has nothing of this track's yet.
+        self._backend_engaged = False
 
         # Create track object. The context UUID identifies the album/playlist the
         # track is played from and is required for Qobuz listening history /
@@ -1093,6 +1137,7 @@ class QobuzPlayer:
 
         # Set loading state
         self._state = PlaybackState.LOADING
+        self._backend_engaged = False
         await self._send_state_update()
 
         try:
@@ -1151,6 +1196,7 @@ class QobuzPlayer:
 
             # Start playback on backend
             await self.backend.play(url, backend_meta)
+            self._backend_engaged = True
 
             # Update state. Report the start position, not 0 — the caller
             # seeks the backend right after, and reporting 0 first makes the
@@ -1605,6 +1651,13 @@ class QobuzPlayer:
                     # Try to arm gapless if not already armed
                     if not self._gapless_armed:
                         await self._prepare_next_track_for_gapless()
+
+                elif self._state == PlaybackState.PAUSED and not self._backend_engaged:
+                    # Cold pause (see _pause_locked) — the backend was never
+                    # actually started for this track, so there's nothing on
+                    # the device to poll; get_state() would just report
+                    # STOPPED and wipe the remembered resume position below.
+                    pass
 
                 elif self._state == PlaybackState.PAUSED:
                     # Keep watching while paused: a pause leaves the play-report
