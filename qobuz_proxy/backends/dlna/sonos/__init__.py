@@ -12,10 +12,13 @@ from .client import SonosClient
 from .discovery import discover_and_enrich
 from .events import GenaSubscription, SonosEventSubscriber
 from .topology import (
+    SonosGroup,
     SonosZoneMember,
     enrich_discovered_devices,
+    fetch_sonos_groups,
     fetch_sonos_topology,
     parse_zone_group_state,
+    parse_zone_groups,
 )
 
 __all__ = [
@@ -23,9 +26,12 @@ __all__ = [
     "SonosBackend",
     "SonosClient",
     "SonosEventSubscriber",
+    "SonosGroup",
     "SonosZoneMember",
     "discover_and_enrich",
     "enrich_discovered_devices",
+    "fetch_sonos_groups",
     "fetch_sonos_topology",
     "parse_zone_group_state",
+    "parse_zone_groups",
 ]
