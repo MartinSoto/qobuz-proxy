@@ -10,6 +10,7 @@ from qobuz_proxy.backends import (
     BackendRegistry,
     BackendTrackMetadata,
     BufferStatus,
+    DLNABackend,
     PlaybackState,
 )
 from qobuz_proxy.config import BackendConfig, Config
@@ -160,6 +161,57 @@ class TestBackendFactory:
         """Test DLNA backend creation fails gracefully when device unavailable."""
         with pytest.raises(BackendNotFoundError):
             await BackendFactory.create_dlna(ip="192.168.1.100")
+
+
+class TestSelectDlnaBackendClass:
+    """BackendFactory._select_dlna_backend_class — a lightweight probe
+    connect that decides DLNABackend vs sonos.SonosBackend before the real
+    one create_dlna() makes, so the right class is constructed instead of
+    a runtime manufacturer flag inside one shared class."""
+
+    def _mock_probe(self, manufacturer: str):  # type: ignore[no-untyped-def]
+        from unittest.mock import AsyncMock, MagicMock
+
+        probe = MagicMock()
+        probe.connect = AsyncMock(return_value=MagicMock(manufacturer=manufacturer))
+        probe.disconnect = AsyncMock()
+        return probe
+
+    async def test_sonos_manufacturer_selects_sonos_backend(self) -> None:
+        from unittest.mock import patch
+
+        from qobuz_proxy.backends.dlna.sonos import SonosBackend
+
+        with patch(
+            "qobuz_proxy.backends.dlna.client.DLNAClient",
+            return_value=self._mock_probe("Sonos, Inc."),
+        ):
+            result = await BackendFactory._select_dlna_backend_class("10.0.1.30", 1400, None)
+
+        assert result is SonosBackend
+
+    async def test_other_manufacturer_selects_generic_backend(self) -> None:
+        from unittest.mock import patch
+
+        with patch(
+            "qobuz_proxy.backends.dlna.client.DLNAClient",
+            return_value=self._mock_probe("Denon"),
+        ):
+            result = await BackendFactory._select_dlna_backend_class("10.0.1.30", 1400, None)
+
+        assert result is DLNABackend
+
+    async def test_probe_failure_falls_back_to_generic_backend(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        probe = MagicMock()
+        probe.connect = AsyncMock(side_effect=ConnectionError("unreachable"))
+        probe.disconnect = AsyncMock()
+
+        with patch("qobuz_proxy.backends.dlna.client.DLNAClient", return_value=probe):
+            result = await BackendFactory._select_dlna_backend_class("10.0.1.30", 1400, None)
+
+        assert result is DLNABackend
 
 
 class TestAudioBackendInterface:
