@@ -11,7 +11,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -295,18 +295,36 @@ def build_protocol_info(
     return f"http-get:*:{mime}:DLNA.ORG_OP=01"
 
 
-# Known device limitations
-DEVICE_OVERRIDES: dict[str, dict[str, int]] = {
-    "Sonos": {"max_sample_rate": 48000, "max_bit_depth": 16},
-}
+# Some devices advertise capabilities they don't fully support. A registered
+# override gets a chance to apply conservative corrections in place, keyed
+# by a case-insensitive substring match against "{manufacturer} {model}".
+# A callback rather than a plain data dict so a manufacturer's override can
+# encode real logic (e.g. a model-dependent decision), not just a fixed set
+# of field replacements — see register_override().
+OverrideFn = Callable[[DLNACapabilities, str, str], None]
+
+_OVERRIDE_REGISTRY: list[tuple[str, OverrideFn]] = []
+
+
+def register_override(manufacturer_substring: str, fn: OverrideFn) -> None:
+    """
+    Register a capability-override callback for devices whose
+    "{manufacturer} {model}" string contains manufacturer_substring
+    (case-insensitive). Only the first matching registration (in
+    registration order) is applied per device.
+
+    Args:
+        manufacturer_substring: Substring to match against the device's
+            manufacturer/model string, e.g. "Sonos".
+        fn: Called as fn(caps, manufacturer, model) to modify caps in place.
+    """
+    _OVERRIDE_REGISTRY.append((manufacturer_substring, fn))
 
 
 def apply_device_overrides(caps: DLNACapabilities, manufacturer: str, model: str) -> None:
     """
-    Apply known device-specific limitations.
-
-    Some devices advertise capabilities they don't fully support.
-    This applies conservative overrides for known devices.
+    Apply the first registered device-specific override that matches this
+    device, if any (see register_override()).
 
     Args:
         caps: Capabilities object to modify in place
@@ -314,12 +332,20 @@ def apply_device_overrides(caps: DLNACapabilities, manufacturer: str, model: str
         model: Device model string
     """
     device_str = f"{manufacturer} {model}".lower()
-    for pattern, overrides in DEVICE_OVERRIDES.items():
+    for pattern, fn in _OVERRIDE_REGISTRY:
         if pattern.lower() in device_str:
-            logger.info(f"Applying {pattern} overrides: {overrides}")
-            for k, v in overrides.items():
-                setattr(caps, k, v)
+            fn(caps, manufacturer, model)
             break
+
+
+def _apply_sonos_overrides(caps: DLNACapabilities, manufacturer: str, model: str) -> None:
+    overrides = {"max_sample_rate": 48000, "max_bit_depth": 16}
+    logger.info(f"Applying Sonos overrides: {overrides}")
+    for k, v in overrides.items():
+        setattr(caps, k, v)
+
+
+register_override("Sonos", _apply_sonos_overrides)
 
 
 # Capability cache
