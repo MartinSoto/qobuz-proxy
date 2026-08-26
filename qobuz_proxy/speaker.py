@@ -152,6 +152,26 @@ class Speaker:
             logger.info(f"[{new_name}] Renamed")
         return ok
 
+    async def retarget(self, ip: str, port: int) -> bool:
+        """
+        Repoint this speaker's backend at a different physical device, in
+        place — the Qobuz Connect session (WebSocket, mDNS registration)
+        is untouched. Delegates to AudioBackend.retarget(), which is a
+        no-op returning False for backends without a meaningful notion of
+        this (e.g. local output).
+
+        Returns:
+            True if the retarget succeeded.
+        """
+        if not self._backend:
+            return False
+
+        ok = await self._backend.retarget(ip, port)
+        if ok:
+            self._config.dlna_ip = ip
+            self._config.dlna_port = port
+        return ok
+
     def get_status(self) -> dict:
         """Return rich status dict for API responses."""
         from qobuz_proxy.config import slugify_name
