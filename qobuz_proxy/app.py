@@ -642,12 +642,25 @@ class QobuzProxy:
         _assign_ports(all_configs, webui_port=self._config.server.http_port)
 
         speaker = Speaker(config=sc, api_client=self._api_client, app_id=self._app_id)
-        started = await speaker.start()
+
+        # Register (name + assigned ports) before the slow part (speaker.start():
+        # DLNA connect, mDNS registration, ...) rather than after. Multiple newly
+        # found rooms are started concurrently (see SonosDiscoveryManager), and
+        # this whole method runs to this point with no `await` in between — so
+        # by the time another concurrently-scheduled call reaches its own name
+        # check / _assign_ports above, it already sees this one reserved and
+        # can't compute a colliding name or port. Rolled back below on failure.
+        self._speakers.append(speaker)
+        try:
+            started = await speaker.start()
+        except Exception:
+            self._speakers.remove(speaker)
+            raise
         if not started:
+            self._speakers.remove(speaker)
             logger.warning(f"Sonos discovery: '{display_name}' failed to start")
             return False
 
-        self._speakers.append(speaker)
         self._sonos_speakers_by_group_id[room.tracking_key] = speaker
         logger.info(f"Sonos discovery: added speaker '{display_name}' ({room.ip})")
         return True

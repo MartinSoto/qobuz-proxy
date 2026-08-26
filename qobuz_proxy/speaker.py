@@ -293,88 +293,14 @@ class Speaker:
             # 1. Build a per-speaker Config for component factories
             component_config = self._build_component_config()
 
-            # 2. Create audio backend
-            logger.debug(f"[{self.name}] Creating audio backend...")
-            backend = await BackendFactory.create_from_config(component_config)
-            self._backend = backend
-            logger.info(f"[{self.name}] Connected to backend: {backend.name}")
-
-            # 3. Resolve effective quality (handle AUTO_QUALITY)
-            self._effective_quality = self._config.max_quality
-            if self._effective_quality == AUTO_QUALITY:
-                if isinstance(backend, DLNABackend):
-                    recommended = backend.get_recommended_quality()
-                    if recommended:
-                        self._effective_quality = recommended
-                        quality_names = {
-                            5: "MP3",
-                            6: "CD (FLAC 16/44)",
-                            7: "Hi-Res (24/96)",
-                            27: "Hi-Res (24/192)",
-                        }
-                        if backend.quality_detection_confirmed:
-                            self._quality_source = "auto"
-                            logger.info(
-                                f"[{self.name}] Auto-detected max quality: "
-                                f"{quality_names.get(self._effective_quality, self._effective_quality)}"
-                            )
-                        else:
-                            self._quality_source = "auto_fallback"
-                            logger.info(
-                                f"[{self.name}] Device did not report its supported "
-                                f"formats; using conservative quality: "
-                                f"{quality_names.get(self._effective_quality, self._effective_quality)}. "
-                                f"Set max_quality manually if the device supports hi-res."
-                            )
-                    else:
-                        self._effective_quality = AUTO_FALLBACK_QUALITY
-                        self._quality_source = "auto_fallback"
-                        logger.info(
-                            f"[{self.name}] Capability discovery unavailable, "
-                            f"using fallback quality: CD (FLAC 16/44)"
-                        )
-                else:
-                    # Local backend: default to Hi-Res 192k
-                    self._effective_quality = 27
-                    self._quality_source = "auto"
-                    logger.info(f"[{self.name}] Local backend, using max quality: Hi-Res (24/192)")
-
-            # 4. Create metadata service
-            logger.debug(f"[{self.name}] Creating metadata service...")
-            self._metadata_service = MetadataService(
-                api_client=self._api_client,
-                max_quality=self._effective_quality,
-            )
-
-            # 5. Create and start audio proxy server (DLNA only)
-            if isinstance(backend, DLNABackend):
-                logger.debug(f"[{self.name}] Starting audio proxy server...")
-                url_provider = MetadataServiceURLProvider(self._metadata_service)
-                self._proxy_server = AudioProxyServer(
-                    url_provider=url_provider,
-                    host=self._config.bind_address,
-                    port=self._config.proxy_port,
-                )
-                await self._proxy_server.start()
-                logger.info(
-                    f"[{self.name}] Audio proxy listening on "
-                    f"{self._config.bind_address}:{self._config.proxy_port}"
-                )
-                backend.set_proxy_server(self._proxy_server)
-
-            # 6. Create queue and player
-            logger.debug(f"[{self.name}] Creating queue and player...")
-            self._queue = QobuzQueue()
-            self._player = QobuzPlayer(
-                queue=self._queue,
-                metadata_service=self._metadata_service,
-                backend=backend,
-                play_reporter=PlayReporter(self._api_client),
-            )
-            if isinstance(backend, DLNABackend):
-                self._player.set_fixed_volume_mode(self._config.dlna_fixed_volume)
-
-            # 7. Create and start discovery service
+            # 2. Create and start discovery service — its constructor is
+            # synchronous, but its actual .start() (mDNS registration: a
+            # fresh Zeroconf() engine plus RFC 6762 probing, typically the
+            # single most expensive step here) touches nothing the backend
+            # chain below builds. quality_getter is a bound method invoked
+            # lazily by an HTTP handler, not resolved now, so the two have
+            # no real dependency — run them concurrently instead of paying
+            # for mDNS registration and DLNA connect back to back.
             logger.debug(f"[{self.name}] Starting discovery service...")
             self._discovery = DiscoveryService(
                 config=component_config,
@@ -383,7 +309,11 @@ class Speaker:
                 quality_getter=self._get_effective_quality,
                 web_app=self._web_app,
             )
-            await self._discovery.start()
+
+            await asyncio.gather(
+                self._discovery.start(),
+                self._connect_backend_and_build_player(component_config),
+            )
             logger.info(f"[{self.name}] Discovery service started on port {self._config.http_port}")
 
             self._is_running = True
@@ -396,6 +326,95 @@ class Speaker:
             logger.error(f"[{self.name}] Failed to start: {e}", exc_info=True)
             await self.stop()
             return False
+
+    async def _connect_backend_and_build_player(self, component_config: Config) -> None:
+        """Connect the audio backend and build the queue/player on top of it.
+
+        Split out of start() so it can run concurrently with
+        DiscoveryService.start() (see there) — sets self._backend,
+        self._effective_quality, self._metadata_service, self._proxy_server,
+        self._queue and self._player.
+        """
+        # Create audio backend
+        logger.debug(f"[{self.name}] Creating audio backend...")
+        backend = await BackendFactory.create_from_config(component_config)
+        self._backend = backend
+        logger.info(f"[{self.name}] Connected to backend: {backend.name}")
+
+        # Resolve effective quality (handle AUTO_QUALITY)
+        self._effective_quality = self._config.max_quality
+        if self._effective_quality == AUTO_QUALITY:
+            if isinstance(backend, DLNABackend):
+                recommended = backend.get_recommended_quality()
+                if recommended:
+                    self._effective_quality = recommended
+                    quality_names = {
+                        5: "MP3",
+                        6: "CD (FLAC 16/44)",
+                        7: "Hi-Res (24/96)",
+                        27: "Hi-Res (24/192)",
+                    }
+                    if backend.quality_detection_confirmed:
+                        self._quality_source = "auto"
+                        logger.info(
+                            f"[{self.name}] Auto-detected max quality: "
+                            f"{quality_names.get(self._effective_quality, self._effective_quality)}"
+                        )
+                    else:
+                        self._quality_source = "auto_fallback"
+                        logger.info(
+                            f"[{self.name}] Device did not report its supported "
+                            f"formats; using conservative quality: "
+                            f"{quality_names.get(self._effective_quality, self._effective_quality)}. "
+                            f"Set max_quality manually if the device supports hi-res."
+                        )
+                else:
+                    self._effective_quality = AUTO_FALLBACK_QUALITY
+                    self._quality_source = "auto_fallback"
+                    logger.info(
+                        f"[{self.name}] Capability discovery unavailable, "
+                        f"using fallback quality: CD (FLAC 16/44)"
+                    )
+            else:
+                # Local backend: default to Hi-Res 192k
+                self._effective_quality = 27
+                self._quality_source = "auto"
+                logger.info(f"[{self.name}] Local backend, using max quality: Hi-Res (24/192)")
+
+        # Create metadata service
+        logger.debug(f"[{self.name}] Creating metadata service...")
+        self._metadata_service = MetadataService(
+            api_client=self._api_client,
+            max_quality=self._effective_quality,
+        )
+
+        # Create and start audio proxy server (DLNA only)
+        if isinstance(backend, DLNABackend):
+            logger.debug(f"[{self.name}] Starting audio proxy server...")
+            url_provider = MetadataServiceURLProvider(self._metadata_service)
+            self._proxy_server = AudioProxyServer(
+                url_provider=url_provider,
+                host=self._config.bind_address,
+                port=self._config.proxy_port,
+            )
+            await self._proxy_server.start()
+            logger.info(
+                f"[{self.name}] Audio proxy listening on "
+                f"{self._config.bind_address}:{self._config.proxy_port}"
+            )
+            backend.set_proxy_server(self._proxy_server)
+
+        # Create queue and player
+        logger.debug(f"[{self.name}] Creating queue and player...")
+        self._queue = QobuzQueue()
+        self._player = QobuzPlayer(
+            queue=self._queue,
+            metadata_service=self._metadata_service,
+            backend=backend,
+            play_reporter=PlayReporter(self._api_client),
+        )
+        if isinstance(backend, DLNABackend):
+            self._player.set_fixed_volume_mode(self._config.dlna_fixed_volume)
 
     async def stop(self, send_device_stop: bool = True) -> None:
         """

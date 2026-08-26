@@ -1,5 +1,6 @@
 """Tests for continuous Sonos household discovery (poll/diff/retry logic)."""
 
+import asyncio
 import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -134,6 +135,58 @@ class TestPollOnce:
         assert found_calls == []
         assert lost_calls == []
         assert "RINCON_A" in manager._known  # untouched, not torn down
+
+    async def test_multiple_added_rooms_are_started_concurrently(self) -> None:
+        """Reaction-time regression: rooms found in the same topology diff
+        must run concurrently (asyncio.gather), not one after another —
+        sequential processing makes startup (and burst-change reaction)
+        time scale linearly with room count. Proven deterministically: the
+        first callback call blocks until the second one has *also* started
+        and signals it — impossible under sequential for-loop processing,
+        where the second call can't start until the first one returns."""
+        arrived = asyncio.Event()
+        count = 0
+        deadlocked = False
+
+        async def on_found(room: SonosRoom) -> bool:
+            nonlocal count, deadlocked
+            count += 1
+            if count == 1:
+                try:
+                    await asyncio.wait_for(arrived.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    deadlocked = True
+            else:
+                arrived.set()
+            return True
+
+        manager, *_ = _make_manager(on_found=on_found)
+
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(
+                f"{MODULE}.fetch_sonos_topology",
+                AsyncMock(
+                    return_value={
+                        "RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30"),
+                        "RINCON_B": _member("RINCON_B", "Bedroom", "10.0.1.31"),
+                    }
+                ),
+            ),
+            patch(
+                f"{MODULE}.fetch_sonos_groups",
+                AsyncMock(
+                    return_value=[
+                        SonosGroup(coordinator_uuid="RINCON_A", member_uuids=["RINCON_A"]),
+                        SonosGroup(coordinator_uuid="RINCON_B", member_uuids=["RINCON_B"]),
+                    ]
+                ),
+            ),
+        ):
+            await manager._poll_once()
+
+        assert not deadlocked
+        assert count == 2
 
     async def test_topology_unavailable_keeps_previous_state(self) -> None:
         manager, found_calls, lost_calls, _renamed_calls, _, _, _ = _make_manager()

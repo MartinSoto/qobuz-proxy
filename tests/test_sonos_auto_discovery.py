@@ -1,5 +1,6 @@
 """Tests for wiring SonosDiscoveryManager into QobuzProxy's speaker lifecycle."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -226,6 +227,88 @@ class TestRoomFoundAndLost:
         app = QobuzProxy(_make_config())
 
         await app._on_sonos_room_lost("RINCON_UNKNOWN", still_present=False)  # must not raise
+
+
+class TestConcurrentRoomFound:
+    """SonosDiscoveryManager now runs _on_sonos_room_found concurrently for
+    multiple rooms discovered in the same batch (startup with several rooms,
+    or several changes landing in one topology diff) — see
+    _apply_topology's use of asyncio.gather. _on_sonos_room_found must
+    register (name + assigned ports) before the slow await speaker.start(),
+    or two concurrent calls both compute against the same stale
+    self._speakers snapshot and collide."""
+
+    async def test_concurrent_finds_get_distinct_ports_and_names(self) -> None:
+        app = QobuzProxy(_make_config())
+        app._api_client = MagicMock()
+
+        def make_speaker(*, config, **_kwargs) -> MagicMock:
+            speaker = _mock_speaker(config.name)
+            speaker._config = config
+
+            async def slow_start() -> bool:
+                # Yield so the other concurrently-scheduled call's own
+                # name/port-assignment prefix runs before this one returns —
+                # reproduces the interleaving a real, slower speaker.start()
+                # (DLNA connect, mDNS registration) would cause.
+                await asyncio.sleep(0)
+                return True
+
+            speaker.start = AsyncMock(side_effect=slow_start)
+            return speaker
+
+        room_a = SonosRoom(
+            uuid="RINCON_A", name="Kitchen", ip="10.0.1.30", port=1400, is_stereo_pair=False
+        )
+        room_b = SonosRoom(
+            uuid="RINCON_B", name="Bedroom", ip="10.0.1.31", port=1400, is_stereo_pair=False
+        )
+
+        with patch("qobuz_proxy.app.Speaker", side_effect=make_speaker):
+            results = await asyncio.gather(
+                app._on_sonos_room_found(room_a),
+                app._on_sonos_room_found(room_b),
+            )
+
+        assert results == [True, True]
+        assert len(app._speakers) == 2
+        ports = {s._config.http_port for s in app._speakers}
+        assert len(ports) == 2, f"expected distinct ports, got {ports}"
+        names = {s._config.name for s in app._speakers}
+        assert names == {"Kitchen", "Bedroom"}
+
+    async def test_a_failed_concurrent_start_rolls_back_its_reservation(self) -> None:
+        app = QobuzProxy(_make_config())
+        app._api_client = MagicMock()
+
+        def make_speaker(*, config, **_kwargs) -> MagicMock:
+            speaker = _mock_speaker(config.name)
+            speaker._config = config
+            fails = config.name == "Bedroom"
+
+            async def slow_start() -> bool:
+                await asyncio.sleep(0)
+                return not fails
+
+            speaker.start = AsyncMock(side_effect=slow_start)
+            return speaker
+
+        room_a = SonosRoom(
+            uuid="RINCON_A", name="Kitchen", ip="10.0.1.30", port=1400, is_stereo_pair=False
+        )
+        room_b = SonosRoom(
+            uuid="RINCON_B", name="Bedroom", ip="10.0.1.31", port=1400, is_stereo_pair=False
+        )
+
+        with patch("qobuz_proxy.app.Speaker", side_effect=make_speaker):
+            results = await asyncio.gather(
+                app._on_sonos_room_found(room_a),
+                app._on_sonos_room_found(room_b),
+            )
+
+        assert results == [True, False]
+        assert [s._config.name for s in app._speakers] == ["Kitchen"]
+        assert "RINCON_B" not in app._sonos_speakers_by_group_id
 
 
 class TestRoomRenamed:

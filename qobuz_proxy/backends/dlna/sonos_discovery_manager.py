@@ -486,23 +486,30 @@ class SonosDiscoveryManager:
                 )
             )
 
-        for key, departed in departures:
-            await self._report_members_departed(key, departed)
-        for key in removed:
-            # Still visible in this snapshot's topology (just not a
-            # coordinator anymore) means it was absorbed as a plain member
-            # into another group, not that it went offline — see
-            # RoomLostCallback.
-            still_present = self._known[key].uuid in members
-            await self._report_lost(key, still_present)
-        for old_key, room in rekeyed:
-            await self._report_rekeyed(old_key, room)
-        for room in added:
-            await self._report_found(room)
-        for room in renamed:
-            await self._report_renamed(room)
-        for room in retargeted:
-            await self._report_retargeted(room)
+        # Each category runs concurrently within itself (distinct rooms/
+        # devices, no shared per-item state — see _report_found's docstring
+        # and app.py's _on_sonos_room_found for the one case, a fresh
+        # speaker's name/port reservation, that needed care to stay safe
+        # under concurrency). Categories stay sequential relative to each
+        # other: a room's departures/loss/rekey must be settled before it's
+        # treated as newly found/renamed/retargeted.
+        await asyncio.gather(
+            *(self._report_members_departed(key, departed) for key, departed in departures)
+        )
+        await asyncio.gather(
+            *(
+                # Still visible in this snapshot's topology (just not a
+                # coordinator anymore) means it was absorbed as a plain
+                # member into another group, not that it went offline —
+                # see RoomLostCallback.
+                self._report_lost(key, self._known[key].uuid in members)
+                for key in removed
+            )
+        )
+        await asyncio.gather(*(self._report_rekeyed(old_key, room) for old_key, room in rekeyed))
+        await asyncio.gather(*(self._report_found(room) for room in added))
+        await asyncio.gather(*(self._report_renamed(room) for room in renamed))
+        await asyncio.gather(*(self._report_retargeted(room) for room in retargeted))
 
     async def _report_members_departed(
         self, tracking_key: str, departed: tuple[DepartedMember, ...]
