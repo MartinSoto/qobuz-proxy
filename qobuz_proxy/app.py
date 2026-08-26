@@ -841,5 +841,12 @@ class QobuzProxy:
         self._sonos_speakers_by_group_id.clear()
 
         if self._speakers:
-            await asyncio.gather(*[s.stop() for s in self._speakers], return_exceptions=True)
+            # Only send a live device Stop to speakers we're actually
+            # driving — shutting down (or logging out) must not interrupt
+            # a merely-discovered, idle Sonos room, the same principle as
+            # _on_sonos_room_lost/_on_sonos_room_members_departed.
+            await asyncio.gather(
+                *[s.stop(send_device_stop=s.is_active) for s in self._speakers],
+                return_exceptions=True,
+            )
             self._speakers = []

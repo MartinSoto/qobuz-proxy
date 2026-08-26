@@ -531,3 +531,38 @@ class TestStopSpeakers:
         mock_manager.stop.assert_awaited_once()
         assert app._sonos_discovery is None
         assert app._sonos_speakers_by_group_id == {}
+
+    async def test_active_speaker_gets_a_device_stop(self) -> None:
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Kitchen")
+        speaker.is_active = True
+        app._speakers.append(speaker)
+
+        await app._stop_speakers()
+
+        speaker.stop.assert_awaited_once_with(send_device_stop=True)
+
+    async def test_idle_speaker_is_not_sent_a_device_stop(self) -> None:
+        # Shutting down (or logging out) must not interrupt a merely
+        # discovered, idle Sonos room nobody is actually playing to.
+        app = QobuzProxy(_make_config())
+        speaker = _mock_speaker("Living Room")
+        speaker.is_active = False
+        app._speakers.append(speaker)
+
+        await app._stop_speakers()
+
+        speaker.stop.assert_awaited_once_with(send_device_stop=False)
+
+    async def test_mixed_active_and_idle_speakers_each_get_the_right_treatment(self) -> None:
+        app = QobuzProxy(_make_config())
+        active_speaker = _mock_speaker("Kitchen")
+        active_speaker.is_active = True
+        idle_speaker = _mock_speaker("Living Room")
+        idle_speaker.is_active = False
+        app._speakers.extend([active_speaker, idle_speaker])
+
+        await app._stop_speakers()
+
+        active_speaker.stop.assert_awaited_once_with(send_device_stop=True)
+        idle_speaker.stop.assert_awaited_once_with(send_device_stop=False)
