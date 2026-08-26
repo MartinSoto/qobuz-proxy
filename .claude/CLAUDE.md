@@ -19,6 +19,7 @@ uv sync --all-extras                        # Also install the local audio backe
 uv run python -m qobuz_proxy
 uv run qobuz-proxy --config config.yaml    # Then visit http://localhost:8689 to log in
 uv run qobuz-proxy --discover              # Find DLNA renderers
+uv run qobuz-proxy --discover-sonos        # Show Sonos household rooms/groups
 
 # Test
 uv run pytest                              # All tests
@@ -57,7 +58,8 @@ Proto files in `protos/`: `qconnect_common.proto`, `qconnect_envelope.proto`, `q
 2. **Connect** (`connect/`): Registers as mDNS device + HTTP discovery endpoints (`discovery.py`), manages WebSocket connection to Qobuz servers (`ws_manager.py`), encodes/decodes protobuf messages (`protocol.py`)
 3. **Playback** (`playback/`): State machine player (`player.py`), queue management (`queue.py`), track metadata from Qobuz API (`metadata.py`), command handlers (`command_handler.py`, `queue_handler.py`, `volume_handler.py`), periodic state reporting to Qobuz app (`state_reporter.py`)
 4. **Backend** (`backends/`): Abstract `AudioBackend` interface (`base.py`), factory/registry pattern (`factory.py`). Two implementations:
-   - **DLNA** (`dlna/`): SOAP/UPnP client (`client.py`), device capability detection (`capabilities.py`), audio proxy server (`proxy_server.py`)
+   - **DLNA** (`dlna/`): SOAP/UPnP client (`client.py`), device capability detection (`capabilities.py`), audio proxy server (`proxy_server.py`, with on-the-fly Hi-Res downsampling via `transcoding_reader.py`/`lazy_flac_source.py`). Deliberately generic — no manufacturer knowledge lives here; see `dlna/sonos/` below.
+   - **Sonos** (`dlna/sonos/`): everything Sonos-specific, layered on the generic DLNA classes via subclassing rather than manufacturer-string branching — `SonosClient`/`SonosBackend` (queue-based playback, whole-group volume), `topology.py`/`discovery_manager.py`/`events.py` (continuous household discovery: SSDP + GENA eventing), `controller.py` (`SonosController`, turning discovered rooms into Speaker/Qobuz Connect sessions — see Sonos Auto-Discovery below). `BackendFactory` picks `DLNABackend` vs `SonosBackend` by probing the device's manufacturer before connecting.
    - **Local** (`local/`): Downloads FLAC, decodes to float32, plays via PortAudio (`backend.py`), ring buffer for streaming (`ring_buffer.py`), sounddevice output stream (`stream.py`). Optional deps: `sounddevice`, `numpy`, `soundfile`
 
 ### Key Data Flows
@@ -72,13 +74,26 @@ Proto files in `protos/`: `qconnect_common.proto`, `qconnect_envelope.proto`, `q
 
 ### Quality Auto-Detection
 
-When `max_quality: auto`: DLNA `GetProtocolInfo` → `capabilities.py` parses Sink string → maps to Qobuz quality (27=Hi-Res 192k, 7=Hi-Res 96k, 6=CD, 5=MP3). Falls back to CD quality (6) on failure.
+When `max_quality: auto`: DLNA `GetProtocolInfo` → `capabilities.py` parses Sink string → maps to Qobuz quality (27=Hi-Res 192k, 7=Hi-Res 96k, 6=CD, 5=MP3). Falls back to CD quality (6) on failure. Manufacturer-specific corrections (e.g. Sonos's 48kHz platform cap) go through `capabilities.py`'s `register_override()` registry rather than hardcoded branches — see `dlna/sonos/capabilities.py` for the one registered today.
+
+### Sonos Auto-Discovery
+
+`sonos_auto_discover: true` (or `QOBUZPROXY_SONOS_AUTO_DISCOVER`) replaces the static `speakers` list with continuous household discovery, mutually exclusive with it. `SonosController` (`dlna/sonos/controller.py`) is what `app.py` starts/stops in that mode — it owns every auto-discovered `Speaker` end to end and is the only thing `app.py` talks to for it (`_all_speakers()` merges its speakers with any manual ones for the web UI/shutdown).
+
+```
+SonosDiscoveryManager (SSDP poll + GENA eventing, Sonos topology only)
+  → found/lost/renamed/retargeted/rekeyed/members_departed callbacks
+  → SonosController (dlna/sonos/controller.py)
+  → Speaker start/stop/rename/retarget (Qobuz Connect session lifecycle)
+```
+
+A group is tracked by its own `group_id` (confirmed stable across a coordinator handoff), not the coordinator's physical `uuid` — so a handoff renames/retargets the existing `Speaker` in place instead of tearing down and recreating it. `generate_sonos_speaker_uuid()` derives the Qobuz Connect device identity from that same `group_id`, so a promoted coordinator computes the identity its predecessor had and the Qobuz app sees a reconnect, not a new device. `Speaker.is_active` (wraps `Player.is_active_renderer`) is what gates whether a departing/idle Sonos room actually gets sent a live device Stop — a room that's merely discovered, not the one Qobuz is actually driving, must never be interrupted.
 
 ## Configuration Priority
 
 1. CLI arguments (highest) → 2. Environment variables → 3. YAML config file → 4. Code defaults
 
-Key env vars: `QOBUZ_AUTH_TOKEN`, `QOBUZ_USER_ID`, `QOBUZ_MAX_QUALITY`, `QOBUZPROXY_BACKEND`, `QOBUZPROXY_DEVICE_NAME`, `QOBUZPROXY_DLNA_IP`, `QOBUZPROXY_AUDIO_DEVICE`, `QOBUZPROXY_LOG_LEVEL`
+Key env vars: `QOBUZ_AUTH_TOKEN`, `QOBUZ_USER_ID`, `QOBUZ_MAX_QUALITY`, `QOBUZPROXY_BACKEND`, `QOBUZPROXY_DEVICE_NAME`, `QOBUZPROXY_DLNA_IP`, `QOBUZPROXY_AUDIO_DEVICE`, `QOBUZPROXY_LOG_LEVEL`, `QOBUZPROXY_SONOS_AUTO_DISCOVER`, `QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING`
 
 ## Code Style
 
