@@ -305,13 +305,15 @@ async def run_discovery(timeout: float, json_output: bool) -> int:
     Returns:
         Exit code
     """
-    from qobuz_proxy.backends.dlna.discovery import DLNADiscovery
+    from qobuz_proxy.backends.dlna.sonos import discover_and_enrich
 
     if not json_output:
         print(f"Scanning for DLNA renderers ({timeout}s timeout)...")
 
-    discovery = DLNADiscovery()
-    devices = await discovery.discover(timeout=timeout)
+    # Sonos-aware: hides bonded stereo pair members/HT satellites and shows
+    # room names instead of raw Sonos friendlyNames when a Sonos household
+    # is present.
+    devices = await discover_and_enrich(timeout=timeout)
 
     if json_output:
         output = {
