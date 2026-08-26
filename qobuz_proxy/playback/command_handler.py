@@ -228,9 +228,15 @@ class PlaybackCommandHandler:
         self.player.set_active_renderer(active)
 
         if active:
-            # A controller just attached. The Qobuz cloud does not seem to replay
-            # our last RndrSrvrVolumeChanged to it, so the device picker can show
-            # an empty volume bar until we re-emit. Push current volume now.
+            # A controller just attached — claim a silent, ready state
+            # (Spotify-Connect-style) rather than leaving whatever's
+            # already playing on a shared renderer, from a completely
+            # different source, running until the app actually picks a
+            # track. Then: the Qobuz cloud does not seem to replay our
+            # last RndrSrvrVolumeChanged to a freshly-attached controller,
+            # so the device picker can show an empty volume bar until we
+            # re-emit — push current volume now.
+            await self.player.claim_device()
             await self.player.broadcast_current_volume()
         else:
             # We're no longer the active renderer - stop playback

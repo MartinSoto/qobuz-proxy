@@ -26,13 +26,39 @@ def _set_active_msg(active: bool):  # type: ignore[no-untyped-def]
 
 class TestSetActiveHandling:
     async def test_active_true_marks_the_player_active(self) -> None:
-        player, _backend = _make_player()
+        player, backend = _make_player()
         handler = PlaybackCommandHandler(player, queue=None)
         player.broadcast_current_volume = AsyncMock()  # type: ignore[method-assign]
+        backend.stop = AsyncMock()  # type: ignore[method-assign]
 
         assert player.is_active_renderer is False  # default, before any message
 
         await handler._handle_set_active(_set_active_msg(True))
+
+        assert player.is_active_renderer is True
+        player.broadcast_current_volume.assert_awaited_once()
+
+    async def test_active_true_claims_the_device(self) -> None:
+        # A shared DLNA/Sonos renderer may already be playing something
+        # from a completely different source when selected — claim a
+        # silent, ready state (Spotify-Connect-style) instead of leaving
+        # it running until the app actually picks a track.
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player, queue=None)
+        player.broadcast_current_volume = AsyncMock()  # type: ignore[method-assign]
+        backend.stop = AsyncMock()  # type: ignore[method-assign]
+
+        await handler._handle_set_active(_set_active_msg(True))
+
+        backend.stop.assert_awaited_once()
+
+    async def test_a_failing_device_stop_does_not_block_activation(self) -> None:
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player, queue=None)
+        player.broadcast_current_volume = AsyncMock()  # type: ignore[method-assign]
+        backend.stop = AsyncMock(side_effect=OSError("unreachable"))  # type: ignore[method-assign]
+
+        await handler._handle_set_active(_set_active_msg(True))  # must not raise
 
         assert player.is_active_renderer is True
         player.broadcast_current_volume.assert_awaited_once()

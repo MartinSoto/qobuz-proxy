@@ -367,6 +367,24 @@ class QobuzPlayer:
         except Exception as e:
             logger.warning(f"Failed to re-broadcast volume: {e}")
 
+    async def claim_device(self) -> None:
+        """Send the physical device a plain stop, without touching our own
+        playback state/reporting (there's nothing of ours to report — we
+        were never playing anything before this).
+
+        Used when we're freshly selected as the active renderer
+        (`SrvrRndrSetActive(active=true)`): a shared DLNA/Sonos renderer
+        may already be playing something from a completely different
+        source (Spotify via AirPlay, the Sonos app, ...) when the Qobuz
+        app selects it. Silencing it on selection — rather than letting
+        that keep going until the app actually picks a track — claims a
+        silent, ready state the same way Spotify Connect does.
+        """
+        try:
+            await self.backend.stop()
+        except Exception as e:
+            logger.warning(f"Failed to stop device on activation: {e}")
+
     # =========================================================================
     # Seek Control
     # =========================================================================
