@@ -71,16 +71,18 @@ class BackendFactory:
 
         # Dispatch to type-specific factory method
         if backend_type == "dlna":
+            ip = config.backend.dlna.ip
+            port = config.backend.dlna.port or 1400
             description_url = config.backend.dlna.description_url or None
             if not description_url:
-                description_url = await cls._discover_description_url(
-                    config.backend.dlna.ip, config.backend.dlna.port or 1400
-                )
+                description_url = await cls._discover_description_url(ip, port)
+            dlna_backend_class = await cls._select_dlna_backend_class(ip, port, description_url)
             return await cls.create_dlna(
-                ip=config.backend.dlna.ip,
-                port=config.backend.dlna.port or 1400,
+                ip=ip,
+                port=port,
                 description_url=description_url,
                 hires_downsampling=config.backend.dlna.hires_downsampling,
+                backend_class=dlna_backend_class,
             )
         elif backend_type == "local":
             return await cls.create_local(
@@ -100,6 +102,7 @@ class BackendFactory:
         name: Optional[str] = None,
         description_url: Optional[str] = None,
         hires_downsampling: bool = False,
+        backend_class: Optional[type[DLNABackend]] = None,
     ) -> AudioBackend:
         """
         Create a DLNA backend.
@@ -112,6 +115,12 @@ class BackendFactory:
             description_url: Full URL to UPnP device description XML
             hires_downsampling: Experimental, opt-in hi-res-with-on-the-fly-
                 downsampling for capable devices — see DLNABackend.__init__.
+            backend_class: Concrete DLNABackend subclass to instantiate.
+                Defaults to the plain generic DLNABackend — pass
+                sonos.SonosBackend for a device already known to be Sonos
+                (see create_from_config's manufacturer probe). A direct
+                caller that doesn't need that distinction (tests, a
+                caller that already knows what it wants) can just omit it.
 
         Returns:
             Connected DLNABackend instance
@@ -119,7 +128,8 @@ class BackendFactory:
         Raises:
             BackendNotFoundError: If connection fails
         """
-        backend = DLNABackend(
+        cls_ = backend_class or DLNABackend
+        backend = cls_(
             ip=ip,
             port=port,
             fixed_volume=fixed_volume,
@@ -130,6 +140,41 @@ class BackendFactory:
         if await backend.connect():
             return backend
         raise BackendNotFoundError(f"Failed to connect to DLNA device at {ip}:{port}")
+
+    @classmethod
+    async def _select_dlna_backend_class(
+        cls, ip: str, port: int, description_url: Optional[str]
+    ) -> type[DLNABackend]:
+        """
+        Probe the device's manufacturer to decide whether to build a plain
+        DLNABackend or a sonos.SonosBackend.
+
+        This is a separate, throwaway connect from the real one
+        create_dlna() makes right after — one extra lightweight
+        HTTP GET (the device description XML) per speaker at startup or
+        retarget, accepted so the *class* is right from construction
+        instead of a runtime manufacturer flag living inside one shared
+        class.
+
+        Falls back to plain DLNABackend (never raises) — a probe failure
+        here isn't fatal, the real connect right after will surface it
+        properly.
+        """
+        from .dlna.client import DLNAClient
+        from .dlna.sonos import SonosBackend
+
+        probe = DLNAClient(ip, port, description_url=description_url)
+        try:
+            device_info = await probe.connect()
+        except Exception as e:
+            logger.debug(f"Could not probe manufacturer for {ip}:{port}: {e}")
+            return DLNABackend
+        finally:
+            await probe.disconnect()
+
+        if "sonos" in (device_info.manufacturer or "").lower():
+            return SonosBackend
+        return DLNABackend
 
     @classmethod
     async def _discover_description_url(cls, target_ip: str, target_port: int) -> Optional[str]:
