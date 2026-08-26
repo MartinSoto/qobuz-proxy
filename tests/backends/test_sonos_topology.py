@@ -6,7 +6,7 @@ from xml.sax.saxutils import escape
 from aiohttp import web
 
 from qobuz_proxy.backends.dlna.discovery import DiscoveredDevice
-from qobuz_proxy.backends.dlna.sonos_topology import (
+from qobuz_proxy.backends.dlna.sonos.topology import (
     enrich_discovered_devices,
     fetch_sonos_topology,
     parse_zone_group_state,
