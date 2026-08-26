@@ -109,56 +109,56 @@ class TestQualityDetectionConfirmed:
         assert backend.quality_detection_confirmed is False
 
 
-class TestSonosGaplessQueue:
-    """Sonos gapless arming appends to the device queue — duplicates replay the song."""
+class TestIsPlayingOurContent:
+    """Detects an external takeover (another source now playing to this
+    renderer) — get_state() alone reports PLAYING either way, so this
+    compares the device's actual current track URI against the one we
+    last set. Standard DLNA: GetMediaInfo.CurrentURI. See
+    test_sonos_backend.py's own TestIsPlayingOurContent for the Sonos
+    queue-playback variant (GetPositionInfo.TrackURI instead)."""
 
-    def _make_sonos_backend(self):
-        from unittest.mock import AsyncMock, MagicMock
+    def _make_backend(self, proxy_url: str = "http://proxy/track.flac"):  # type: ignore[no-untyped-def]
+        from unittest.mock import AsyncMock
 
-        backend = DLNABackend("10.0.0.5")
-        backend._is_sonos = True
-        backend._gapless_supported = True
-        client = MagicMock()
-        client.add_uri_to_queue = AsyncMock(return_value=7)
-        client.remove_track_from_queue = AsyncMock(return_value=True)
-        backend._client = client
-        return backend, client
+        backend = DLNABackend.__new__(DLNABackend)
+        backend._client = AsyncMock()
+        backend._current_proxy_url = proxy_url
+        backend._next_track_proxy_url = None
+        return backend
 
-    async def test_set_next_track_stores_queue_position(self):
-        backend, client = self._make_sonos_backend()
-        meta = _make_metadata(track_id="222")
+    async def test_true_when_uri_matches(self):
+        backend = self._make_backend()
+        backend._client.get_media_info.return_value = "http://proxy/track.flac"
 
-        assert await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+        assert await backend.is_playing_our_content() is True
 
-        client.add_uri_to_queue.assert_awaited_once()
-        assert backend._next_track_queue_nr == 7
+    async def test_false_when_uri_does_not_match(self):
+        backend = self._make_backend()
+        backend._client.get_media_info.return_value = "http://someone-else/spotify-stream"
 
-    async def test_set_next_track_skips_duplicate_url(self):
-        backend, client = self._make_sonos_backend()
-        meta = _make_metadata(track_id="222")
+        assert await backend.is_playing_our_content() is False
 
-        assert await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
-        assert await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+    async def test_true_when_uri_matches_the_armed_next_track(self):
+        # A gapless transition already in flight is a legitimate URI
+        # change, not a takeover.
+        backend = self._make_backend()
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._client.get_media_info.return_value = "http://proxy/next.flac"
 
-        client.add_uri_to_queue.assert_awaited_once()
+        assert await backend.is_playing_our_content() is True
 
-    async def test_clear_next_track_removes_queued_entry(self):
-        backend, client = self._make_sonos_backend()
-        meta = _make_metadata(track_id="222")
-        await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+    async def test_true_when_nothing_of_ours_playing_yet(self):
+        backend = self._make_backend(proxy_url="")
+        backend._current_proxy_url = None
 
-        await backend.clear_next_track()
+        assert await backend.is_playing_our_content() is True
+        backend._client.get_media_info.assert_not_called()
 
-        client.remove_track_from_queue.assert_awaited_once_with(7)
-        assert backend._next_track_queue_nr is None
-        assert backend._next_track_proxy_url is None
+    async def test_true_on_transient_read_failure(self):
+        backend = self._make_backend()
+        backend._client.get_media_info.return_value = None
 
-    async def test_clear_next_track_without_armed_entry_is_noop(self):
-        backend, client = self._make_sonos_backend()
-
-        await backend.clear_next_track()
-
-        client.remove_track_from_queue.assert_not_called()
+        assert await backend.is_playing_our_content() is True
 
 
 class TestRetarget:
@@ -193,7 +193,7 @@ class TestRetarget:
         new_client.connect = AsyncMock(return_value=self._make_device_info())
         new_client.get_protocol_info = AsyncMock(return_value=None)
 
-        with patch("qobuz_proxy.backends.dlna.backend.DLNAClient", return_value=new_client):
+        with patch.object(backend, "_client_class", return_value=new_client):
             result = await backend.retarget("10.0.1.31", 1400)
 
         assert result is True
@@ -220,7 +220,7 @@ class TestRetarget:
         new_client.connect = AsyncMock(return_value=self._make_device_info())
         new_client.get_protocol_info = AsyncMock(return_value=None)
 
-        with patch("qobuz_proxy.backends.dlna.backend.DLNAClient", return_value=new_client):
+        with patch.object(backend, "_client_class", return_value=new_client):
             await backend.retarget("10.0.1.31", 1400)
 
         assert backend._next_track_proxy_url is None
@@ -238,7 +238,7 @@ class TestRetarget:
         new_client.connect = AsyncMock(side_effect=ConnectionError("unreachable"))
         new_client.disconnect = AsyncMock()
 
-        with patch("qobuz_proxy.backends.dlna.backend.DLNAClient", return_value=new_client):
+        with patch.object(backend, "_client_class", return_value=new_client):
             result = await backend.retarget("10.0.1.31", 1400)
 
         assert result is False
@@ -253,7 +253,7 @@ class TestRetarget:
         old_client = AsyncMock()
         backend._client = old_client
 
-        with patch("qobuz_proxy.backends.dlna.backend.DLNAClient") as MockClient:
+        with patch.object(backend, "_client_class") as MockClient:
             result = await backend.retarget("10.0.1.30", 1400)
 
         assert result is True

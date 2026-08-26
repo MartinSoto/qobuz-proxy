@@ -50,7 +50,15 @@ class DLNABackend(AudioBackend):
 
     Note: This backend expects URLs to be provided by the Audio Proxy Server.
     It does not handle URL proxying itself.
+
+    Subclassed by sonos.backend.SonosBackend for Sonos's queue-based
+    playback — this class itself only ever speaks standard DLNA
+    (SetAVTransportURI/SetNextAVTransportURI). _client_class is the seam
+    a subclass overrides to get its own DLNAClient subclass constructed by
+    connect()/retarget() without either needing to know about the other.
     """
+
+    _client_class: type[DLNAClient] = DLNAClient
 
     def __init__(
         self,
@@ -106,12 +114,11 @@ class DLNABackend(AudioBackend):
         # Gapless playback state
         self._next_track_proxy_url: Optional[str] = None
         self._next_track_metadata: Optional[BackendTrackMetadata] = None
-        self._next_track_queue_nr: Optional[int] = None  # Sonos queue position of armed track
+        # Only ever set by SonosBackend's queue-based _arm_next_track — a
+        # generic renderer's SetNextAVTransportURI has no queue position.
+        self._next_track_queue_nr: Optional[int] = None
         self._gapless_supported: bool = True
         self._current_proxy_url: Optional[str] = None
-
-        # Sonos queue-based playback (for Sonos app metadata display)
-        self._is_sonos: bool = False
 
     # =========================================================================
     # Lifecycle
@@ -133,17 +140,14 @@ class DLNABackend(AudioBackend):
     async def connect(self) -> bool:
         """Connect to DLNA device."""
         try:
-            self._client = DLNAClient(self._ip, self._port, description_url=self._description_url)
+            self._client = self._client_class(
+                self._ip, self._port, description_url=self._description_url
+            )
             device_info = await self._client.connect()
 
             # Update name from device
             if device_info.friendly_name:
                 self.name = device_info.friendly_name
-
-            # Detect Sonos devices for queue-based playback
-            self._is_sonos = "sonos" in (device_info.manufacturer or "").lower()
-            if self._is_sonos:
-                logger.info("Sonos device detected — using queue-based playback")
 
             # Query device capabilities
             await self._discover_capabilities(device_info)
@@ -180,7 +184,7 @@ class DLNABackend(AudioBackend):
         if ip == self._ip and port == self._port:
             return True
 
-        new_client = DLNAClient(ip, port, description_url=description_url)
+        new_client = self._client_class(ip, port, description_url=description_url)
         try:
             device_info = await new_client.connect()
         except Exception as e:
@@ -208,7 +212,6 @@ class DLNABackend(AudioBackend):
         self._client = new_client
         if device_info.friendly_name:
             self.name = device_info.friendly_name
-        self._is_sonos = "sonos" in (device_info.manufacturer or "").lower()
 
         # Capabilities can differ between devices (e.g. a different model) —
         # re-detect rather than carry the old target's forward.
@@ -326,11 +329,7 @@ class DLNABackend(AudioBackend):
         # Build DIDL-Lite metadata
         didl = self._build_didl(actual_url, metadata, content_type)
 
-        # Start playback — Sonos uses queue for proper app metadata display
-        if self._is_sonos:
-            success = await self._play_via_queue(actual_url, didl)
-        else:
-            success = await self._play_via_transport(actual_url, didl)
+        success = await self._start_transport(actual_url, didl)
 
         if success:
             self._position_ms = 0
@@ -338,6 +337,14 @@ class DLNABackend(AudioBackend):
             self._playback_started_at = time.monotonic()
             self._notify_state_change(PlaybackState.PLAYING)
             logger.info(f"Playing: {metadata.artist} - {metadata.title}")
+
+    async def _start_transport(self, url: str, didl: str) -> bool:
+        """Actually start playback of an already-registered/DIDL-built URL.
+
+        Standard DLNA: SetAVTransportURI + Play. SonosBackend overrides
+        this to use its AVTransport queue instead (see _play_via_queue).
+        """
+        return await self._play_via_transport(url, didl)
 
     async def _play_via_transport(self, url: str, didl: str) -> bool:
         """Start playback using SetAVTransportURI (standard DLNA).
@@ -383,23 +390,6 @@ class DLNABackend(AudioBackend):
         if not await self._client.play():
             return "play"
         return None
-
-    async def _play_via_queue(self, url: str, didl: str) -> bool:
-        """Start playback using Sonos queue (shows metadata in Sonos app)."""
-        assert self._client
-        if not await self._client.clear_queue():
-            logger.warning("Failed to clear queue, falling back to transport URI")
-            return await self._play_via_transport(url, didl)
-
-        if not await self._client.add_uri_to_queue(url, didl):
-            logger.warning("Failed to add to queue, falling back to transport URI")
-            return await self._play_via_transport(url, didl)
-
-        if await self._client.play_from_queue(0):
-            return True
-
-        self._notify_playback_error("Failed to play from queue")
-        return False
 
     async def pause(self) -> None:
         """Pause playback."""
@@ -499,6 +489,33 @@ class DLNABackend(AudioBackend):
     async def get_buffer_status(self) -> BufferStatus:
         """Get buffer status (always OK for DLNA)."""
         return BufferStatus.OK
+
+    async def is_playing_our_content(self) -> bool:
+        """Compare the device's actual current track URI against the one we
+        last set — a shared DLNA renderer can be handed to a completely
+        different source (another app, someone grouping into it) while
+        still reporting PLAYING throughout, so get_state() alone can't
+        detect this."""
+        if not self._client or not self._current_proxy_url:
+            return True  # nothing of ours to have been displaced yet
+
+        current_uri = await self._get_current_transport_uri()
+        if current_uri is None:
+            return True  # transient read failure — don't false-positive
+
+        # A gapless transition already armed by us is a legitimate URI
+        # change in flight, not a takeover.
+        return current_uri in (self._current_proxy_url, self._next_track_proxy_url)
+
+    async def _get_current_transport_uri(self) -> Optional[str]:
+        """The URI this device reports as its current source — used both
+        for gapless-transition detection (_poll_state_loop) and external-
+        takeover detection (is_playing_our_content). Standard DLNA:
+        GetMediaInfo.CurrentURI is the actual playing track URL.
+        SonosBackend overrides this — Sonos queue playback's
+        GetMediaInfo.CurrentURI is the *queue* URI, not the track URL."""
+        assert self._client
+        return await self._client.get_media_info()
 
     # =========================================================================
     # Info
@@ -647,23 +664,15 @@ class DLNABackend(AudioBackend):
         # Build DIDL-Lite metadata
         didl = self._build_didl(actual_url, metadata, content_type)
 
-        # Send to device — Sonos uses queue, others use SetNextAVTransportURI
-        if self._is_sonos:
-            # Already armed with this URL — appending again would queue a
-            # duplicate entry and make the song play twice
-            if self._next_track_proxy_url == actual_url and self._next_track_queue_nr is not None:
-                logger.debug("Gapless: next track already armed, skipping duplicate")
-                return True
-            queue_nr = await self._client.add_uri_to_queue(actual_url, didl)
-            if queue_nr is not None:
-                self._next_track_proxy_url = actual_url
-                self._next_track_metadata = metadata
-                self._next_track_queue_nr = queue_nr
-                logger.info(f"Gapless: armed next track: {metadata.artist} - {metadata.title}")
-                return True
-            logger.warning("Gapless: failed to add next track to queue")
-            return False
+        return await self._arm_next_track(actual_url, didl, metadata)
 
+    async def _arm_next_track(
+        self, actual_url: str, didl: str, metadata: BackendTrackMetadata
+    ) -> bool:
+        """Actually arm the next track on the device. Standard DLNA:
+        SetNextAVTransportURI. SonosBackend overrides this to append to
+        its AVTransport queue instead."""
+        assert self._client
         result: SoapResult = await self._client.set_next_av_transport_uri(actual_url, didl)
 
         if result.success:
@@ -685,13 +694,7 @@ class DLNABackend(AudioBackend):
         return False
 
     async def clear_next_track(self) -> None:
-        """Clear prepared next track.
-
-        On Sonos the armed track was appended to the device queue, so it must
-        be removed there too — otherwise it still plays after the current track.
-        """
-        if self._is_sonos and self._client and self._next_track_queue_nr is not None:
-            await self._client.remove_track_from_queue(self._next_track_queue_nr)
+        """Clear prepared next track."""
         self._next_track_proxy_url = None
         self._next_track_metadata = None
         self._next_track_queue_nr = None
@@ -724,12 +727,7 @@ class DLNABackend(AudioBackend):
                     and self._next_track_proxy_url
                     and self._client
                 ):
-                    # For Sonos queue playback, GetMediaInfo.CurrentURI returns the
-                    # queue URI, not the track URL. Use GetPositionInfo.TrackURI instead.
-                    if self._is_sonos:
-                        current_uri = await self._client.get_track_uri()
-                    else:
-                        current_uri = await self._client.get_media_info()
+                    current_uri = await self._get_current_transport_uri()
                     if current_uri and current_uri == self._next_track_proxy_url:
                         logger.info("Gapless: transition detected — device moved to next track")
                         # Update state to reflect the new track
