@@ -29,6 +29,10 @@ INITIAL_RECONNECT_DELAY = 1.0  # seconds
 MAX_RECONNECT_DELAY = 60.0  # seconds
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
 
+# How long force_reconnect() holds the connection closed before letting the
+# normal reconnect cycle resume — see its docstring.
+HIJACK_RECONNECT_HOLD_SECONDS = 8.0
+
 # Message handler callback type
 MessageHandler = Callable[[int, Any], None]
 
@@ -88,6 +92,12 @@ class WsManager:
 
         # Quality setting for join session message
         self._max_audio_quality: int = 27  # Default to Hi-Res 192k
+
+        # Whether the *next* JoinSession should (re)claim active-renderer
+        # status — a one-shot override, reset to True right after each
+        # join. False only for the join right after force_reconnect(); see
+        # its docstring and encode_join_session()'s is_active parameter.
+        self._next_join_claims_active: bool = True
 
     def set_tokens(self, tokens: ConnectTokens) -> None:
         """
@@ -174,6 +184,51 @@ class WsManager:
     def is_connected(self) -> bool:
         """Check if currently connected."""
         return self._is_connected
+
+    async def force_reconnect(
+        self, reason: str, hold_seconds: float = HIJACK_RECONNECT_HOLD_SECONDS
+    ) -> None:
+        """
+        Close the current connection and hold off reconnecting for
+        hold_seconds before the normal reconnect cycle resumes.
+
+        The Qobuz Connect protocol has no message for a renderer to
+        voluntarily give up "active" status (confirmed against two
+        independent reverse-engineered implementations — neither
+        documents or sends one), and neither does it for a device that
+        crashes or is powered off — so the server almost certainly relies
+        on its own WS-level heartbeat/timeout to notice a renderer is
+        gone. An immediate reconnect is indistinguishable from a network
+        blip and likely never crosses that threshold; holding the
+        connection closed for a while gives it a real chance to fire.
+        Used when this renderer detects it's no longer really in
+        control — see Player's external-takeover ("hijack") detection.
+
+        Reuses the existing backoff mechanism rather than adding new
+        timing state: setting _reconnect_delay directly makes
+        _connection_loop's very next sleep — which runs right after
+        _connect_and_run() returns from the close() below — wait exactly
+        this long. It resets to normal on the next successful connect,
+        same as any other reconnect.
+
+        Confirmed live: holding the connection closed does make the app
+        fall back to local playback — but by default a rejoin claims
+        isActive again (see encode_join_session()), and the server
+        recognizes the *same* renderer coming back (deviceUuid/
+        sessionUuid — not the display name, which can change anytime) and
+        hands it right back control, evicting whatever the app fell back
+        to. So the rejoin that follows this specific reconnect is made to
+        *not* reclaim active status.
+        """
+        if not self._ws:
+            return
+        logger.info(f"Forcing WebSocket reconnect: {reason} (holding {hold_seconds:.0f}s)")
+        self._reconnect_delay = hold_seconds
+        self._next_join_claims_active = False
+        try:
+            await self._ws.close()
+        except Exception as e:
+            logger.debug(f"Failed to close WebSocket for forced reconnect: {e}")
 
     async def send_message(self, data: bytes) -> bool:
         """
@@ -460,14 +515,21 @@ class WsManager:
             logger.error("No session UUID for join session")
             return
 
+        claims_active = self._next_join_claims_active
+        self._next_join_claims_active = True  # one-shot — restore the default for next time
+
         join_frame = self._codec.encode_join_session(
             device_uuid=self._device_uuid,
             friendly_name=self.config.device.name,
             session_uuid=self._session_uuid,
             max_audio_quality=self._max_audio_quality,
+            is_active=claims_active,
         )
         await self._ws.send(join_frame)
-        logger.debug(f"Sent JOIN_SESSION with max_quality={self._max_audio_quality}")
+        logger.debug(
+            f"Sent JOIN_SESSION with max_quality={self._max_audio_quality}, "
+            f"is_active={claims_active}"
+        )
 
     async def _receive_loop(self) -> None:
         """Receive and dispatch messages."""

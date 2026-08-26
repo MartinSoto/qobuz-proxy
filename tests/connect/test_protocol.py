@@ -126,6 +126,47 @@ class TestEncoding:
         assert len(frame) > 0
         assert frame[0] == MessageType.PAYLOAD
 
+    def test_encode_join_session_defaults_to_claiming_active(
+        self, codec: ProtocolCodec, device_uuid: bytes
+    ) -> None:
+        """A normal (re)connect claims active-renderer status, as before —
+        is_active defaults to True so every existing call site is unaffected."""
+        session_uuid = uuid.UUID("11111111-2222-3333-4444-555555555555").bytes
+        frame = codec.encode_join_session(
+            device_uuid=device_uuid,
+            friendly_name="Test Device",
+            session_uuid=session_uuid,
+        )
+
+        decoded = codec.decode_frame(frame)
+        assert decoded is not None
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        assert batch is not None
+        assert batch.messages[0].rndrSrvrJoinSession.isActive is True
+
+    def test_encode_join_session_can_rejoin_without_claiming_active(
+        self, codec: ProtocolCodec, device_uuid: bytes
+    ) -> None:
+        # Recovering from an external takeover: the server still thinks
+        # this renderer is active, and recognizes it as the *same*
+        # renderer reconnecting (by deviceUuid/sessionUuid, not the
+        # display name) — so a plain rejoin hands control right back,
+        # evicting whatever the app fell back to. is_active=False avoids
+        # reclaiming it.
+        session_uuid = uuid.UUID("11111111-2222-3333-4444-555555555555").bytes
+        frame = codec.encode_join_session(
+            device_uuid=device_uuid,
+            friendly_name="Test Device",
+            session_uuid=session_uuid,
+            is_active=False,
+        )
+
+        decoded = codec.decode_frame(frame)
+        assert decoded is not None
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        assert batch is not None
+        assert batch.messages[0].rndrSrvrJoinSession.isActive is False
+
     def test_encode_device_info_updated(self, codec: ProtocolCodec, device_uuid: bytes) -> None:
         """Test device info updated (rename) message encoding."""
         frame = codec.encode_device_info_updated(
