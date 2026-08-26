@@ -18,6 +18,7 @@ QobuzProxy solves this by acting as a virtual Qobuz Connect device on your netwo
 
 - Appears as a Qobuz Connect device in the official Qobuz app
 - Streams audio to DLNA renderers (Sonos, Denon HEOS, etc.)
+- **Sonos household auto-discovery** — one speaker per room/group, tracking Sonos app changes live with no config edits (see [Sonos Auto-Discovery](#sonos-auto-discovery))
 - Local audio playback via PortAudio (play directly through your machine's speakers/DAC)
 - **Web UI for speaker management** — discover, add, edit, and remove speakers from your browser
 - Auto-detects device capabilities to select optimal audio quality
@@ -136,6 +137,26 @@ speakers:
 ```
 
 Ports are auto-assigned unless explicitly set via `http_port` and `proxy_port`. See `config.yaml.example` for all available options.
+
+### Sonos Auto-Discovery
+
+Instead of listing each Sonos room in `config.yaml`, QobuzProxy can watch your whole Sonos household and manage a speaker per group automatically — grouping/ungrouping rooms in the Sonos app, renaming a room, or a coordinator handoff within a group all update live, with no restart and no config edits.
+
+Enable it with `sonos_auto_discover: true` (or `QOBUZPROXY_SONOS_AUTO_DISCOVER=true` / `--sonos-auto-discover`). This replaces the `speakers` list entirely — the two are mutually exclusive, and a manual `speakers` list is ignored (with a warning) while it's on.
+
+```yaml
+sonos_auto_discover: true
+```
+
+Only group *coordinators* are exposed as Qobuz Connect devices — a grouped room shows up as its group's combined name (e.g. "Kitchen, Living Room"), matching how the Sonos app itself labels an active group.
+
+To see your household's current rooms and groups (coordinators, bonded stereo pairs, and each group's detected streaming quality) without starting the full app:
+
+```bash
+uv run qobuz-proxy --discover-sonos
+```
+
+**Experimental — Hi-Res on Sonos:** every Sonos device is capped at 48kHz by the platform itself, and QobuzProxy conservatively requests CD quality for it by default. Setting `hires_downsampling: true` under `backend.dlna` (or `QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING=true` / `--hires-downsampling`) requests Hi-Res from Qobuz for any Sonos model with real 24-bit support and downsamples a track on the fly if it exceeds the device's 48kHz ceiling, instead of leaving every Sonos stuck at CD quality. Off by default.
 
 ### Network Requirements
 
