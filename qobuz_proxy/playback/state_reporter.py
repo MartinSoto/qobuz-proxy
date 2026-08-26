@@ -177,6 +177,13 @@ class StateReporter:
         # Get current track info
         current_track = self._player.current_track
         queue_item_id = current_track.queue_item_id if current_track else 0
+        # Defense in depth: the outgoing field is a signed int32. A bad
+        # upstream value here (e.g. a not-yet-recognized server sentinel)
+        # must degrade to "no item" rather than crash the report loop with
+        # a protobuf range error every cycle.
+        if not (0 <= queue_item_id <= 0x7FFFFFFF):
+            logger.warning(f"Ignoring out-of-range queue_item_id={queue_item_id}; reporting 0")
+            queue_item_id = 0
 
         # Get position with current timestamp
         now_ms = int(time.time() * 1000)
