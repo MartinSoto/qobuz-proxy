@@ -46,6 +46,14 @@ local = [
     "soundfile>=0.12.1",
 ]
 
+# Optional runtime feature: on-the-fly Hi-Res downsampling for DLNA devices
+# that can't handle a track's native sample rate (see transcoding_reader.py).
+hires = [
+    "numpy>=1.24.0",
+    "soundfile>=0.12.1",
+    "soxr>=0.3.0",
+]
+
 # Development tooling (PEP 735 dependency group). uv installs the `dev` group
 # by default on `uv sync` — see [tool.uv].default-groups below.
 [dependency-groups]
