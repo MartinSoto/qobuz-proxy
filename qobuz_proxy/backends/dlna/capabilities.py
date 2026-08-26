@@ -63,12 +63,21 @@ class DLNACapabilities:
 
     @property
     def max_quality(self) -> int:
-        """Map capabilities to Qobuz quality level (conservative)."""
+        """Map capabilities to Qobuz quality level (conservative).
+
+        A device with real 24-bit support always gets requested Hi-Res
+        (up to 96k), even when its own max_sample_rate is lower than that.
+        Many "Hi-Res" tracks are natively mastered at or below such a
+        device's own cap anyway; on the ones that aren't, the proxy
+        downsamples on the fly instead of falling all the way back to
+        16-bit (see TranscodingFlacReader) — enforcing max_sample_rate is
+        that downstream layer's job, not this one's.
+        """
         if not self.supports_flac:
             return QOBUZ_QUALITY_MP3
         if self.max_bit_depth >= 24 and self.max_sample_rate >= 192000:
             return QOBUZ_QUALITY_192K
-        if self.max_bit_depth >= 24 and self.max_sample_rate >= 96000:
+        if self.max_bit_depth >= 24:
             return QOBUZ_QUALITY_96K
         return QOBUZ_QUALITY_CD
 

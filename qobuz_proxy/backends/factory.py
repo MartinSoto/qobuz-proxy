@@ -80,6 +80,7 @@ class BackendFactory:
                 ip=config.backend.dlna.ip,
                 port=config.backend.dlna.port or 1400,
                 description_url=description_url,
+                hires_downsampling=config.backend.dlna.hires_downsampling,
             )
         elif backend_type == "local":
             return await cls.create_local(
@@ -98,6 +99,7 @@ class BackendFactory:
         fixed_volume: bool = False,
         name: Optional[str] = None,
         description_url: Optional[str] = None,
+        hires_downsampling: bool = False,
     ) -> AudioBackend:
         """
         Create a DLNA backend.
@@ -108,6 +110,8 @@ class BackendFactory:
             fixed_volume: If True, ignore volume commands
             name: Display name (auto-detected if not provided)
             description_url: Full URL to UPnP device description XML
+            hires_downsampling: Experimental, opt-in hi-res-with-on-the-fly-
+                downsampling for capable devices — see DLNABackend.__init__.
 
         Returns:
             Connected DLNABackend instance
@@ -121,6 +125,7 @@ class BackendFactory:
             fixed_volume=fixed_volume,
             name=name,
             description_url=description_url,
+            hires_downsampling=hires_downsampling,
         )
         if await backend.connect():
             return backend

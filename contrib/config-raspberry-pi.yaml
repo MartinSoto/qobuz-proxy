@@ -42,6 +42,11 @@ backend:
     # Audio proxy port for DLNA streaming
     proxy_port: 7120
 
+    # Experimental, opt-in: Hi-Res quality requests + on-the-fly downsampling
+    # for devices with real 24-bit support below Qobuz's 96k tier. Off by
+    # default.
+    hires_downsampling: false
+
 # Server configuration
 server:
   # HTTP port for mDNS discovery (Qobuz app uses this to find device)

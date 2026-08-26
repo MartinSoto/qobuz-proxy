@@ -22,6 +22,11 @@ backend:
     port: 1400                  # DLNA device port
     fixed_volume: false         # Ignore volume commands
     proxy_port: 7120            # Audio proxy port for DLNA streaming
+    # Experimental, opt-in. A device with real 24-bit support gets Hi-Res
+    # requested from Qobuz even below its actual sample-rate ceiling; any
+    # track that exceeds that ceiling is downsampled on the fly instead of
+    # failing or getting stuck at CD quality for everything. Off by default.
+    hires_downsampling: false
     # description_url: ""       # UPnP description XML URL (auto-discovered via SSDP)
   # local:
   #   device: "default"         # Audio device name or "default"
