@@ -9,8 +9,9 @@ import asyncio
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from qobuz_proxy import __commit__, __version__
 from qobuz_proxy.config import Config, ConfigError, load_config, AUTO_QUALITY
@@ -67,6 +68,8 @@ def parse_args() -> argparse.Namespace:
 Examples:
   qobuz-proxy --discover
   qobuz-proxy --discover --timeout 10 --json
+  qobuz-proxy --discover-sonos
+  qobuz-proxy --sonos-auto-discover
   qobuz-proxy --config config.yaml
   qobuz-proxy --email user@example.com --auth-token TOKEN --user-id ID --dlna-ip 192.168.1.50
 
@@ -91,18 +94,23 @@ Environment Variables:
         help="Scan network for DLNA renderers and exit",
     )
     parser.add_argument(
+        "--discover-sonos",
+        action="store_true",
+        help="Scan for Sonos players and show household rooms/groups and exit",
+    )
+    parser.add_argument(
         "--timeout",
         "-t",
         type=float,
         default=3.0,
         metavar="SECONDS",
-        help="Discovery timeout in seconds (used with --discover)",
+        help="Discovery timeout in seconds (used with --discover/--discover-sonos)",
     )
     parser.add_argument(
         "--json",
         action="store_true",
         dest="json_output",
-        help="Output as JSON (used with --discover)",
+        help="Output as JSON (used with --discover/--discover-sonos)",
     )
     parser.add_argument(
         "--list-audio-devices",
@@ -179,6 +187,15 @@ Environment Variables:
         action="store_true",
         help="Ignore volume commands (for external amp control)",
     )
+    dlna_group.add_argument(
+        "--hires-downsampling",
+        action="store_true",
+        help=(
+            "Experimental: request Hi-Res from Qobuz for Sonos devices with "
+            "real 24-bit support and downsample on the fly when a track "
+            "exceeds the device's sample-rate cap (default: off)"
+        ),
+    )
 
     # Local Audio Backend
     local_group = parser.add_argument_group("Local Audio Backend")
@@ -200,6 +217,11 @@ Environment Variables:
         choices=["dlna", "local"],
         metavar="TYPE",
         help="Audio backend type: dlna or local",
+    )
+    parser.add_argument(
+        "--sonos-auto-discover",
+        action="store_true",
+        help="Continuously discover Sonos rooms/groups instead of configured speakers",
     )
 
     # Server
@@ -256,6 +278,7 @@ def args_to_dict(args: argparse.Namespace) -> dict:
         "dlna_ip": ("backend", "dlna", "ip"),
         "dlna_port": ("backend", "dlna", "port"),
         "fixed_volume": ("backend", "dlna", "fixed_volume"),
+        "hires_downsampling": ("backend", "dlna", "hires_downsampling"),
         "audio_device": ("backend", "local", "device"),
         "audio_buffer_size": ("backend", "local", "buffer_size"),
         "backend_type": ("backend", "type"),
@@ -263,14 +286,18 @@ def args_to_dict(args: argparse.Namespace) -> dict:
         "proxy_port": ("backend", "dlna", "proxy_port"),
         "bind": ("server", "bind_address"),
         "log_level": ("logging", "level"),
+        "sonos_auto_discover": ("sonos_auto_discover",),
     }
+
+    # store_true flags: only set (and thus override lower-priority sources)
+    # when the user explicitly passed them, never for their False default.
+    store_true_flags = {"fixed_volume", "hires_downsampling", "sonos_auto_discover"}
 
     for arg_name, path in mappings.items():
         value = getattr(args, arg_name, None)
-        # Skip None values and False for fixed_volume (only set if explicitly True)
         if value is None:
             continue
-        if arg_name == "fixed_volume" and not value:
+        if arg_name in store_true_flags and not value:
             continue
         _set_nested(result, path, value)
 
@@ -286,6 +313,8 @@ def log_config(config: Config) -> None:
             logger.info(f"  DLNA target: {sc.dlna_ip}:{sc.dlna_port}")
             if sc.dlna_fixed_volume:
                 logger.info("  Volume control: disabled (fixed_volume=true)")
+            if sc.dlna_hires_downsampling:
+                logger.info("  Hi-Res downsampling: enabled (experimental)")
             logger.info(f"  Proxy server: {sc.bind_address}:{sc.proxy_port}")
         elif sc.backend_type == "local":
             logger.info(f"  Audio device: {sc.audio_device}")
@@ -360,6 +389,207 @@ async def run_discovery(timeout: float, json_output: bool) -> int:
         print("    dlna:")
         print(f'      ip: "{first.ip}"')
         print(f"      port: {first.port}")
+
+    return EXIT_SUCCESS
+
+
+# Quality ID -> display name, matching speaker.py's quality_names mapping
+QUALITY_NAMES = {5: "MP3", 6: "CD (FLAC 16/44)", 7: "Hi-Res (24/96)", 27: "Hi-Res (24/192)"}
+
+
+@dataclass
+class _CoordinatorQuality:
+    """Max streamable quality for one group's coordinator.
+
+    ``advertised`` is what the device's own GetProtocolInfo Sink claims;
+    ``effective`` is after known-device overrides (see
+    apply_device_overrides in capabilities.py) are applied — i.e. what
+    QobuzProxy would use out of the box, with the experimental
+    hires_downsampling flag off (this diagnostic command has no config
+    context to read it from, so every Sonos here shows the conservative
+    16-bit/48kHz default regardless of model; enabling the flag in a real
+    deployment unlocks 24-bit for most models — see
+    SONOS_16BIT_ONLY_MODELS). They differ from ``advertised`` exactly when
+    an override kicked in.
+    """
+
+    advertised: int
+    effective: int
+    confirmed: bool
+
+
+async def _fetch_coordinator_quality(ip: str, port: int) -> Optional[_CoordinatorQuality]:
+    """Query a group coordinator's max streamable quality via GetProtocolInfo.
+
+    Returns None if the device couldn't be reached or queried.
+    """
+    from qobuz_proxy.backends.dlna.capabilities import (
+        apply_device_overrides,
+        parse_protocol_info_sink,
+    )
+    from qobuz_proxy.backends.dlna.client import DLNAClient
+
+    client = DLNAClient(ip, port)
+    try:
+        device_info = await client.connect()
+        sink = await client.get_protocol_info()
+        if not sink:
+            return None
+        advertised = parse_protocol_info_sink(sink)
+        effective = parse_protocol_info_sink(sink)
+        apply_device_overrides(effective, device_info.manufacturer, device_info.model_name)
+        return _CoordinatorQuality(
+            advertised=advertised.max_quality,
+            effective=effective.max_quality,
+            confirmed=advertised.format_info_confirmed,
+        )
+    except Exception as e:
+        logger.debug(f"Quality query failed for {ip}:{port}: {e}")
+        return None
+    finally:
+        await client.disconnect()
+
+
+async def run_discover_sonos(timeout: float, json_output: bool) -> int:
+    """
+    Discover Sonos players and show household rooms/groups.
+
+    Runs plain SSDP discovery first (to find candidate IPs to query), then
+    fetches the household's ZoneGroupTopology from whichever Sonos device
+    answers first — this shows every room, marks bonded stereo
+    pairs/invisible members, and shows current dynamic groups with each
+    group's coordinator (the player that must be targeted to control
+    playback for the whole group).
+
+    Args:
+        timeout: SSDP discovery timeout in seconds
+        json_output: Output as JSON if True
+
+    Returns:
+        Exit code
+    """
+    from qobuz_proxy.backends.dlna.discovery import discover_dlna_devices
+    from qobuz_proxy.backends.dlna.sonos.topology import fetch_sonos_groups, fetch_sonos_topology
+
+    if not json_output:
+        print(f"Scanning for Sonos players ({timeout}s timeout)...")
+
+    # A plain SSDP scan just needs to find *some* reachable Sonos IP to query
+    # GetZoneGroupState on — that response then describes the whole household
+    # (including members SSDP alone would filter out), so this doesn't need
+    # to find every player.
+    devices = await discover_dlna_devices(timeout=timeout)
+    sonos_devices = [d for d in devices if "sonos" in d.manufacturer.lower()]
+
+    members = await fetch_sonos_topology(sonos_devices)
+    groups = await fetch_sonos_groups(sonos_devices)
+
+    if not members or not groups:
+        if json_output:
+            print(json.dumps({"groups": [], "count": 0}, indent=2))
+        else:
+            print("\nNo Sonos household found.")
+            print("\nTroubleshooting tips:")
+            print("  - Ensure your Sonos players are powered on and connected")
+            print("  - Try increasing timeout with --timeout 10")
+        return EXIT_SUCCESS
+
+    # Query each group's coordinator for its max streamable quality — that's
+    # the only member whose format ceiling matters, since audio reaches the
+    # whole group through it. Concurrent: each is its own SOAP round trip.
+    quality_by_coordinator: dict[str, Optional[_CoordinatorQuality]] = {}
+    coordinators_to_query = {
+        g.coordinator_uuid: members[g.coordinator_uuid]
+        for g in groups
+        if g.coordinator_uuid in members and members[g.coordinator_uuid].ip
+    }
+    if coordinators_to_query:
+        results = await asyncio.gather(
+            *[_fetch_coordinator_quality(m.ip, m.port) for m in coordinators_to_query.values()]
+        )
+        quality_by_coordinator = dict(zip(coordinators_to_query.keys(), results))
+
+    if json_output:
+        output = {
+            "groups": [
+                {
+                    "group_id": g.group_id,
+                    "coordinator_uuid": g.coordinator_uuid,
+                    "coordinator_name": (
+                        members[g.coordinator_uuid].zone_name
+                        if g.coordinator_uuid in members
+                        else ""
+                    ),
+                    "max_quality": (
+                        {
+                            "advertised": q.advertised,
+                            "advertised_name": QUALITY_NAMES.get(q.advertised, str(q.advertised)),
+                            "effective": q.effective,
+                            "effective_name": QUALITY_NAMES.get(q.effective, str(q.effective)),
+                            "confirmed": q.confirmed,
+                        }
+                        if (q := quality_by_coordinator.get(g.coordinator_uuid))
+                        else None
+                    ),
+                    "members": [
+                        {
+                            "uuid": uuid,
+                            "zone_name": member.zone_name,
+                            "ip": member.ip,
+                            "is_coordinator": uuid == g.coordinator_uuid,
+                            "invisible": member.invisible,
+                            "is_stereo_pair": member.is_stereo_pair,
+                        }
+                        for uuid in g.member_uuids
+                        if (member := members.get(uuid)) is not None
+                    ],
+                }
+                for g in groups
+            ],
+            "count": len(groups),
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        print(f"\nSonos household: {len(groups)} group(s), {len(members)} player(s):\n")
+        for g in groups:
+            coordinator_name = (
+                members[g.coordinator_uuid].zone_name if g.coordinator_uuid in members else "?"
+            )
+            print(f"Group — coordinator: {coordinator_name}  [id: {g.group_id or '?'}]")
+
+            quality = quality_by_coordinator.get(g.coordinator_uuid)
+            if quality is None:
+                print("  Max quality: unknown (coordinator unreachable)")
+            elif quality.effective != quality.advertised:
+                print(
+                    f"  Max quality: {QUALITY_NAMES.get(quality.effective, quality.effective)}"
+                    f" (device advertises {QUALITY_NAMES.get(quality.advertised, quality.advertised)}"
+                    f", capped by a known-device override — see apply_device_overrides)"
+                )
+            else:
+                confirmed_note = (
+                    "" if quality.confirmed else " — not confirmed by device, conservative default"
+                )
+                print(
+                    f"  Max quality: {QUALITY_NAMES.get(quality.effective, quality.effective)}"
+                    f"{confirmed_note}"
+                )
+
+            for uuid in g.member_uuids:
+                member = members.get(uuid)
+                if member is None:
+                    continue
+                tags = []
+                if uuid == g.coordinator_uuid:
+                    tags.append("coordinator")
+                if member.is_stereo_pair:
+                    tags.append("stereo pair")
+                if member.invisible:
+                    tags.append("hidden — bonded/satellite")
+                tag_str = f" ({', '.join(tags)})" if tags else ""
+                ip = member.ip or "?"
+                print(f"  • {member.zone_name or uuid:<20} {ip:<15}{tag_str}")
+            print()
 
     return EXIT_SUCCESS
 
@@ -451,6 +681,8 @@ def main() -> int:
 
     if args.discover:
         return asyncio.run(run_discovery(args.timeout, args.json_output))
+    elif args.discover_sonos:
+        return asyncio.run(run_discover_sonos(args.timeout, args.json_output))
     elif args.list_audio_devices:
         return run_list_audio_devices()
     else:
