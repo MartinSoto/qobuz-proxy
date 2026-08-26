@@ -110,6 +110,48 @@ class Speaker:
         """Human-readable speaker name (used as Qobuz Connect device name)."""
         return self._config.name
 
+    async def rename(self, new_name: str) -> bool:
+        """
+        Rename this speaker in place, without restarting playback.
+
+        Updates the mDNS advertisement and, if a Qobuz Connect session is
+        currently joined, sends DEVICE_INFO_UPDATED so the app relabels the
+        device without a reconnect — unlike a full stop/start, this never
+        drops the WebSocket or resets playback state/position. Safe to call
+        repeatedly with the same result (e.g. on a retried failure).
+
+        Returns:
+            True once applied (or already matching — a no-op).
+        """
+        if new_name == self._config.name:
+            return True
+
+        self._config.name = new_name
+
+        # Independent steps: a failure in one (e.g. mDNS) must not skip the
+        # other (e.g. the live app-visible WS rename) — both are safe to
+        # retry, so on any failure the caller retries the whole call, but
+        # each attempt still does everything it can this time around.
+        ok = True
+
+        if self._discovery:
+            try:
+                await self._discovery.update_name(new_name)
+            except Exception as e:
+                logger.warning(f"Failed to update mDNS name to '{new_name}': {e}")
+                ok = False
+
+        if self._ws_manager and self._ws_manager.is_connected:
+            try:
+                await self._ws_manager.send_device_info_updated(new_name)
+            except Exception as e:
+                logger.warning(f"Failed to send device info update for '{new_name}': {e}")
+                ok = False
+
+        if ok:
+            logger.info(f"[{new_name}] Renamed")
+        return ok
+
     def get_status(self) -> dict:
         """Return rich status dict for API responses."""
         from qobuz_proxy.config import slugify_name

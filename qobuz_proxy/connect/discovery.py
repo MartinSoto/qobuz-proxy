@@ -309,6 +309,47 @@ class DiscoveryService:
             f"(as {sanitized_name}) at {local_ip}:{self.config.server.http_port}"
         )
 
+    async def update_name(self, new_name: str) -> None:
+        """
+        Rename this device's mDNS advertisement and HTTP display info, in
+        place — the registered service name (the DNS-SD instance identity,
+        e.g. "Kitchen._qobuz-connect...") is deliberately left unchanged;
+        only the human-readable "Name" property/display_info are updated.
+        Renaming the instance identity itself would mean unregistering and
+        re-registering under a new name, which is unnecessary here since
+        nothing reads that raw instance name as a display label.
+
+        No-ops (beyond updating config.device.name for future HTTP
+        responses) if mDNS isn't registered yet.
+        """
+        self.config.device.name = new_name
+
+        if not self._zeroconf or not self._service_info:
+            return
+
+        properties = dict(self._service_info.properties)
+        properties[b"Name"] = new_name.encode()
+
+        updated_info = ServiceInfo(
+            self._service_info.type,
+            self._service_info.name,
+            addresses=self._service_info.addresses,
+            port=self._service_info.port,
+            properties=properties,
+            # register_service() defaults .server to .name in place when it
+            # was omitted at construction (as _register_mdns does) — but
+            # that mutation only happens on the *original* object.
+            # update_service() has no such fallback and rejects server=None
+            # outright, so it must be carried forward explicitly here.
+            server=self._service_info.server or self._service_info.name,
+        )
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._zeroconf.update_service, updated_info)
+        self._service_info = updated_info
+
+        logger.info(f"Renamed mDNS service display name to '{new_name}'")
+
     async def _unregister_mdns(self) -> None:
         """Unregister mDNS service."""
         if self._zeroconf and self._service_info:

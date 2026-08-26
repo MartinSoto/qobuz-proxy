@@ -239,6 +239,67 @@ class ProtocolCodec:
 
         return self.encode_payload(batch.SerializeToString())
 
+    def _build_device_info(
+        self,
+        device_uuid: bytes,
+        friendly_name: str,
+        max_audio_quality: int,
+    ) -> common_pb2.DeviceInfo:
+        """Build the DeviceInfo message shared by JOIN_SESSION and DEVICE_INFO_UPDATED."""
+        device_info = common_pb2.DeviceInfo()
+        device_info.deviceUuid = device_uuid
+        device_info.friendlyName = friendly_name
+        device_info.brand = "QobuzProxy"
+        device_info.model = "Python"
+        device_info.type = common_pb2.DEVICE_TYPE_SPEAKER
+        device_info.softwareVersion = "py-1.0.0"
+
+        # Device capabilities - map quality ID to protocol value
+        proto_quality = QUALITY_TO_PROTOCOL.get(max_audio_quality, 4)
+        caps = common_pb2.DeviceCapabilities()
+        caps.minAudioQuality = 1
+        caps.maxAudioQuality = proto_quality
+        caps.volumeRemoteControl = 2  # CONTROLLER
+        device_info.capabilities.CopyFrom(caps)
+
+        return device_info
+
+    def encode_device_info_updated(
+        self,
+        device_uuid: bytes,
+        friendly_name: str,
+        max_audio_quality: int = 27,
+    ) -> bytes:
+        """
+        Encode a device info update — renames this renderer on an already-
+        joined session without requiring a fresh JOIN_SESSION (i.e. without
+        dropping the WebSocket / losing playback position).
+
+        Args:
+            device_uuid: 16-byte device UUID (must match the joined session's)
+            friendly_name: New device display name
+            max_audio_quality: Current max quality ID (kept consistent with
+                the DeviceInfo shape JOIN_SESSION sends)
+
+        Returns:
+            Encoded frame bytes
+        """
+        device_info = self._build_device_info(device_uuid, friendly_name, max_audio_quality)
+
+        updated = payload_pb2.RndrSrvrDeviceInfoUpdated()
+        updated.deviceInfo.CopyFrom(device_info)
+
+        qc_msg = payload_pb2.QConnectMessage()
+        qc_msg.messageType = QConnectMessageType.RNDR_SRVR_DEVICE_INFO_UPDATED
+        qc_msg.rndrSrvrDeviceInfoUpdated.CopyFrom(updated)
+
+        batch = payload_pb2.QConnectBatch()
+        batch.messagesTime = self._now_ms()
+        batch.messagesId = self._next_msg_id()
+        batch.messages.append(qc_msg)
+
+        return self.encode_payload(batch.SerializeToString())
+
     def encode_join_session(
         self,
         device_uuid: bytes,
@@ -260,22 +321,7 @@ class ProtocolCodec:
         Returns:
             Encoded frame bytes
         """
-        # Build DeviceInfo
-        device_info = common_pb2.DeviceInfo()
-        device_info.deviceUuid = device_uuid
-        device_info.friendlyName = friendly_name
-        device_info.brand = "QobuzProxy"
-        device_info.model = "Python"
-        device_info.type = common_pb2.DEVICE_TYPE_SPEAKER
-        device_info.softwareVersion = "py-1.0.0"
-
-        # Device capabilities - map quality ID to protocol value
-        proto_quality = QUALITY_TO_PROTOCOL.get(max_audio_quality, 4)
-        caps = common_pb2.DeviceCapabilities()
-        caps.minAudioQuality = 1
-        caps.maxAudioQuality = proto_quality
-        caps.volumeRemoteControl = 2  # CONTROLLER
-        device_info.capabilities.CopyFrom(caps)
+        device_info = self._build_device_info(device_uuid, friendly_name, max_audio_quality)
 
         # Build JoinSession message
         join = payload_pb2.RndrSrvrJoinSession()

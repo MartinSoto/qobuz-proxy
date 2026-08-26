@@ -225,6 +225,29 @@ class WsManager:
         )
         return await self.send_message(data)
 
+    async def send_device_info_updated(self, friendly_name: str) -> bool:
+        """
+        Rename this renderer on an already-joined session, in place.
+
+        Unlike reconnecting with a new JOIN_SESSION, this doesn't drop the
+        WebSocket or reset playback state — the app just relabels the
+        device. Also updates config.device.name so a future reconnect's
+        JOIN_SESSION (if one happens) already carries the new name.
+
+        Args:
+            friendly_name: New device display name
+
+        Returns:
+            True if sent successfully
+        """
+        self.config.device.name = friendly_name
+        data = self._codec.encode_device_info_updated(
+            device_uuid=self._device_uuid,
+            friendly_name=friendly_name,
+            max_audio_quality=self._max_audio_quality,
+        )
+        return await self.send_message(data)
+
     async def send_volume_changed(self, volume: int) -> bool:
         """
         Send volume changed notification.

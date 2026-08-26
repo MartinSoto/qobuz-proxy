@@ -578,3 +578,92 @@ class TestQualitySourceStatus:
         assert cfg["max_quality"] == 27
         assert cfg["effective_quality"] == 27
         assert cfg["quality_source"] == "manual"
+
+
+class TestSpeakerRename:
+    def _make_speaker(self) -> Speaker:
+        return Speaker(
+            config=_make_speaker_config(name="Kitchen"),
+            api_client=_make_api_client(),
+            app_id="app-id",
+        )
+
+    async def test_noop_when_name_unchanged(self):
+        speaker = self._make_speaker()
+        speaker._discovery = MagicMock()
+        speaker._discovery.update_name = AsyncMock()
+
+        result = await speaker.rename("Kitchen")
+
+        assert result is True
+        speaker._discovery.update_name.assert_not_called()
+
+    async def test_updates_mdns_and_sends_device_info_updated_when_connected(self):
+        speaker = self._make_speaker()
+        speaker._discovery = MagicMock()
+        speaker._discovery.update_name = AsyncMock()
+        speaker._ws_manager = MagicMock()
+        speaker._ws_manager.is_connected = True
+        speaker._ws_manager.send_device_info_updated = AsyncMock(return_value=True)
+
+        result = await speaker.rename("Kitchen, Living Room")
+
+        assert result is True
+        assert speaker.name == "Kitchen, Living Room"
+        speaker._discovery.update_name.assert_awaited_once_with("Kitchen, Living Room")
+        speaker._ws_manager.send_device_info_updated.assert_awaited_once_with(
+            "Kitchen, Living Room"
+        )
+
+    async def test_skips_ws_send_when_not_connected(self):
+        speaker = self._make_speaker()
+        speaker._discovery = MagicMock()
+        speaker._discovery.update_name = AsyncMock()
+        speaker._ws_manager = MagicMock()
+        speaker._ws_manager.is_connected = False
+        speaker._ws_manager.send_device_info_updated = AsyncMock()
+
+        result = await speaker.rename("Kitchen, Living Room")
+
+        assert result is True
+        speaker._ws_manager.send_device_info_updated.assert_not_called()
+
+    async def test_works_before_ws_manager_exists(self):
+        speaker = self._make_speaker()
+        speaker._discovery = MagicMock()
+        speaker._discovery.update_name = AsyncMock()
+        # speaker._ws_manager stays None — no app has joined a session yet
+
+        result = await speaker.rename("Kitchen, Living Room")
+
+        assert result is True
+        assert speaker.name == "Kitchen, Living Room"
+
+    async def test_returns_false_on_error(self):
+        speaker = self._make_speaker()
+        speaker._discovery = MagicMock()
+        speaker._discovery.update_name = AsyncMock(side_effect=RuntimeError("boom"))
+
+        result = await speaker.rename("Kitchen, Living Room")
+
+        assert result is False
+
+    async def test_ws_rename_still_attempted_when_mdns_update_fails(self):
+        # Regression: a failure in the mDNS step must not skip the
+        # WS-based rename the app actually reads live — the two are
+        # independent, not one try/except aborting on the first error.
+        speaker = self._make_speaker()
+        speaker._discovery = MagicMock()
+        speaker._discovery.update_name = AsyncMock(
+            side_effect=ValueError("ServiceInfo must have a server")
+        )
+        speaker._ws_manager = MagicMock()
+        speaker._ws_manager.is_connected = True
+        speaker._ws_manager.send_device_info_updated = AsyncMock(return_value=True)
+
+        result = await speaker.rename("Kitchen, Living Room")
+
+        assert result is False  # mDNS did fail — reported, and retried next poll
+        speaker._ws_manager.send_device_info_updated.assert_awaited_once_with(
+            "Kitchen, Living Room"
+        )

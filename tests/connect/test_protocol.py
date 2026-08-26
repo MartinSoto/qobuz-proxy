@@ -126,6 +126,27 @@ class TestEncoding:
         assert len(frame) > 0
         assert frame[0] == MessageType.PAYLOAD
 
+    def test_encode_device_info_updated(self, codec: ProtocolCodec, device_uuid: bytes) -> None:
+        """Test device info updated (rename) message encoding."""
+        frame = codec.encode_device_info_updated(
+            device_uuid=device_uuid,
+            friendly_name="Kitchen, Living Room",
+        )
+
+        assert isinstance(frame, bytes)
+        assert len(frame) > 0
+        assert frame[0] == MessageType.PAYLOAD
+
+        decoded = codec.decode_frame(frame)
+        assert decoded is not None
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        assert batch is not None
+        assert len(batch.messages) == 1
+        msg = batch.messages[0]
+        assert msg.messageType == QConnectMessageType.RNDR_SRVR_DEVICE_INFO_UPDATED
+        assert msg.rndrSrvrDeviceInfoUpdated.deviceInfo.friendlyName == "Kitchen, Living Room"
+        assert msg.rndrSrvrDeviceInfoUpdated.deviceInfo.deviceUuid == device_uuid
+
     def test_encode_volume_changed(self, codec: ProtocolCodec) -> None:
         """Test volume changed message encoding."""
         frame = codec.encode_volume_changed(volume=75)
