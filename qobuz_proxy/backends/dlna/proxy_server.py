@@ -236,22 +236,22 @@ class AudioProxyServer:
 
     async def _handle_head_probe(self, track: RegisteredTrack) -> web.Response:
         """Answer a HEAD probe from upstream headers, without a body transfer."""
-        response = web.Response(
-            status=200,
-            headers={"Content-Type": track.content_type, "Accept-Ranges": "bytes"},
-        )
+        # web.Response computes Content-Length from its body automatically
+        # and refuses `.content_length = ...` afterwards (RuntimeError) — it
+        # has to go in the headers dict at construction time instead.
+        headers = {"Content-Type": track.content_type, "Accept-Ranges": "bytes"}
         timeout = ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
             async with ClientSession(timeout=timeout) as session:
                 async with session.head(track.qobuz_url, allow_redirects=True) as upstream:
                     cl = upstream.headers.get("Content-Length")
                     if upstream.status in (200, 206) and cl and cl.isdigit():
-                        response.content_length = int(cl)
+                        headers["Content-Length"] = cl
         except Exception as e:
             # A probe answer without Content-Length is still useful; renderers
             # mostly check availability and type here.
             logger.debug(f"Upstream HEAD failed for track {track.track_id}: {e}")
-        return response
+        return web.Response(status=200, headers=headers)
 
     async def _proxy_stream(
         self,
