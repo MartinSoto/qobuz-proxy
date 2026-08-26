@@ -90,3 +90,7 @@ warn_unused_ignores = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "slow: real I/O / real timing, seconds not milliseconds — excluded by default, run with `--runslow` or `-m slow`",
+]
+addopts = "-m 'not slow'"
