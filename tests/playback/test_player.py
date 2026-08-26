@@ -326,6 +326,7 @@ class TestResumeChecksBackend:
         player._send_state_update = AsyncMock()
         player._current_track = QueueTrack(queue_item_id=9, track_id="222")
         player._state = PlaybackState.PAUSED
+        player._backend_engaged = True  # a real pause, not a cold one — see player.py
 
         result = await player.play()
 
@@ -339,6 +340,7 @@ class TestResumeChecksBackend:
         backend.resume = AsyncMock(return_value=True)
         player._current_track = QueueTrack(queue_item_id=9, track_id="222")
         player._state = PlaybackState.PAUSED
+        player._backend_engaged = True  # a real pause, not a cold one — see player.py
 
         result = await player.play()
 
