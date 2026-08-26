@@ -197,6 +197,24 @@ class AudioBackend(ABC):
         """Check if backend is connected."""
         return self._is_connected
 
+    async def retarget(self, ip: str, port: int, description_url: Optional[str] = None) -> bool:
+        """
+        Repoint this backend at a different physical device, in place —
+        without dropping whatever session (e.g. a Qobuz Connect join) is
+        built on top of it. Used when the renderer actually driving
+        playback changes without the app-level session changing (e.g. a
+        DHCP address change, or a group coordinator handoff on a backend
+        that groups renderers together).
+
+        Default: not supported, returns False. Backends without a
+        meaningful notion of "the same session, different device" (e.g.
+        local audio output) never need to override this.
+
+        Returns:
+            True if the retarget succeeded.
+        """
+        return False
+
     # =========================================================================
     # Event Callbacks
     # =========================================================================

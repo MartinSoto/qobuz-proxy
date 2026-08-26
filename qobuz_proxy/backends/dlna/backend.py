@@ -153,6 +153,75 @@ class DLNABackend(AudioBackend):
             logger.error(f"Unexpected error connecting to DLNA: {e}", exc_info=True)
             return False
 
+    async def retarget(self, ip: str, port: int, description_url: Optional[str] = None) -> bool:
+        """
+        Repoint this backend at a different DLNA renderer, in place —
+        without dropping whatever session this backend is part of. Used
+        for a group-coordinator handoff or a changed device address: the
+        underlying audio source doesn't need to restart, only where
+        *future* commands go and where state gets polled from.
+
+        On failure, keeps talking to the previous target — the caller
+        should retry.
+
+        Returns:
+            True if the new target connected successfully.
+        """
+        if ip == self._ip and port == self._port:
+            return True
+
+        new_client = DLNAClient(ip, port, description_url=description_url)
+        try:
+            device_info = await new_client.connect()
+        except Exception as e:
+            logger.warning(
+                f"Retarget to {ip}:{port} failed, staying on {self._ip}:{self._port}: {e}"
+            )
+            try:
+                await new_client.disconnect()
+            except Exception:
+                pass
+            return False
+
+        old_client = self._client
+
+        # Gapless state referenced the *old* device's own queue — invalid
+        # on a different physical player.
+        self._next_track_proxy_url = None
+        self._next_track_metadata = None
+        self._next_track_queue_nr = None
+        self._gapless_supported = True
+
+        self._ip = ip
+        self._port = port
+        self._description_url = description_url
+        self._client = new_client
+        if device_info.friendly_name:
+            self.name = device_info.friendly_name
+        self._is_sonos = "sonos" in (device_info.manufacturer or "").lower()
+
+        # Capabilities can differ between devices (e.g. a different model) —
+        # re-detect rather than carry the old target's forward.
+        self._capabilities = None
+        await self._discover_capabilities(device_info)
+
+        if old_client is not None:
+            # Just release the connection here — whether the old device
+            # should also be told to stop is a decision this backend has
+            # no visibility into (that depends on state above it, e.g.
+            # whether it's still the one actually being driven).
+            try:
+                await old_client.disconnect()
+            except Exception:
+                # Anything still in flight on it just fails — the same
+                # class of transient error existing retry/error-handling
+                # already tolerates, and it no longer matters: we're not
+                # talking to that device anymore.
+                pass
+
+        logger.info(f"Retargeted DLNA backend to {self.name} ({ip}:{port})")
+        return True
+
     async def _discover_capabilities(self, device_info) -> None:
         """Query and parse device capabilities."""
         # Check cache first

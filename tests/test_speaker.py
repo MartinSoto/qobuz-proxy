@@ -667,3 +667,59 @@ class TestSpeakerRename:
         speaker._ws_manager.send_device_info_updated.assert_awaited_once_with(
             "Kitchen, Living Room"
         )
+
+
+class TestSpeakerRetarget:
+    def _make_speaker(self) -> Speaker:
+        return Speaker(
+            config=_make_speaker_config(name="Kitchen", dlna_ip="10.0.1.30"),
+            api_client=_make_api_client(),
+            app_id="app-id",
+        )
+
+    async def test_retargets_dlna_backend_and_updates_config(self):
+        from qobuz_proxy.backends.dlna import DLNABackend
+
+        speaker = self._make_speaker()
+        speaker._backend = DLNABackend("10.0.1.30", 1400)
+        speaker._backend.retarget = AsyncMock(return_value=True)
+
+        result = await speaker.retarget("10.0.1.31", 1400)
+
+        assert result is True
+        speaker._backend.retarget.assert_awaited_once_with("10.0.1.31", 1400)
+        assert speaker._config.dlna_ip == "10.0.1.31"
+        assert speaker._config.dlna_port == 1400
+
+    async def test_returns_false_when_backend_retarget_fails(self):
+        from qobuz_proxy.backends.dlna import DLNABackend
+
+        speaker = self._make_speaker()
+        speaker._backend = DLNABackend("10.0.1.30", 1400)
+        speaker._backend.retarget = AsyncMock(return_value=False)
+
+        result = await speaker.retarget("10.0.1.31", 1400)
+
+        assert result is False
+        assert speaker._config.dlna_ip == "10.0.1.30"  # unchanged
+
+    async def test_returns_false_for_a_backend_that_does_not_support_retargeting(self):
+        # AudioBackend.retarget()'s base default — a backend not meaningfully
+        # "the same session, different device" (e.g. local output) never
+        # overrides it.
+        from qobuz_proxy.backends.local.backend import LocalAudioBackend
+
+        speaker = self._make_speaker()
+        speaker._backend = LocalAudioBackend()
+
+        result = await speaker.retarget("10.0.1.31", 1400)
+
+        assert result is False
+
+    async def test_returns_false_with_no_backend_at_all(self):
+        speaker = self._make_speaker()
+        assert speaker._backend is None
+
+        result = await speaker.retarget("10.0.1.31", 1400)
+
+        assert result is False
