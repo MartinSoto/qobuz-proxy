@@ -10,6 +10,7 @@ from . import capabilities as _capabilities  # noqa: F401 — registers the Sono
 from .backend import SonosBackend
 from .client import SonosClient
 from .discovery import discover_and_enrich
+from .discovery_manager import DepartedMember, SonosDiscoveryManager, SonosRoom
 from .events import GenaSubscription, SonosEventSubscriber
 from .topology import (
     SonosGroup,
@@ -22,11 +23,14 @@ from .topology import (
 )
 
 __all__ = [
+    "DepartedMember",
     "GenaSubscription",
     "SonosBackend",
     "SonosClient",
+    "SonosDiscoveryManager",
     "SonosEventSubscriber",
     "SonosGroup",
+    "SonosRoom",
     "SonosZoneMember",
     "discover_and_enrich",
     "enrich_discovered_devices",
