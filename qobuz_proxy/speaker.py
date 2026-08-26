@@ -110,6 +110,15 @@ class Speaker:
         """Human-readable speaker name (used as Qobuz Connect device name)."""
         return self._config.name
 
+    @property
+    def is_active(self) -> bool:
+        """Whether the Qobuz server currently considers this Speaker the
+        active playback target (SrvrRndrSetActive) — the authoritative
+        signal for "is this the renderer actually being played to right
+        now", as opposed to one that's merely discovered and available. At
+        most one Speaker is ever active at a time."""
+        return self._player is not None and self._player.is_active_renderer
+
     async def rename(self, new_name: str) -> bool:
         """
         Rename this speaker in place, without restarting playback.
@@ -224,6 +233,7 @@ class Speaker:
             "status": playback_status,
             "config": config_dict,
             "now_playing": now_playing,
+            "auto_managed": self._config.auto_managed,
         }
 
     def _build_component_config(self) -> Config:

@@ -62,6 +62,8 @@ ENV_MAPPINGS = {
     "QOBUZPROXY_PROXY_PORT": ("backend", "dlna", "proxy_port"),
     # Logging
     "QOBUZPROXY_LOG_LEVEL": ("logging", "level"),
+    # Sonos auto-discovery (replaces the `speakers` list when enabled)
+    "QOBUZPROXY_SONOS_AUTO_DISCOVER": ("sonos_auto_discover",),
 }
 
 
@@ -159,6 +161,11 @@ class SpeakerConfig:
     proxy_port: int = 0  # 0 = auto-assign
     audio_device: str = "default"
     audio_buffer_size: int = 2048
+    # True for speakers created by an auto-discovery mechanism (e.g. Sonos
+    # household discovery) rather than user config. Never appended to
+    # Config.speakers / persisted to config.yaml — they're re-derived from
+    # the network instead.
+    auto_managed: bool = False
 
 
 @dataclass
@@ -171,6 +178,10 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     speakers: list[SpeakerConfig] = field(default_factory=list)
+    # When True, speakers come from continuous Sonos household discovery
+    # instead of the `speakers` list above (which is ignored, with a
+    # warning, if also set) — no manual per-room configuration needed.
+    sonos_auto_discover: bool = False
     config_path: Optional[Path] = None  # Set by load_config() when loading from file
 
 
@@ -238,6 +249,20 @@ def validate_config(config: Config) -> None:
 def generate_speaker_uuid(speaker_name: str) -> str:
     """Generate a deterministic UUID for a speaker based on hostname and name."""
     return str(uuid.uuid5(_SPEAKER_UUID_NAMESPACE, f"{platform.node()}:{speaker_name}"))
+
+
+def generate_sonos_speaker_uuid(sonos_identity_key: str) -> str:
+    """Generate a deterministic UUID for an auto-discovered Sonos speaker.
+
+    Keyed by a stable Sonos-side identifier — a group's `group_id` (a
+    coordinator handoff keeps the same group_id, confirmed against a real
+    household, so the promoted coordinator's Speaker computes the same
+    device identity its predecessor had) or, failing that, a player's own
+    RINCON uuid — rather than `hostname:name` like generate_speaker_uuid.
+    Either way this must survive DHCP IP changes and renames, neither of
+    which affect the input.
+    """
+    return str(uuid.uuid5(_SPEAKER_UUID_NAMESPACE, f"sonos:{sonos_identity_key}"))
 
 
 def slugify_name(name: str) -> str:
@@ -567,6 +592,7 @@ def load_env_config() -> dict:
             elif env_var in (
                 "QOBUZPROXY_DLNA_FIXED_VOLUME",
                 "QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING",
+                "QOBUZPROXY_SONOS_AUTO_DISCOVER",
             ):
                 value = value.lower() in ("true", "1", "yes", "on")
 
@@ -663,6 +689,10 @@ def dict_to_config(d: dict) -> Config:
     # Logging
     if "logging" in d:
         config.logging.level = d["logging"].get("level", config.logging.level)
+
+    # Sonos auto-discovery
+    if "sonos_auto_discover" in d:
+        config.sonos_auto_discover = bool(d["sonos_auto_discover"])
 
     return config
 

@@ -30,6 +30,8 @@ from qobuz_proxy.config import (
     _generate_uuids,
     slugify_name,
 )
+from qobuz_proxy.backends.dlna.sonos import SonosController
+from qobuz_proxy.backends.dlna.sonos.events import SonosEventSubscriber
 from qobuz_proxy.speaker import Speaker
 from qobuz_proxy.webui.config_writer import save_config
 from qobuz_proxy.webui.routes import register_routes
@@ -77,12 +79,24 @@ class QobuzProxy:
         self._web_app: Optional[web.Application] = None
         self._web_runner: Optional[web.AppRunner] = None
         self._web_site: Optional[web.TCPSite] = None
+        # Its GENA NOTIFY route must be registered before the app starts
+        # serving (aiohttp freezes the router afterwards), but a
+        # SonosController to actually use it only exists post-login — so
+        # this is created unconditionally in _start_web_server(), and
+        # SonosController attaches/detaches as it starts/stops.
+        self._sonos_event_subscriber: Optional[SonosEventSubscriber] = None
 
         # Speakers
         self._speakers: list[Speaker] = []
         # Background retry tasks for speakers that failed to start, keyed by
         # slugified speaker name. Also keeps strong references to the tasks.
         self._speaker_retry_tasks: dict[str, asyncio.Task[None]] = {}
+
+        # Sonos auto-discovery (mutually exclusive with config.speakers —
+        # see _start_speakers). Owns its own Speakers end to end; see
+        # _all_speakers() for where its speakers join self._speakers for
+        # cross-cutting concerns (the web UI's list, app-wide shutdown).
+        self._sonos_controller: Optional[SonosController] = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -257,16 +271,27 @@ class QobuzProxy:
 
     async def _on_add_speaker(self, body: dict) -> dict:
         """Add a new speaker at runtime."""
+        if self._config.sonos_auto_discover:
+            # A manually-added speaker would run until the next restart, then
+            # silently vanish — auto-discovery skips config.speakers on boot,
+            # so it's never read back. Reject rather than trap the user.
+            raise ValueError(
+                "Manual speaker configuration is disabled while sonos_auto_discover is enabled"
+            )
+
         name = body["name"].strip()
         backend_type = body.get("backend", "dlna")
 
         # Check for duplicate names against the config — a speaker can exist in
         # config without running (e.g. its device is offline), and a duplicate
-        # name in the saved config prevents the app from booting.
+        # name in the saved config prevents the app from booting. Also check
+        # currently running speakers, which can include ones not in config.
         new_id = slugify_name(name)
         for sc_existing in self._config.speakers:
             if slugify_name(sc_existing.name) == new_id:
                 raise ValueError(f"Speaker '{name}' already exists")
+        if any(slugify_name(s.name) == new_id for s in self._speakers):
+            raise ValueError(f"Speaker '{name}' already exists")
 
         # Build SpeakerConfig
         quality_raw = body.get("max_quality", "auto")
@@ -432,7 +457,7 @@ class QobuzProxy:
 
         # Expose state for route handlers
         self._web_app["auth_state"] = self._auth_state
-        self._web_app["get_speakers"] = lambda: [s.get_status() for s in self._speakers]
+        self._web_app["get_speakers"] = lambda: [s.get_status() for s in self._all_speakers()]
         self._web_app["version"] = __version__
         self._web_app["commit"] = __commit__
         self._web_app["http_port"] = self._config.server.http_port
@@ -446,6 +471,12 @@ class QobuzProxy:
         ).lower() in ("true", "1", "yes")
 
         register_routes(self._web_app)
+
+        # Registered unconditionally (cheap — an idle route that 412s until
+        # a SonosController claims it) since routes can't be added once the
+        # runner below freezes the router.
+        self._sonos_event_subscriber = SonosEventSubscriber()
+        self._sonos_event_subscriber.register_route(self._web_app)
 
         self._web_runner = web.AppRunner(self._web_app, access_log=None)
         await self._web_runner.setup()
@@ -471,14 +502,32 @@ class QobuzProxy:
     # Speaker lifecycle
     # ------------------------------------------------------------------
 
+    def _all_speakers(self) -> list[Speaker]:
+        """Every currently-running speaker, manual or Sonos-auto-discovered
+        — the two are mutually exclusive (see _start_speakers), but this
+        is the single list cross-cutting concerns (the web UI, an app-wide
+        shutdown) should read instead of picking one source themselves."""
+        if self._sonos_controller is not None:
+            return self._speakers + self._sonos_controller.speakers
+        return self._speakers
+
     async def _start_speakers(self) -> None:
-        """Create and start Speaker instances from config.
+        """Create and start Speaker instances from config, or hand off to
+        continuous Sonos household discovery.
 
         Speakers that fail to start (e.g. the renderer is still booting or
         temporarily unreachable) are retried in the background instead of
         being dropped until the next restart.
         """
         assert self._api_client is not None
+
+        if self._config.sonos_auto_discover:
+            if self._config.speakers:
+                logger.warning(
+                    "sonos_auto_discover is enabled — ignoring the configured 'speakers' list"
+                )
+            await self._start_sonos_controller()
+            return
 
         if not self._config.speakers:
             port = self._config.server.http_port
@@ -520,6 +569,23 @@ class QobuzProxy:
         port = self._config.server.http_port
         logger.info(f"qobuz-proxy ready — {len(self._speakers)} speaker(s): {names}")
         logger.info(f"Web UI: http://localhost:{port}")
+
+    async def _start_sonos_controller(self) -> None:
+        """Start continuous Sonos household discovery in place of config.speakers."""
+        assert self._api_client is not None
+        if self._sonos_controller is not None:
+            return  # already running (e.g. re-login after logout)
+
+        assert self._sonos_event_subscriber is not None
+        self._sonos_controller = SonosController(
+            api_client=self._api_client,
+            app_id=self._app_id,
+            webui_http_port=self._config.server.http_port,
+            event_subscriber=self._sonos_event_subscriber,
+            hires_downsampling=self._config.backend.dlna.hires_downsampling,
+        )
+        await self._sonos_controller.start()
+        logger.info(f"Web UI: http://localhost:{self._config.server.http_port}")
 
     def _schedule_speaker_retry(self, config: SpeakerConfig) -> None:
         """Start (or keep) a background task retrying a failed speaker."""
@@ -586,6 +652,16 @@ class QobuzProxy:
             task.cancel()
         self._speaker_retry_tasks.clear()
 
+        if self._sonos_controller is not None:
+            await self._sonos_controller.stop()
+            self._sonos_controller = None
+
         if self._speakers:
-            await asyncio.gather(*[s.stop() for s in self._speakers], return_exceptions=True)
+            # Only send a live device Stop to a speaker actually being
+            # driven (Speaker.is_active) — shutting down (or logging out)
+            # must not interrupt a renderer nobody has selected in the app.
+            await asyncio.gather(
+                *[s.stop(send_device_stop=s.is_active) for s in self._speakers],
+                return_exceptions=True,
+            )
             self._speakers = []
