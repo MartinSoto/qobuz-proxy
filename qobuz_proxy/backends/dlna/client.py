@@ -59,6 +59,12 @@ class DLNADeviceInfo:
     av_transport_url: str = ""
     rendering_control_url: str = ""
     connection_manager_url: str = ""
+    # Present only on a device that groups renderers together and exposes
+    # a group-wide volume control (in practice: a Sonos coordinator) — see
+    # sonos.client.SonosClient, the only thing that ever reads this. Just
+    # recorded here as what the device's own description advertises; a
+    # generic DLNAClient never acts on it.
+    group_rendering_control_url: str = ""
 
 
 class DLNAClientError(Exception):
@@ -619,15 +625,20 @@ class DLNAClient:
                     else:
                         info.av_transport_url = control_url
 
+                elif "GroupRenderingControl" in service_type and control_url:
+                    # Captured separately from (and doesn't compete with)
+                    # plain RenderingControl below — see DLNADeviceInfo's
+                    # own docstring for this field.
+                    if control_url.startswith("/"):
+                        info.group_rendering_control_url = base_url + control_url
+                    else:
+                        info.group_rendering_control_url = control_url
+
                 elif "RenderingControl" in service_type and control_url:
-                    # Prefer standard RenderingControl over GroupRenderingControl
-                    # GroupRenderingControl is Sonos-specific and uses different API
-                    is_standard = "GroupRenderingControl" not in service_type
-                    if is_standard or not info.rendering_control_url:
-                        if control_url.startswith("/"):
-                            info.rendering_control_url = base_url + control_url
-                        else:
-                            info.rendering_control_url = control_url
+                    if control_url.startswith("/"):
+                        info.rendering_control_url = base_url + control_url
+                    else:
+                        info.rendering_control_url = control_url
 
                 elif "ConnectionManager" in service_type and control_url:
                     if control_url.startswith("/"):
@@ -644,7 +655,8 @@ class DLNAClient:
         )
         logger.debug(
             f"Service URLs: AVTransport={info.av_transport_url}, "
-            f"RenderingControl={info.rendering_control_url}"
+            f"RenderingControl={info.rendering_control_url}, "
+            f"GroupRenderingControl={info.group_rendering_control_url}"
         )
         return info
 
