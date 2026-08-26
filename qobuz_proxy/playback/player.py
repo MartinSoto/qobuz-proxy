@@ -207,8 +207,14 @@ class QobuzPlayer:
 
         logger.info("Player started")
 
-    async def stop(self) -> None:
-        """Stop the player and clean up."""
+    async def stop(self, send_device_stop: bool = True) -> None:
+        """Stop the player and clean up.
+
+        Args:
+            send_device_stop: Forwarded to backend.disconnect() — set False
+                when the device shouldn't actually be told to stop (see
+                AudioBackend.disconnect()).
+        """
         self._is_running = False
 
         # Cancel background tasks
@@ -228,7 +234,7 @@ class QobuzPlayer:
         await self.queue.stop()
 
         # Disconnect backend
-        await self.backend.disconnect()
+        await self.backend.disconnect(send_device_stop=send_device_stop)
 
         logger.info("Player stopped")
 

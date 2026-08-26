@@ -52,7 +52,7 @@ class ConcurrencyTrackingBackend(AudioBackend):
     async def connect(self) -> bool:
         return True
 
-    async def disconnect(self) -> None: ...
+    async def disconnect(self, send_device_stop: bool = True) -> None: ...
 
 
 def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:

@@ -556,7 +556,9 @@ class LocalAudioBackend(AudioBackend):
             logger.error(f"Failed to initialize audio device: {e}")
             return False
 
-    async def disconnect(self) -> None:
+    async def disconnect(self, send_device_stop: bool = True) -> None:
+        # send_device_stop doesn't apply here — there's no external device
+        # to interfere with, just our own local audio stream to tear down.
         await self.stop()
         if self._stream:
             self._stream.close()
