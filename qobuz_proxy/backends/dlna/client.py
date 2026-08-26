@@ -24,6 +24,10 @@ SOAP_ENVELOPE_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 UPNP_AV_TRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
 UPNP_RENDERING_CONTROL = "urn:schemas-upnp-org:service:RenderingControl:1"
 UPNP_CONNECTION_MANAGER = "urn:schemas-upnp-org:service:ConnectionManager:1"
+# Sonos-specific: controls the volume of an entire dynamic group (all its
+# members scaled together) via the coordinator, rather than just the
+# coordinator's own speaker. See DLNADeviceInfo.group_rendering_control_url.
+UPNP_GROUP_RENDERING_CONTROL = "urn:schemas-upnp-org:service:GroupRenderingControl:1"
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -59,6 +63,10 @@ class DLNADeviceInfo:
     av_transport_url: str = ""
     rendering_control_url: str = ""
     connection_manager_url: str = ""
+    # Sonos-specific group volume control — set only when the device exposes
+    # GroupRenderingControl (i.e. it's a Sonos coordinator). Empty for plain
+    # DLNA renderers (Denon HEOS, etc.), which have no concept of a group.
+    group_rendering_control_url: str = ""
 
 
 class DLNAClientError(Exception):
@@ -406,18 +414,32 @@ class DLNAClient:
         """
         Get current volume.
 
+        On a Sonos coordinator this is the *group* volume (GroupRenderingControl)
+        so it reflects what the Sonos app itself shows for the group, not just
+        this one speaker — see set_volume().
+
         Returns:
             Volume 0-100
         """
-        if not self.device_info or not self.device_info.rendering_control_url:
+        if not self.device_info:
             return None
 
-        response = await self._soap_action(
-            self.device_info.rendering_control_url,
-            UPNP_RENDERING_CONTROL,
-            "GetVolume",
-            {"InstanceID": "0", "Channel": "Master"},
-        )
+        if self.device_info.group_rendering_control_url:
+            response = await self._soap_action(
+                self.device_info.group_rendering_control_url,
+                UPNP_GROUP_RENDERING_CONTROL,
+                "GetGroupVolume",
+                {"InstanceID": "0"},
+            )
+        elif self.device_info.rendering_control_url:
+            response = await self._soap_action(
+                self.device_info.rendering_control_url,
+                UPNP_RENDERING_CONTROL,
+                "GetVolume",
+                {"InstanceID": "0", "Channel": "Master"},
+            )
+        else:
+            return None
 
         if response:
             vol_str = self._parse_xml_value(response, "CurrentVolume")
@@ -431,10 +453,18 @@ class DLNAClient:
 
         Rate limits volume commands but ensures the final value is always sent.
 
+        On a Sonos coordinator this sets the whole *group's* volume
+        (GroupRenderingControl), which Sonos itself scales proportionally
+        across every member — matching what the Sonos app's own volume
+        slider does for a group, instead of moving only the one physical
+        speaker we happen to be connected to.
+
         Args:
             volume: Volume 0-100
         """
-        if not self.device_info or not self.device_info.rendering_control_url:
+        if not self.device_info or not (
+            self.device_info.group_rendering_control_url or self.device_info.rendering_control_url
+        ):
             logger.warning("Cannot set volume: no RenderingControl URL")
             return False
 
@@ -467,21 +497,46 @@ class DLNAClient:
                 await self._do_set_volume(volume)
 
     async def _do_set_volume(self, volume: int) -> bool:
-        """Actually send the volume command."""
-        if not self.device_info or not self.device_info.rendering_control_url:
+        """Actually send the volume command — group volume when available."""
+        if not self.device_info:
             return False
+
+        if self.device_info.group_rendering_control_url:
+            # SetGroupVolume scales each member proportionally to the ratio
+            # captured by the *last* SnapshotGroupVolume — not to their
+            # current actual volumes. Without a fresh snapshot right before
+            # each change, it scales against a stale (or undefined) ratio,
+            # which is why one member (typically the coordinator, since it's
+            # the one device we used to set individually pre-group-volume)
+            # can end up moving far more than the others. See
+            # https://sonos.svrooij.io/services/group-rendering-control
+            await self._soap_action(
+                self.device_info.group_rendering_control_url,
+                UPNP_GROUP_RENDERING_CONTROL,
+                "SnapshotGroupVolume",
+                {"InstanceID": "0"},
+                max_retries=1,
+            )
+            url = self.device_info.group_rendering_control_url
+            service = UPNP_GROUP_RENDERING_CONTROL
+            action = "SetGroupVolume"
+            args = {"InstanceID": "0", "DesiredVolume": str(volume)}
+        elif self.device_info.rendering_control_url:
+            url = self.device_info.rendering_control_url
+            service = UPNP_RENDERING_CONTROL
+            action = "SetVolume"
+            args = {"InstanceID": "0", "Channel": "Master", "DesiredVolume": str(volume)}
+        else:
+            return False
+
         self._last_volume_time_ms = time.time() * 1000
-        logger.debug(f"SetVolume({volume}) to {self.device_info.rendering_control_url}")
+        logger.debug(f"{action}({volume}) to {url}")
 
         result = await self._soap_action(
-            self.device_info.rendering_control_url,
-            UPNP_RENDERING_CONTROL,
-            "SetVolume",
-            {
-                "InstanceID": "0",
-                "Channel": "Master",
-                "DesiredVolume": str(volume),
-            },
+            url,
+            service,
+            action,
+            args,
             max_retries=1,  # Don't retry volume commands (UI will send new ones)
         )
         return result is not None
@@ -739,15 +794,20 @@ class DLNAClient:
                     else:
                         info.av_transport_url = control_url
 
+                elif "GroupRenderingControl" in service_type and control_url:
+                    # Sonos-specific: volume for the whole dynamic group, not
+                    # just this device. Captured separately from (and doesn't
+                    # compete with) plain RenderingControl below.
+                    if control_url.startswith("/"):
+                        info.group_rendering_control_url = base_url + control_url
+                    else:
+                        info.group_rendering_control_url = control_url
+
                 elif "RenderingControl" in service_type and control_url:
-                    # Prefer standard RenderingControl over GroupRenderingControl
-                    # GroupRenderingControl is Sonos-specific and uses different API
-                    is_standard = "GroupRenderingControl" not in service_type
-                    if is_standard or not info.rendering_control_url:
-                        if control_url.startswith("/"):
-                            info.rendering_control_url = base_url + control_url
-                        else:
-                            info.rendering_control_url = control_url
+                    if control_url.startswith("/"):
+                        info.rendering_control_url = base_url + control_url
+                    else:
+                        info.rendering_control_url = control_url
 
                 elif "ConnectionManager" in service_type and control_url:
                     if control_url.startswith("/"):
@@ -764,7 +824,8 @@ class DLNAClient:
         )
         logger.debug(
             f"Service URLs: AVTransport={info.av_transport_url}, "
-            f"RenderingControl={info.rendering_control_url}"
+            f"RenderingControl={info.rendering_control_url}, "
+            f"GroupRenderingControl={info.group_rendering_control_url}"
         )
         return info
 
