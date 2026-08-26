@@ -185,8 +185,15 @@ class DLNABackend(AudioBackend):
             logger.warning(f"Failed to discover capabilities: {e}")
             self._capabilities = None
 
-    async def disconnect(self) -> None:
-        """Disconnect from DLNA device."""
+    async def disconnect(self, send_device_stop: bool = True) -> None:
+        """Disconnect from DLNA device.
+
+        Args:
+            send_device_stop: If False, skip the live Stop command — use
+                this when the device isn't actually being stopped, only
+                given up on (e.g. it's already being driven by something
+                else and a Stop sent here would just interrupt that).
+        """
         self._is_connected = False
 
         if self._poll_task:
@@ -197,11 +204,11 @@ class DLNABackend(AudioBackend):
                 pass
 
         if self._client:
-            # Stop playback before disconnecting
-            try:
-                await self._client.stop()
-            except Exception:
-                pass
+            if send_device_stop:
+                try:
+                    await self._client.stop()
+                except Exception:
+                    pass
             await self._client.disconnect()
 
         logger.info(f"Disconnected from DLNA device: {self.name}")

@@ -180,8 +180,17 @@ class AudioBackend(ABC):
         pass
 
     @abstractmethod
-    async def disconnect(self) -> None:
-        """Disconnect and clean up backend resources."""
+    async def disconnect(self, send_device_stop: bool = True) -> None:
+        """
+        Disconnect and clean up backend resources.
+
+        Args:
+            send_device_stop: Whether to send the underlying device an
+                explicit stop command first. Set False when the device
+                itself isn't actually going anywhere and shouldn't be
+                interrupted — e.g. it's already being driven by something
+                else and a stop here would just interrupt that.
+        """
         pass
 
     def is_connected(self) -> bool:
