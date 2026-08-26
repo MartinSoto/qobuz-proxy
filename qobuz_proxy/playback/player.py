@@ -93,6 +93,13 @@ class QobuzPlayer:
         # State
         self._state: PlaybackState = PlaybackState.STOPPED
 
+        # Whether the Qobuz server currently considers *this* renderer the
+        # active playback target (SrvrRndrSetActive) — the one authoritative
+        # signal for "is this the renderer the app is actually driving right
+        # now". False until the server says otherwise — a freshly started
+        # renderer has no controller attached yet.
+        self._is_active_renderer: bool = False
+
         # Consecutive STOPPED polls seen while paused (external-stop detection).
         self._paused_stop_polls = 0
 
@@ -222,6 +229,11 @@ class QobuzPlayer:
         self._fixed_volume = enabled
         logger.info(f"Fixed volume mode: {enabled}")
 
+    def set_active_renderer(self, active: bool) -> None:
+        """Record whether the Qobuz server currently considers this
+        renderer the active playback target (see SrvrRndrSetActive)."""
+        self._is_active_renderer = active
+
     def set_next_track_callbacks(
         self,
         get_callback: Callable[[], Optional[dict]],
@@ -320,6 +332,24 @@ class QobuzPlayer:
             logger.info(f"Re-broadcast current volume to app: {volume}%")
         except Exception as e:
             logger.warning(f"Failed to re-broadcast volume: {e}")
+
+    async def claim_device(self) -> None:
+        """Send the physical device a plain stop, without touching our own
+        playback state/reporting (there's nothing of ours to report — we
+        were never playing anything before this).
+
+        Used when we're freshly selected as the active renderer
+        (`SrvrRndrSetActive(active=true)`): a shared DLNA/Sonos renderer
+        may already be playing something from a completely different
+        source (Spotify via AirPlay, the Sonos app, ...) when the Qobuz
+        app selects it. Silencing it on selection — rather than letting
+        that keep going until the app actually picks a track — claims a
+        silent, ready state the same way Spotify Connect does.
+        """
+        try:
+            await self.backend.stop()
+        except Exception as e:
+            logger.warning(f"Failed to stop device on activation: {e}")
 
     # =========================================================================
     # Seek Control
@@ -1584,6 +1614,12 @@ class QobuzPlayer:
     def state(self) -> PlaybackState:
         """Get current playback state."""
         return self._state
+
+    @property
+    def is_active_renderer(self) -> bool:
+        """Whether the Qobuz server currently considers this renderer the
+        active playback target (see SrvrRndrSetActive in command_handler.py)."""
+        return self._is_active_renderer
 
     @property
     def current_track(self) -> Optional[QueueTrack]:
