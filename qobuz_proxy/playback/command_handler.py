@@ -24,6 +24,18 @@ MSG_TYPE_SET_LOOP_MODE = 45  # SrvrRndrSetLoopMode
 MSG_TYPE_SET_SHUFFLE_MODE = 46  # SrvrRndrSetShuffleMode
 MSG_TYPE_SET_AUTOPLAY_MODE = 47  # SrvrRndrSetAutoplayMode
 
+# The server signals "no current/next track" with an all-bits-set
+# QueueTrackRef rather than omitting the field — HasField() is still True,
+# so these sentinel values must be checked explicitly. Widths match the
+# proto: trackId is fixed32, queueItemId is uint64.
+_SENTINEL_TRACK_ID = 0xFFFFFFFF
+_SENTINEL_QUEUE_ITEM_ID = 0xFFFFFFFFFFFFFFFF
+
+
+def _is_no_track_sentinel(ref: Any) -> bool:
+    """Whether a QueueTrackRef is the server's "no track" marker."""
+    return bool(ref.trackId == _SENTINEL_TRACK_ID or ref.queueItemId == _SENTINEL_QUEUE_ITEM_ID)
+
 
 class PlaybackCommandHandler:
     """
@@ -113,7 +125,7 @@ class PlaybackCommandHandler:
         current_queue_item_id = None
         current_track_id = None
         current_context_uuid = None
-        if state.HasField("currentQueueItem"):
+        if state.HasField("currentQueueItem") and not _is_no_track_sentinel(state.currentQueueItem):
             current_item = state.currentQueueItem
             current_queue_item_id = current_item.queueItemId
             current_track_id = current_item.trackId
@@ -121,10 +133,12 @@ class PlaybackCommandHandler:
             logger.debug(
                 f"Current queue item: queueItemId={current_queue_item_id}, trackId={current_track_id}"
             )
+        elif state.HasField("currentQueueItem"):
+            logger.debug("SET_STATE: currentQueueItem is the server's no-track sentinel")
 
         # Extract and store next queue item for auto-advance
         next_track_changed = False
-        if state.HasField("nextQueueItem"):
+        if state.HasField("nextQueueItem") and not _is_no_track_sentinel(state.nextQueueItem):
             next_item = state.nextQueueItem
             old_queue_item_id = (
                 self._next_track_info.get("queueItemId") if self._next_track_info else None
