@@ -43,6 +43,55 @@ class TestHijackDetection:
 
         assert player.state == PlaybackState.STOPPED
 
+    async def test_takeover_invokes_the_hijack_callback(self) -> None:
+        # A plain STOPPED report leaves the app still believing it's
+        # connected to this renderer — there's no protocol message to
+        # tell it otherwise (confirmed against two independent Qobuz
+        # Connect reverse-engineering efforts), so the closest available
+        # signal is forcing a real WebSocket reconnect.
+        player, backend = _make_player()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend.get_position = AsyncMock(return_value=30_000)
+        backend.is_playing_our_content = AsyncMock(return_value=False)
+        player._state = PlaybackState.PLAYING
+        player._hijack_check_countdown = 1
+        callback = AsyncMock()
+        player.set_hijack_detected_callback(callback)
+
+        await _run_one_monitor_cycle(player)
+
+        callback.assert_awaited_once_with("external takeover detected")
+
+    async def test_no_takeover_does_not_invoke_the_hijack_callback(self) -> None:
+        player, backend = _make_player()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend.get_position = AsyncMock(return_value=30_000)
+        backend.is_playing_our_content = AsyncMock(return_value=True)
+        player._state = PlaybackState.PLAYING
+        player._hijack_check_countdown = 1
+        callback = AsyncMock()
+        player.set_hijack_detected_callback(callback)
+
+        await _run_one_monitor_cycle(player)
+
+        callback.assert_not_called()
+
+    async def test_a_failing_hijack_callback_does_not_raise(self) -> None:
+        player, backend = _make_player()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend.get_position = AsyncMock(return_value=30_000)
+        backend.is_playing_our_content = AsyncMock(return_value=False)
+        player._state = PlaybackState.PLAYING
+        player._hijack_check_countdown = 1
+        player.set_hijack_detected_callback(AsyncMock(side_effect=OSError("no connection")))
+
+        await _run_one_monitor_cycle(player)  # must not raise/crash the loop
+
+        assert player.state == PlaybackState.STOPPED
+
     async def test_no_takeover_leaves_player_playing(self) -> None:
         player, backend = _make_player()
         backend._state = PlaybackState.PLAYING

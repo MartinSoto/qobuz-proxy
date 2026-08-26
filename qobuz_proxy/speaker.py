@@ -565,6 +565,7 @@ class Speaker:
                 self._player.set_file_quality_report_callback(
                     self._ws_manager.send_file_audio_quality_changed
                 )
+                self._player.set_hijack_detected_callback(self._ws_manager.force_reconnect)
 
                 # Start WebSocket, state reporter, and player
                 await self._ws_manager.start()

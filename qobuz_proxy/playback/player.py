@@ -7,7 +7,7 @@ Core playback controller that orchestrates queue, metadata, and audio backend.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 from qobuz_proxy.backends import (
     AudioBackend,
@@ -132,6 +132,13 @@ class QobuzPlayer:
         self._state_update_callback: Optional[Callable[[], asyncio.Future]] = None
         self._state_reporter: Optional["StateReporter"] = None
 
+        # Called when an external takeover is detected (see
+        # is_playing_our_content()). The Qobuz Connect protocol has no
+        # message for voluntarily giving up "active" status, so the best
+        # available signal is forcing a real WebSocket reconnect — see
+        # WsManager.force_reconnect() and set_hijack_detected_callback().
+        self._hijack_detected_callback: Optional[Callable[[str], Awaitable[None]]] = None
+
         # Volume
         self._volume: int = 50  # Cached volume level (0-100)
         self._fixed_volume: bool = False  # From config
@@ -228,6 +235,11 @@ class QobuzPlayer:
     def set_state_update_callback(self, callback: Callable[[], asyncio.Future]) -> None:
         """Set callback to send state updates to app (legacy method)."""
         self._state_update_callback = callback
+
+    def set_hijack_detected_callback(self, callback: Callable[[str], Awaitable[None]]) -> None:
+        """Set callback invoked (with a reason string) when an external
+        takeover of this renderer is detected."""
+        self._hijack_detected_callback = callback
 
     def set_state_reporter(self, reporter: "StateReporter") -> None:
         """
@@ -1553,6 +1565,19 @@ class QobuzPlayer:
                                 self._position_timestamp_ms = int(time.time() * 1000)
                                 await self._send_state_update()
                                 await self._report_stopped()
+                                # A plain STOPPED report leaves the app
+                                # still believing it's connected to this
+                                # renderer — there's no protocol message to
+                                # tell it otherwise, so force a real
+                                # reconnect instead, the closest thing to
+                                # "I just came back online" available.
+                                if self._hijack_detected_callback:
+                                    try:
+                                        await self._hijack_detected_callback(
+                                            "external takeover detected"
+                                        )
+                                    except Exception as e:
+                                        logger.warning(f"Hijack-detected callback failed: {e}")
                                 continue
 
                     # Update position from backend
