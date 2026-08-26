@@ -430,6 +430,7 @@ class TestQobuzQueue:
     # Preloading Tests
     # =========================================================================
 
+    @pytest.mark.slow  # real asyncio.sleep(1.5) to let the background preload loop run
     @pytest.mark.asyncio
     async def test_preload_fetches_metadata(
         self, queue: QobuzQueue, sample_tracks: list[dict[str, Any]]
@@ -460,6 +461,7 @@ class TestQobuzQueue:
         assert metadata_callback.call_count >= 1
         assert url_callback.call_count >= 1
 
+    @pytest.mark.slow  # real asyncio.sleep(1.5) x2 to let the background preload loop run
     @pytest.mark.asyncio
     async def test_preload_refreshes_stale_urls(
         self, queue: QobuzQueue, sample_tracks: list[dict[str, Any]]
@@ -485,6 +487,7 @@ class TestQobuzQueue:
 
         assert url_callback.call_count > initial_url_calls
 
+    @pytest.mark.slow  # real asyncio.sleep(1.5) x2 to let the background preload loop run
     @pytest.mark.asyncio
     async def test_preload_skips_already_preloaded(
         self, queue: QobuzQueue, sample_tracks: list[dict[str, Any]]

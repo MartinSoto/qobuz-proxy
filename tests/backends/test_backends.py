@@ -154,6 +154,7 @@ class TestBackendFactory:
         available = BackendFactory.list_available_backends()
         assert "dlna" in available
 
+    @pytest.mark.slow  # real TCP connect against an unreachable IP, ~65s to time out
     @pytest.mark.asyncio
     async def test_create_dlna_connection_failure(self) -> None:
         """Test DLNA backend creation fails gracefully when device unavailable."""
