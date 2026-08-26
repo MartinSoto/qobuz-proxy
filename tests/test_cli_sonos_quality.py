@@ -70,17 +70,32 @@ async def _start_device_server(
 
 class TestFetchCoordinatorQuality:
     async def test_sonos_device_is_capped_by_override(self) -> None:
-        # The Sink advertises FLAC_192 (Hi-Res 24/192), but DEVICE_OVERRIDES
-        # conservatively caps every Sonos device to 16/48 — advertised and
-        # effective quality must diverge, and effective must reflect the cap.
+        # The Sink advertises FLAC_192 (Hi-Res 24/192), but every Sonos is
+        # capped to 48kHz regardless of model — advertised and effective
+        # quality must diverge, and effective must reflect the cap (96k
+        # tier: real 24-bit support, sample-rate enforcement is the proxy's
+        # job downstream — see capabilities.py's max_quality docstring).
         runner, port = await _start_device_server(manufacturer="Sonos, Inc.")
         try:
             result = await _fetch_coordinator_quality("127.0.0.1", port)
 
             assert result is not None
             assert result.advertised == 27  # Hi-Res 192k, as advertised
-            assert result.effective == 6  # CD, after the Sonos override
+            assert result.effective == 7  # Hi-Res 96k, after the Sonos override
             assert result.confirmed is True
+        finally:
+            await runner.cleanup()
+
+    async def test_legacy_sonos_model_is_capped_to_cd_quality(self) -> None:
+        # Play:1/Play:3 are the known 16-bit-only blacklist — everything
+        # else defaults to 24-bit (see SONOS_16BIT_ONLY_MODELS).
+        runner, port = await _start_device_server(manufacturer="Sonos, Inc.", model="Play:1")
+        try:
+            result = await _fetch_coordinator_quality("127.0.0.1", port)
+
+            assert result is not None
+            assert result.advertised == 27
+            assert result.effective == 6  # CD, after the legacy-model override
         finally:
             await runner.cleanup()
 

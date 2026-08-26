@@ -388,8 +388,9 @@ class _CoordinatorQuality:
     """Max streamable quality for one group's coordinator.
 
     ``advertised`` is what the device's own GetProtocolInfo Sink claims;
-    ``effective`` is after known-device overrides (see DEVICE_OVERRIDES in
-    capabilities.py — e.g. Sonos is conservatively capped) are applied,
+    ``effective`` is after known-device overrides (see
+    apply_device_overrides in capabilities.py — e.g. every Sonos is capped
+    to 48kHz, and pre-24-bit models further capped to 16-bit) are applied,
     i.e. what QobuzProxy would actually use for this device. They differ
     exactly when an override kicked in.
     """
@@ -545,7 +546,7 @@ async def run_discover_sonos(timeout: float, json_output: bool) -> int:
                 print(
                     f"  Max quality: {QUALITY_NAMES.get(quality.effective, quality.effective)}"
                     f" (device advertises {QUALITY_NAMES.get(quality.advertised, quality.advertised)}"
-                    f", capped by a known-device override — see DEVICE_OVERRIDES)"
+                    f", capped by a known-device override — see apply_device_overrides)"
                 )
             else:
                 confirmed_note = (

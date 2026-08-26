@@ -1,8 +1,11 @@
 """Tests for DLNA capability parsing — FLAC MIME detection in particular."""
 
 from qobuz_proxy.backends.dlna.capabilities import (
+    QOBUZ_QUALITY_96K,
     QOBUZ_QUALITY_CD,
     QOBUZ_QUALITY_MP3,
+    DLNACapabilities,
+    apply_device_overrides,
     parse_protocol_info_sink,
 )
 
@@ -98,3 +101,56 @@ class TestFormatInfoConfirmed:
         caps = parse_protocol_info_sink(sink)
         assert caps.format_info_confirmed is True
         assert caps.max_quality == 7
+
+
+class TestSonosDeviceOverrides:
+    """Every Sonos device is capped at 48kHz (a platform-wide ceiling, not a
+    per-model quirk); bit depth is a blacklist of known 16-bit-only legacy
+    models, defaulting new/unlisted models to 24-bit — see
+    apply_device_overrides's docstring for why a blacklist and not a
+    whitelist."""
+
+    def _caps(self, advertised_sr: int = 192000, advertised_bd: int = 24) -> DLNACapabilities:
+        return DLNACapabilities(
+            supports_flac=True, max_sample_rate=advertised_sr, max_bit_depth=advertised_bd
+        )
+
+    def test_unlisted_sonos_model_defaults_to_24bit_48k(self) -> None:
+        """A model not on the legacy blacklist — including any future Sonos
+        product this code has never heard of — gets treated as 24-bit
+        capable, sample-rate-capped at 48kHz."""
+        caps = self._caps()
+        apply_device_overrides(caps, "Sonos, Inc.", "One SL")
+
+        assert caps.max_sample_rate == 48000
+        assert caps.max_bit_depth == 24
+        assert caps.max_quality == QOBUZ_QUALITY_96K
+
+    def test_blacklisted_legacy_model_stays_16bit(self) -> None:
+        caps = self._caps()
+        apply_device_overrides(caps, "Sonos, Inc.", "Play:1")
+
+        assert caps.max_sample_rate == 48000
+        assert caps.max_bit_depth == 16
+        assert caps.max_quality == QOBUZ_QUALITY_CD
+
+    def test_blacklist_match_is_case_insensitive(self) -> None:
+        caps = self._caps()
+        apply_device_overrides(caps, "SONOS", "PLAY:3")
+
+        assert caps.max_bit_depth == 16
+
+    def test_override_wins_even_if_advertised_more(self) -> None:
+        """A legacy model that (wrongly) advertises Hi-Res 192k must still
+        end up capped — the override doesn't just fill in gaps."""
+        caps = self._caps(advertised_sr=192000, advertised_bd=24)
+        apply_device_overrides(caps, "Sonos, Inc.", "Play:1")
+
+        assert caps.max_quality == QOBUZ_QUALITY_CD
+
+    def test_non_sonos_device_is_untouched(self) -> None:
+        caps = self._caps(advertised_sr=192000, advertised_bd=24)
+        apply_device_overrides(caps, "Denon", "AVR-X1700H")
+
+        assert caps.max_sample_rate == 192000
+        assert caps.max_bit_depth == 24
