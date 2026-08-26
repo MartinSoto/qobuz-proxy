@@ -6,6 +6,7 @@ discovery.py at the dlna/ level) should need to know Sonos exists — see
 this repo's architecture notes for the split.
 """
 
+from . import capabilities as _capabilities  # noqa: F401 — registers the Sonos override
 from .backend import SonosBackend
 from .client import SonosClient
 from .discovery import discover_and_enrich
