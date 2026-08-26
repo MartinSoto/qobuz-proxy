@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from .sonos_topology import enrich_discovered_devices, fetch_sonos_topology
+from .sonos.topology import enrich_discovered_devices, fetch_sonos_topology
 
 logger = logging.getLogger(__name__)
 

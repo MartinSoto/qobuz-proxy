@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 import aiohttp
 
 if TYPE_CHECKING:
-    from .discovery import DiscoveredDevice
+    from ..discovery import DiscoveredDevice
 
 logger = logging.getLogger(__name__)
 
