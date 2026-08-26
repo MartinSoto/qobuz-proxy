@@ -40,7 +40,7 @@ class TestDiscoverDLNA:
         mock_device.location = "http://192.168.1.50:1400/xml/desc.xml"
 
         with patch(
-            "qobuz_proxy.webui.speaker_routes.discover_dlna_devices",
+            "qobuz_proxy.webui.speaker_routes.discover_and_enrich",
             new_callable=AsyncMock,
             return_value=[mock_device],
         ):
@@ -54,7 +54,7 @@ class TestDiscoverDLNA:
 
     async def test_discover_with_timeout(self, client: TestClient) -> None:
         with patch(
-            "qobuz_proxy.webui.speaker_routes.discover_dlna_devices",
+            "qobuz_proxy.webui.speaker_routes.discover_and_enrich",
             new_callable=AsyncMock,
             return_value=[],
         ) as mock_discover:
@@ -64,7 +64,7 @@ class TestDiscoverDLNA:
 
     async def test_discover_empty(self, client: TestClient) -> None:
         with patch(
-            "qobuz_proxy.webui.speaker_routes.discover_dlna_devices",
+            "qobuz_proxy.webui.speaker_routes.discover_and_enrich",
             new_callable=AsyncMock,
             return_value=[],
         ):

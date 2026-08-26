@@ -14,8 +14,6 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from .sonos.topology import enrich_discovered_devices, fetch_sonos_topology
-
 logger = logging.getLogger(__name__)
 
 # SSDP constants
@@ -121,12 +119,6 @@ class DLNADiscovery:
         # Fetch device descriptions
         raw_devices = list(self._devices.values())
         result = await self._fetch_device_descriptions(raw_devices)
-
-        # Sonos: hide bonded pair members / HT satellites, use room names.
-        # No-op (and no network traffic) when no Sonos device was found.
-        topology = await fetch_sonos_topology(result)
-        if topology:
-            result = enrich_discovered_devices(result, topology)
 
         logger.debug(f"Discovered {len(result)} DLNA device(s)")
         return result

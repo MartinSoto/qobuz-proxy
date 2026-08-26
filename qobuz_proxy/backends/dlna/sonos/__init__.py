@@ -6,6 +6,7 @@ discovery.py at the dlna/ level) should need to know Sonos exists — see
 this repo's architecture notes for the split.
 """
 
+from .discovery import discover_and_enrich
 from .topology import (
     SonosZoneMember,
     enrich_discovered_devices,
@@ -15,6 +16,7 @@ from .topology import (
 
 __all__ = [
     "SonosZoneMember",
+    "discover_and_enrich",
     "enrich_discovered_devices",
     "fetch_sonos_topology",
     "parse_zone_group_state",

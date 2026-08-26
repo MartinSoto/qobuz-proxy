@@ -2,20 +2,25 @@
 
 import logging
 from aiohttp import web
-from qobuz_proxy.backends.dlna.discovery import discover_dlna_devices
+from qobuz_proxy.backends.dlna.sonos import discover_and_enrich
 
 logger = logging.getLogger(__name__)
 
 
 async def _handle_discover_dlna(request: web.Request) -> web.Response:
-    """Trigger SSDP discovery and return found DLNA devices."""
+    """Trigger SSDP discovery and return found DLNA devices.
+
+    Sonos-aware: hides bonded stereo pair members/HT satellites and shows
+    room names instead of raw Sonos friendlyNames when a Sonos household is
+    present — see sonos.discovery.discover_and_enrich.
+    """
     try:
         body = await request.json()
     except Exception:
         body = {}
 
     timeout = float(body.get("timeout", 5))
-    devices = await discover_dlna_devices(timeout=timeout)
+    devices = await discover_and_enrich(timeout=timeout)
 
     result = {
         "devices": [
