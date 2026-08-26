@@ -2,13 +2,14 @@
 
 import asyncio
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from qobuz_proxy.config import Config
 from qobuz_proxy.connect.types import ConnectTokens, JWTConnectToken
 from qobuz_proxy.connect.ws_manager import (
+    HIJACK_RECONNECT_HOLD_SECONDS,
     INITIAL_RECONNECT_DELAY,
     MAX_RECONNECT_DELAY,
     RECONNECT_BACKOFF_MULTIPLIER,
@@ -143,6 +144,110 @@ class TestTokenManagement:
         await asyncio.sleep(0)
 
         ws_manager._ws.close.assert_awaited_once()
+
+
+class TestForceReconnect:
+    """force_reconnect() — used when a renderer detects an external
+    takeover (see Player.is_playing_our_content()). The protocol has no
+    message for voluntarily giving up "active" status, and neither for a
+    device that just crashed or lost power, so the server likely relies
+    on its own WS heartbeat/timeout to notice a renderer is gone — this
+    holds the connection closed for a while (via the existing
+    _reconnect_delay/backoff mechanism) to give that a real chance to
+    fire, rather than reconnecting immediately."""
+
+    async def test_closes_the_current_connection(self, ws_manager: WsManager) -> None:
+        ws_manager._ws = AsyncMock()
+
+        await ws_manager.force_reconnect("test reason")
+
+        ws_manager._ws.close.assert_awaited_once()
+
+    async def test_sets_the_reconnect_delay_to_the_hold_duration(
+        self, ws_manager: WsManager
+    ) -> None:
+        ws_manager._ws = AsyncMock()
+        ws_manager._reconnect_delay = INITIAL_RECONNECT_DELAY
+
+        await ws_manager.force_reconnect("test reason", hold_seconds=8.0)
+
+        assert ws_manager._reconnect_delay == 8.0
+
+    async def test_the_next_join_will_not_reclaim_active_status(
+        self, ws_manager: WsManager
+    ) -> None:
+        # The server recognizes the *same* renderer reconnecting (by
+        # deviceUuid/sessionUuid) and would otherwise hand control right
+        # back, evicting whatever the app fell back to in the meantime.
+        ws_manager._ws = AsyncMock()
+        assert ws_manager._next_join_claims_active is True
+
+        await ws_manager.force_reconnect("test reason")
+
+        assert ws_manager._next_join_claims_active is False
+
+    async def test_default_hold_is_used_when_not_specified(self, ws_manager: WsManager) -> None:
+        ws_manager._ws = AsyncMock()
+
+        await ws_manager.force_reconnect("test reason")
+
+        assert ws_manager._reconnect_delay == HIJACK_RECONNECT_HOLD_SECONDS
+
+    async def test_is_a_noop_when_not_connected(self, ws_manager: WsManager) -> None:
+        ws_manager._ws = None
+        ws_manager._reconnect_delay = INITIAL_RECONNECT_DELAY
+
+        await ws_manager.force_reconnect("test reason")  # must not raise
+
+        assert ws_manager._reconnect_delay == INITIAL_RECONNECT_DELAY  # untouched
+        assert ws_manager._next_join_claims_active is True  # untouched
+
+    async def test_swallows_close_errors(self, ws_manager: WsManager) -> None:
+        ws_manager._ws = AsyncMock()
+        ws_manager._ws.close.side_effect = OSError("already gone")
+
+        await ws_manager.force_reconnect("test reason")  # must not raise
+
+
+class TestSendJoinSession:
+    """_send_join_session() — is_active is a one-shot override (see
+    force_reconnect()), consumed and reset on every join so only the
+    rejoin immediately following a forced reconnect skips reclaiming
+    active-renderer status."""
+
+    async def test_normal_join_claims_active(self, ws_manager: WsManager) -> None:
+        ws_manager._session_uuid = b"0" * 16
+        ws_manager._ws = AsyncMock()
+
+        with patch.object(
+            ws_manager._codec, "encode_join_session", return_value=b"frame"
+        ) as mock_encode:
+            await ws_manager._send_join_session()
+
+        assert mock_encode.call_args.kwargs["is_active"] is True
+
+    async def test_overridden_join_does_not_claim_active_and_resets(
+        self, ws_manager: WsManager
+    ) -> None:
+        ws_manager._session_uuid = b"0" * 16
+        ws_manager._ws = AsyncMock()
+        ws_manager._next_join_claims_active = False
+
+        with patch.object(
+            ws_manager._codec, "encode_join_session", return_value=b"frame"
+        ) as mock_encode:
+            await ws_manager._send_join_session()
+
+        assert mock_encode.call_args.kwargs["is_active"] is False
+        assert ws_manager._next_join_claims_active is True  # reset for next time
+
+    async def test_noop_without_a_session_uuid(self, ws_manager: WsManager) -> None:
+        ws_manager._session_uuid = None
+        ws_manager._ws = AsyncMock()
+
+        await ws_manager._send_join_session()  # must not raise
+
+        ws_manager._ws.send.assert_not_called()
 
 
 class TestHandlerRegistration:

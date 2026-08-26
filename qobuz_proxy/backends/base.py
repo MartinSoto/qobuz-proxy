@@ -132,6 +132,21 @@ class AudioBackend(ABC):
         """Get buffer status. Default returns OK."""
         return BufferStatus.OK
 
+    async def is_playing_our_content(self) -> bool:
+        """
+        Whether the device is actually still playing what we told it to,
+        as opposed to something else having taken it over — e.g. another
+        app grouping into or playing directly to a shared DLNA/Sonos
+        renderer. get_state() alone can't tell the two apart: the device
+        reports PLAYING either way. False means the player should treat
+        this exactly like an external stop.
+
+        Default True: a backend nothing else can interfere with (e.g.
+        local output, which owns its own audio stream outright) never
+        needs to override this.
+        """
+        return True
+
     # =========================================================================
     # Gapless Playback - Optional
     # =========================================================================

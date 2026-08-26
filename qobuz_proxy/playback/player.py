@@ -7,7 +7,7 @@ Core playback controller that orchestrates queue, metadata, and audio backend.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 from qobuz_proxy.backends import (
     AudioBackend,
@@ -39,6 +39,13 @@ _HANDOFF_POSITION_THRESHOLD_MS = 5000
 # STOPPED polls (~0.5s each) before ending the listen — one bad poll must not
 # prematurely stop a normal paused track or lose its resume position.
 _PAUSED_STOP_CONFIRMATIONS = 3
+
+# While playing, how many 0.5s poll cycles between hijack checks (is another
+# source now playing to this renderer instead of us — see
+# AudioBackend.is_playing_our_content()). Costs an extra device round trip,
+# unlike the state/position poll every cycle already does, so this is
+# throttled independently — detection within a few seconds is plenty.
+_HIJACK_CHECK_INTERVAL_POLLS = 6
 
 # After a WebSocket reconnect, the Qobuz server replays its last-known session
 # snapshot via SET_STATE — typically PAUSED at a position from before the drop.
@@ -103,6 +110,12 @@ class QobuzPlayer:
         # Consecutive STOPPED polls seen while paused (external-stop detection).
         self._paused_stop_polls = 0
 
+        # Cycles since the last hijack check (external-takeover detection
+        # while PLAYING) — throttled independently of the 0.5s poll cadence
+        # since it costs an extra device round trip, unlike the plain
+        # state/position poll every cycle already does.
+        self._hijack_check_countdown = 0
+
         # Playback command serialization. A track switch in the Qobuz app sends
         # a burst of SET_STATE messages; without this lock the resulting
         # load/play/stop calls overlap and fire concurrent SOAP control
@@ -115,6 +128,13 @@ class QobuzPlayer:
         # State reporting - supports both callback and StateReporter
         self._state_update_callback: Optional[Callable[[], asyncio.Future]] = None
         self._state_reporter: Optional["StateReporter"] = None
+
+        # Called when an external takeover is detected (see
+        # is_playing_our_content()). The Qobuz Connect protocol has no
+        # message for voluntarily giving up "active" status, so the best
+        # available signal is forcing a real WebSocket reconnect — see
+        # WsManager.force_reconnect() and set_hijack_detected_callback().
+        self._hijack_detected_callback: Optional[Callable[[str], Awaitable[None]]] = None
 
         # Volume
         self._volume: int = 50  # Cached volume level (0-100)
@@ -206,6 +226,11 @@ class QobuzPlayer:
     def set_state_update_callback(self, callback: Callable[[], asyncio.Future]) -> None:
         """Set callback to send state updates to app (legacy method)."""
         self._state_update_callback = callback
+
+    def set_hijack_detected_callback(self, callback: Callable[[str], Awaitable[None]]) -> None:
+        """Set callback invoked (with a reason string) when an external
+        takeover of this renderer is detected."""
+        self._hijack_detected_callback = callback
 
     def set_state_reporter(self, reporter: "StateReporter") -> None:
         """
@@ -1528,6 +1553,41 @@ class QobuzPlayer:
                         # Stop the played-time clock so this pause is excluded
                         # from the reported duration, like an app-driven pause.
                         self._report_paused()
+                    elif backend_state == PlaybackState.PLAYING:
+                        # Still genuinely "playing" from the transport's own
+                        # perspective — but that's exactly what a hijack (a
+                        # different source now playing to this renderer,
+                        # e.g. someone grouping into it via the Sonos app)
+                        # looks like too; get_state() alone can't tell them
+                        # apart. Throttled — an extra device round trip on
+                        # top of the plain state/position poll every cycle.
+                        self._hijack_check_countdown -= 1
+                        if self._hijack_check_countdown <= 0:
+                            self._hijack_check_countdown = _HIJACK_CHECK_INTERVAL_POLLS
+                            if not await self.backend.is_playing_our_content():
+                                logger.info(
+                                    "External takeover detected on this renderer — "
+                                    "treating as stopped"
+                                )
+                                self._state = PlaybackState.STOPPED
+                                self._position_value_ms = 0
+                                self._position_timestamp_ms = int(time.time() * 1000)
+                                await self._send_state_update()
+                                await self._report_stopped()
+                                # A plain STOPPED report leaves the app
+                                # still believing it's connected to this
+                                # renderer — there's no protocol message to
+                                # tell it otherwise, so force a real
+                                # reconnect instead, the closest thing to
+                                # "I just came back online" available.
+                                if self._hijack_detected_callback:
+                                    try:
+                                        await self._hijack_detected_callback(
+                                            "external takeover detected"
+                                        )
+                                    except Exception as e:
+                                        logger.warning(f"Hijack-detected callback failed: {e}")
+                                continue
 
                     # Update position from backend
                     position = await self.backend.get_position()
@@ -1562,6 +1622,7 @@ class QobuzPlayer:
 
                 else:
                     self._paused_stop_polls = 0
+                    self._hijack_check_countdown = 0
 
             except asyncio.CancelledError:
                 break
