@@ -45,6 +45,11 @@ local = [
     "numpy>=1.24.0",
     "soundfile>=0.12.1",
 ]
+hires = [
+    "numpy>=1.24.0",
+    "soundfile>=0.12.1",
+    "soxr>=0.3.0",
+]
 
 # Development tooling (PEP 735 dependency group). uv installs the `dev` group
 # by default on `uv sync` — see [tool.uv].default-groups below.
