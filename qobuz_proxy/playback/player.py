@@ -1755,6 +1755,28 @@ class QobuzPlayer:
             self._position_timestamp_ms = int(time.time() * 1000)
             await self._send_state_update()
             await self._report_stopped()
+        elif state == PlaybackState.PLAYING:
+            # Recovering from an unprompted PAUSED/STOPPED that turned out
+            # to be transient — e.g. a device-state misread while Sonos
+            # settles after a retarget (see PLAYBACK_START_GRACE_PERIOD_
+            # SECONDS) that self-corrects on a later poll. self._state
+            # already flipped back silently in _on_state_change, and
+            # _position_value_ms/_timestamp_ms already got a fresh reading
+            # this same poll cycle before this task even runs (see
+            # DLNABackend._poll_state_loop: the position notify always
+            # follows the state notify within the same iteration once
+            # new_state reads PLAYING) — but without this branch nothing
+            # ever told the *app* the mismatch resolved, or resumed the
+            # played-time clock _report_paused() had stopped. Left with
+            # only the PAUSED/STOPPED branches above, the app was stuck
+            # showing that stale report indefinitely — frozen position,
+            # "stopped" on screen while the renderer was audibly still
+            # playing — until the next heartbeat or an explicit command
+            # forced a full resync (observed directly, test1.log,
+            # 2026-08-28: fixed by pressing Play, which shouldn't have
+            # been necessary).
+            await self._send_state_update()
+            await self._report_playing(self.current_position_ms)
 
     def _on_external_takeover(self) -> None:
         """Callback when the backend detects another source now driving

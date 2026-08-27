@@ -151,6 +151,44 @@ class TestPlayerReporting:
         assert player._play_reporter._active is not None
         assert player._play_reporter._active.segment_started_ms is None
 
+    async def test_unprompted_recovery_to_playing_resumes_the_clock(self) -> None:
+        """Regression (test1.log, 2026-08-28): a device-state misread that
+        flips the backend to PAUSED/STOPPED and then self-corrects back to
+        PLAYING a poll or two later (e.g. Sonos settling right after a
+        retarget) must resume the played-time clock and push a fresh state
+        update — not leave the app stuck showing the earlier stale report
+        with a frozen position while the renderer keeps playing, needing
+        an explicit Play press to resync."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+
+        player.backend._notify_state_change(PlaybackState.PAUSED)
+        await asyncio.sleep(0.05)
+        assert player._play_reporter._active.segment_started_ms is None  # clock stopped
+
+        player.backend._notify_state_change(PlaybackState.PLAYING)
+        await asyncio.sleep(0.05)
+
+        assert player.state == PlaybackState.PLAYING
+        assert player._play_reporter._active is not None
+        assert player._play_reporter._active.segment_started_ms is not None  # clock resumed
+
+    async def test_unprompted_recovery_to_playing_relays_state(self) -> None:
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        reporter = MagicMock()
+        reporter.report_now = AsyncMock()
+        player._state_reporter = reporter
+
+        player.backend._notify_state_change(PlaybackState.PAUSED)
+        await asyncio.sleep(0.05)
+        reporter.report_now.reset_mock()  # only care about the recovery below
+
+        player.backend._notify_state_change(PlaybackState.PLAYING)
+        await asyncio.sleep(0.05)
+
+        reporter.report_now.assert_awaited_once()
+
     async def test_reload_while_paused_ends_session_so_next_play_is_fresh(self) -> None:
         """A quality reload while paused must end the play, so the next play of
         the same track reports a fresh start (new quality/blob), not a resume."""
