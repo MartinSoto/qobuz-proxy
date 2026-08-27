@@ -5,6 +5,7 @@ Core playback controller that orchestrates queue, metadata, and audio backend.
 """
 
 import asyncio
+import functools
 import logging
 import time
 from typing import Awaitable, Callable, Optional, TYPE_CHECKING
@@ -39,6 +40,23 @@ _HANDOFF_POSITION_THRESHOLD_MS = 5000
 # that as a stale replay and ignore the pause/seek. This is the minimum gap
 # (renderer ahead of server) at which we suppress.
 _STALE_SNAPSHOT_THRESHOLD_MS = 5000
+
+
+class _CommandQueueItem:
+    """One entry in Player._command_queue — see Player.enqueue().
+
+    Identity-compared (no custom __eq__/__hash__), which is exactly what
+    enqueue()'s coalescing sweep and the consumer's "was this coalesced
+    away" check need: two items are never "equal" just because they
+    happen to wrap the same bound method.
+    """
+
+    __slots__ = ("coro_fn", "coalesce", "cancelled")
+
+    def __init__(self, coro_fn: Callable[[], Awaitable[None]], coalesce: bool) -> None:
+        self.coro_fn = coro_fn
+        self.coalesce = coalesce
+        self.cancelled = False
 
 
 class QobuzPlayer:
@@ -102,14 +120,35 @@ class QobuzPlayer:
         # renderer has no controller attached yet.
         self._is_active_renderer: bool = False
 
-        # Playback command serialization. A track switch in the Qobuz app sends
-        # a burst of SET_STATE messages; without this lock the resulting
-        # load/play/stop calls overlap and fire concurrent SOAP control
-        # requests, which wedges DLNA AVTransport renderers. The generation
-        # counter lets a newer command supersede an older one still waiting on
-        # the lock (latest-command-wins).
-        self._playback_lock = asyncio.Lock()
-        self._command_generation = 0
+        # Command queue: the single entry point for everything that drives
+        # playback — WsManager-dispatched commands (via enqueue(), wired up
+        # in speaker.py) and the backend-driven natural-track-end
+        # continuation (_on_track_ended) alike. One consumer
+        # (_command_consumer_loop) runs items strictly one at a time, which
+        # is what gives them mutual exclusion now: a track switch in the
+        # Qobuz app sends a burst of SET_STATE messages, and without this,
+        # the resulting load/play/stop calls would overlap and fire
+        # concurrent SOAP control requests, wedging DLNA AVTransport
+        # renderers — the same problem a lock used to guard against here,
+        # solved instead by nothing ever running concurrently in the first
+        # place. coalesce=True (see enqueue()) reproduces the old
+        # generation-counter's "a newer command supersedes an older one
+        # still waiting to run" behavior for playback-directing commands
+        # specifically.
+        self._command_queue: "asyncio.Queue[_CommandQueueItem]" = asyncio.Queue()
+        self._command_task: Optional[asyncio.Task] = None
+        # Pending (not yet started) coalesce=True items, in enqueue order —
+        # what enqueue() scans/cancels when a new one supersedes them.
+        self._pending_coalescable: list[_CommandQueueItem] = []
+        # True for the duration of _command_consumer_loop actually awaiting
+        # a dequeued item — replaces _playback_lock.locked() as the "is a
+        # command currently running" signal _on_state_change discriminates
+        # on (an unprompted backend notification can't otherwise be told
+        # apart from one acking a command we just issued, since
+        # AudioBackend._notify_state_change fires synchronously inside the
+        # awaited backend call, before the running command's own explicit
+        # self._state assignment).
+        self._processing_command: bool = False
 
         # State reporting - supports both callback and StateReporter
         self._state_update_callback: Optional[Callable[[], asyncio.Future]] = None
@@ -177,6 +216,9 @@ class QobuzPlayer:
         if not self.backend.is_connected():
             await self.backend.connect()
 
+        # Start the command queue's single consumer
+        self._command_task = asyncio.create_task(self._command_consumer_loop())
+
         logger.info("Player started")
 
     async def stop(self, send_device_stop: bool = True) -> None:
@@ -188,6 +230,14 @@ class QobuzPlayer:
                 AudioBackend.disconnect()).
         """
         self._is_running = False
+
+        if self._command_task:
+            self._command_task.cancel()
+            try:
+                await self._command_task
+            except asyncio.CancelledError:
+                pass
+            self._command_task = None
 
         # Close any open play report (incl. a paused listen, which no longer
         # closes on pause) so a shutdown mid-listen still lands in history.
@@ -420,19 +470,74 @@ class QobuzPlayer:
         return await self.seek(position_ms)
 
     # =========================================================================
-    # Playback Commands
+    # Command Queue
     # =========================================================================
 
-    def _next_generation(self) -> int:
-        """Bump and return the playback command generation.
+    def enqueue(self, coro_fn: Callable[[], Awaitable[None]], *, coalesce: bool = False) -> None:
+        """Queue an action to run on the single command consumer, in FIFO
+        order, one at a time. Synchronous — callable from a sync context,
+        e.g. a WsManager handler lambda (see speaker.py) or a backend
+        callback that can't itself be async (see _on_track_ended).
 
-        Public command entrypoints call this before awaiting the playback
-        lock. If a newer command bumps the generation while an older one is
-        still queued on the lock, the older one detects the mismatch after
-        acquiring and skips — so only the latest command in a burst runs.
+        coalesce=True marks this as a playback-directing command: any
+        earlier coalesce=True item still sitting in the queue (not yet
+        started running) is dropped first, so a burst of these — e.g. an
+        aggressive seek-bar scrub sending a SET_STATE per pixel, or a
+        natural track end racing a user's explicit skip — still only ever
+        runs its last one, matching what the old generation-based
+        supersede mechanism did. An item already running can't be
+        coalesced away (nothing interleaves with it either way, so there's
+        nothing to gain by trying). Volume/queue commands (coalesce=False,
+        the default) were never covered by that and stay plain FIFO.
         """
-        self._command_generation += 1
-        return self._command_generation
+        if coalesce:
+            for pending in self._pending_coalescable:
+                pending.cancelled = True
+            self._pending_coalescable.clear()
+        item = _CommandQueueItem(coro_fn, coalesce)
+        if coalesce:
+            self._pending_coalescable.append(item)
+        self._command_queue.put_nowait(item)
+
+    async def _command_consumer_loop(self) -> None:
+        """The only thing that ever runs a queued command — one at a time,
+        strictly in FIFO order. Nothing else pulls from _command_queue, so
+        this is what gives commands their mutual exclusion (see the
+        _command_queue field comment).
+
+        Calls task_done() for every item once handled (run, skipped as
+        coalesced-away, or failed) — this is what makes
+        ``await self._command_queue.join()`` a valid "wait for everything
+        currently queued to finish" barrier (used in tests).
+        """
+        while self._is_running:
+            try:
+                item = await self._command_queue.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                if item.coalesce:
+                    # No longer pending: about to run, or already dropped
+                    # by a later coalescing command (already removed from
+                    # this list in that case — remove() would raise).
+                    try:
+                        self._pending_coalescable.remove(item)
+                    except ValueError:
+                        pass
+                if item.cancelled:
+                    logger.debug("Command queue: skipping a coalesced-away item")
+                    continue
+                self._processing_command = True
+                try:
+                    await item.coro_fn()
+                finally:
+                    self._processing_command = False
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Command queue item failed: {e}", exc_info=True)
+            finally:
+                self._command_queue.task_done()
 
     async def apply_remote_state(
         self,
@@ -446,12 +551,13 @@ class QobuzPlayer:
         """Apply a full SET_STATE intent from the app atomically.
 
         A SET_STATE is a multi-step intent (load this track, seek here, then
-        play/pause/stop). Each SET_STATE message is dispatched as its own task,
-        so if these steps were applied via separate locked methods they could
-        interleave — an older SET_STATE could play a stale track after a newer
-        one already queued a different load. Applying the whole sequence under a
-        single lock acquisition and a single generation check makes the newest
-        SET_STATE win as a unit, with no interleaving.
+        play/pause/stop). Each SET_STATE message is enqueued as its own
+        command-queue item (see speaker.py's registration lambdas and
+        Player.enqueue(..., coalesce=True)); running the whole sequence
+        as one queue item, on the queue's single consumer, makes the
+        newest SET_STATE win as a unit — an earlier one still waiting to
+        run is dropped by coalescing before it can interleave with this
+        one or play a stale track after a newer load already superseded it.
 
         Args:
             track_id: Target track id, or None if the message had no currentQueueItem.
@@ -462,76 +568,68 @@ class QobuzPlayer:
             context_uuid: Album/playlist context bytes for the target track, used
                 for play reporting (listening history / scrobbles).
         """
-        gen = self._next_generation()
-        async with self._playback_lock:
-            if gen != self._command_generation:
-                logger.debug("SET_STATE superseded by newer command; skipping")
-                return
+        # Detect a stale session-restore snapshot (server replays an old
+        # PAUSED position after a reconnect while we're still playing). Done
+        # before any mutation so a replayed snapshot can't overwrite live
+        # state (position or context) with its outdated values.
+        stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
 
-            # Detect a stale session-restore snapshot (server replays an old
-            # PAUSED position after a reconnect while we're still playing). Done
-            # before any mutation so a replayed snapshot can't overwrite live
-            # state (position or context) with its outdated values.
-            stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
-
-            # Load if a track is specified and differs from the loaded one.
-            if track_id is not None:
-                cur = self._current_track
-                if cur is None or cur.track_id != track_id:
-                    logger.info(f"Loading new track: {track_id}")
-                    if not await self._load_track_locked(
-                        queue_item_id or 0, track_id, context_uuid
-                    ):
-                        return
-                elif (
-                    not stale
-                    and queue_item_id
-                    and cur.queue_item_id
-                    and (cur.queue_item_id != queue_item_id)
-                ):
-                    # Same track but a different known queue occurrence id. Adopt
-                    # it. Only split the play report when not currently playing:
-                    # a paused/stopped track re-armed from a different slot is a
-                    # distinct play, so end the prior report and let the
-                    # subsequent play report fresh. While PLAYING the audio is
-                    # continuous (e.g. a queue reorder reassigned the id), so it
-                    # stays one listen — splitting it would double-scrobble.
+        # Load if a track is specified and differs from the loaded one.
+        if track_id is not None:
+            cur = self._current_track
+            if cur is None or cur.track_id != track_id:
+                logger.info(f"Loading new track: {track_id}")
+                if not await self._load_track_locked(queue_item_id or 0, track_id, context_uuid):
+                    return
+            elif (
+                not stale
+                and queue_item_id
+                and cur.queue_item_id
+                and (cur.queue_item_id != queue_item_id)
+            ):
+                # Same track but a different known queue occurrence id. Adopt
+                # it. Only split the play report when not currently playing:
+                # a paused/stopped track re-armed from a different slot is a
+                # distinct play, so end the prior report and let the
+                # subsequent play report fresh. While PLAYING the audio is
+                # continuous (e.g. a queue reorder reassigned the id), so it
+                # stays one listen — splitting it would double-scrobble.
+                cur.queue_item_id = queue_item_id
+                if context_uuid is not None:
+                    cur.context_uuid = context_uuid
+                if self._state != PlaybackState.PLAYING:
+                    await self._report_stopped()
+            elif not stale:
+                # Same play. Fill in a late queue item id if we never had a
+                # real one, and adopt a changed/late context. Only overwrite
+                # context with a real value so a context-less SET_STATE can't
+                # wipe a known context.
+                if queue_item_id and not cur.queue_item_id:
                     cur.queue_item_id = queue_item_id
-                    if context_uuid is not None:
-                        cur.context_uuid = context_uuid
-                    if self._state != PlaybackState.PLAYING:
-                        await self._report_stopped()
-                elif not stale:
-                    # Same play. Fill in a late queue item id if we never had a
-                    # real one, and adopt a changed/late context. Only overwrite
-                    # context with a real value so a context-less SET_STATE can't
-                    # wipe a known context.
-                    if queue_item_id and not cur.queue_item_id:
-                        cur.queue_item_id = queue_item_id
-                    if context_uuid is not None and cur.context_uuid != context_uuid:
-                        cur.context_uuid = context_uuid
-                        # The play may already be active in the reporter (we
-                        # return early from _play_locked while PLAYING), so
-                        # re-sync its session or the end report keeps the old
-                        # context.
-                        if self._play_reporter:
-                            self._play_reporter.update_context(
-                                track_id=track_id,
-                                context_uuid=self._format_context_uuid(context_uuid),
-                            )
+                if context_uuid is not None and cur.context_uuid != context_uuid:
+                    cur.context_uuid = context_uuid
+                    # The play may already be active in the reporter (we
+                    # return early from _play_locked while PLAYING), so
+                    # re-sync its session or the end report keeps the old
+                    # context.
+                    if self._play_reporter:
+                        self._play_reporter.update_context(
+                            track_id=track_id,
+                            context_uuid=self._format_context_uuid(context_uuid),
+                        )
 
-            # Position, then play/pause/stop — same order as the app expects.
-            if position_ms is not None and not stale:
-                await self.seek(position_ms)
+        # Position, then play/pause/stop — same order as the app expects.
+        if position_ms is not None and not stale:
+            await self.seek(position_ms)
 
-            if playing_state is not None and not stale:
-                # Proto: 1=STOPPED, 2=PLAYING, 3=PAUSED
-                if playing_state == 2:
-                    await self._play_locked(position_ms or 0)
-                elif playing_state == 3:
-                    await self._pause_locked(position_ms)
-                elif playing_state == 1:
-                    await self._stop_playback_locked()
+        if playing_state is not None and not stale:
+            # Proto: 1=STOPPED, 2=PLAYING, 3=PAUSED
+            if playing_state == 2:
+                await self._play_locked(position_ms or 0)
+            elif playing_state == 3:
+                await self._pause_locked(position_ms)
+            elif playing_state == 1:
+                await self._stop_playback_locked()
 
     def _is_stale_pause_snapshot_locked(
         self,
@@ -541,9 +639,10 @@ class QobuzPlayer:
     ) -> bool:
         """Decide whether an inbound SET_STATE is a stale session-restore replay.
 
-        Must be called while holding ``_playback_lock`` so the live player state
-        it reads is consistent with the surrounding mutation. Returns True when
-        ALL of:
+        Must be called from within ``apply_remote_state``'s own command-queue
+        item so the live player state it reads is consistent with the
+        surrounding mutation (nothing else can run concurrently with a
+        queued item — see Player.enqueue()). Returns True when ALL of:
           - server says PAUSED
           - renderer is still PLAYING
           - it's the same track the renderer is on
@@ -586,12 +685,7 @@ class QobuzPlayer:
         Returns:
             True if playback started/resumed successfully
         """
-        gen = self._next_generation()
-        async with self._playback_lock:
-            if gen != self._command_generation:
-                logger.debug("play superseded by newer command; skipping")
-                return False
-            return await self._play_locked(position_ms)
+        return await self._play_locked(position_ms)
 
     async def _play_locked(self, position_ms: int = 0) -> bool:
         logger.debug(f"Play command, current state: {self._state}")
@@ -665,12 +759,7 @@ class QobuzPlayer:
         Returns:
             True if track was reloaded successfully
         """
-        gen = self._next_generation()
-        async with self._playback_lock:
-            if gen != self._command_generation:
-                logger.debug("reload_current_track superseded by newer command; skipping")
-                return False
-            return await self._reload_current_track_locked()
+        return await self._reload_current_track_locked()
 
     async def _reload_current_track_locked(self) -> bool:
         if not self._current_track:
@@ -719,12 +808,7 @@ class QobuzPlayer:
         Returns:
             True if paused successfully
         """
-        gen = self._next_generation()
-        async with self._playback_lock:
-            if gen != self._command_generation:
-                logger.debug("pause superseded by newer command; skipping")
-                return False
-            return await self._pause_locked()
+        return await self._pause_locked()
 
     async def _pause_locked(self, position_ms: Optional[int] = None) -> bool:
         if (
@@ -775,12 +859,7 @@ class QobuzPlayer:
 
         Resets position to 0 but keeps queue position.
         """
-        gen = self._next_generation()
-        async with self._playback_lock:
-            if gen != self._command_generation:
-                logger.debug("stop_playback superseded by newer command; skipping")
-                return
-            await self._stop_playback_locked()
+        await self._stop_playback_locked()
 
     async def _stop_playback_locked(self) -> None:
         # Clear gapless state — explicit stop
@@ -815,12 +894,7 @@ class QobuzPlayer:
         Returns:
             True if track loaded successfully
         """
-        gen = self._next_generation()
-        async with self._playback_lock:
-            if gen != self._command_generation:
-                logger.debug("load_track superseded by newer command; skipping")
-                return False
-            return await self._load_track_locked(queue_item_id, track_id)
+        return await self._load_track_locked(queue_item_id, track_id)
 
     async def _load_track_locked(
         self,
@@ -889,12 +963,7 @@ class QobuzPlayer:
         Returns:
             True if playback started successfully
         """
-        gen = self._next_generation()
-        async with self._playback_lock:
-            if gen != self._command_generation:
-                logger.debug("play_track superseded by newer command; skipping")
-                return False
-            return await self._play_track_locked(queue_item_id, track_id, position_ms, context_uuid)
+        return await self._play_track_locked(queue_item_id, track_id, position_ms, context_uuid)
 
     async def _play_track_locked(
         self,
@@ -975,12 +1044,7 @@ class QobuzPlayer:
         Returns:
             True if advanced to next track, False if at end
         """
-        gen = self._next_generation()
-        async with self._playback_lock:
-            if gen != self._command_generation:
-                logger.debug("next_track superseded by newer command; skipping")
-                return False
-            return await self._next_track_locked()
+        return await self._next_track_locked()
 
     async def _next_track_locked(self) -> bool:
         # Clear gapless state — explicit skip
@@ -1023,12 +1087,7 @@ class QobuzPlayer:
         Returns:
             True if action taken successfully
         """
-        gen = self._next_generation()
-        async with self._playback_lock:
-            if gen != self._command_generation:
-                logger.debug("previous_track superseded by newer command; skipping")
-                return False
-            return await self._previous_track_locked()
+        return await self._previous_track_locked()
 
     async def _previous_track_locked(self) -> bool:
         # Clear gapless state — explicit navigation
@@ -1252,16 +1311,27 @@ class QobuzPlayer:
     def _on_track_ended(self) -> None:
         """Callback when backend reports track ended naturally."""
         logger.debug("Track ended callback")
-        # Snapshot the track that ended synchronously, before any queued user
-        # command (stop/next/play) task can run. The automatic repeat restart
-        # is only valid while this exact track is still the active one.
-        asyncio.create_task(self._handle_track_ended(self._current_track))
+        # Snapshot the track that ended synchronously, before this can
+        # actually run — it may sit behind other queued items for a
+        # moment, and the automatic repeat restart below is only valid
+        # while this exact track is still the active one when it does.
+        # coalesce=True: a user command (stop/next/play) enqueued before
+        # this runs supersedes it, same as any other playback-directing
+        # command — see enqueue().
+        self.enqueue(
+            functools.partial(self._handle_track_ended, self._current_track), coalesce=True
+        )
 
     async def _handle_track_ended(self, ended_track: Optional[QueueTrack]) -> None:
         """Handle natural track end.
 
-        ``ended_track`` is the track that was playing when the backend reported
-        the end, used to detect a user command that superseded the restart.
+        ``ended_track`` is the track that was playing when the backend
+        reported the end. Runs as one command-queue item — nothing else
+        can interleave with it (see enqueue()), so by the time it reaches
+        the repeat-one branch below, ``ended_track`` is guaranteed to
+        still be ``self._current_track``: anything that could have
+        changed it either already ran before this item started, or was
+        itself coalesced away by this one being enqueued.
         """
         # Clear gapless state — prevents stale gapless callbacks from racing
         self._transition_generation += 1
@@ -1277,9 +1347,8 @@ class QobuzPlayer:
         queue_state = await self.queue.get_state()
 
         if queue_state.repeat_mode == RepeatMode.ONE and ended_track is not None:
-            # Restart the current track from the beginning under repeat-one,
-            # unless a user command superseded us while we were reporting.
-            await self._restart_current_track(ended_track)
+            # Restart the current track from the beginning under repeat-one.
+            await self._restart_current_track_locked()
             return
 
         # Try to get next track from command handler (SET_STATE nextQueueItem)
@@ -1307,23 +1376,8 @@ class QobuzPlayer:
         self._position_value_ms = 0
         await self._send_state_update()
 
-    async def _restart_current_track(self, ended_track: QueueTrack) -> None:
-        """Restart the current track from the beginning (repeat-one).
-
-        ``ended_track`` is the track that ended. The restart only proceeds while
-        that exact track is still active and the player is still PLAYING — a
-        user stop (-> STOPPED), pause (-> PAUSED), or next/play (different
-        ``_current_track``) that raced the natural end therefore wins, and we
-        skip the replay rather than override their intent.
-        """
-        async with self._playback_lock:
-            if self._current_track is not ended_track or self._state != PlaybackState.PLAYING:
-                logger.debug("repeat-one restart superseded by user command; skipping")
-                return
-            await self._restart_current_track_locked()
-
     async def _restart_current_track_locked(self) -> None:
-        """Restart the current track, assuming the playback lock is held.
+        """Restart the current track from the beginning (repeat-one).
 
         On natural end the backend has already transitioned to STOPPED, so a
         bare seek(0) leaves it silent — we must re-issue play. The cached URL
@@ -1550,18 +1604,18 @@ class QobuzPlayer:
         """Callback when the backend's own state changes.
 
         Fires both when acking a command we just issued (backend.play/
-        pause/resume/stop, all called with `_playback_lock` held by the
-        `_*_locked` method that's awaiting them) and when the backend's
-        own poll loop notices a change on its own (external pause,
-        confirmed external stop while paused — see
-        DLNABackend._poll_state_loop). The command case is already fully
-        handled by the calling `_*_locked` method right after it awaits
-        the backend call (sets `self._state`, sends the update, reports
-        the play/pause/stop) — nothing to do here for that case, so it's
-        skipped via the same lock that method is holding. This handles
-        only the unprompted one.
+        pause/resume/stop, called from within a command-queue item — see
+        enqueue()/_command_consumer_loop) and when the backend's own poll
+        loop notices a change on its own (external pause, confirmed
+        external stop while paused — see DLNABackend._poll_state_loop).
+        The command case is already fully handled by the calling
+        `_*_locked` method right after it awaits the backend call (sets
+        `self._state`, sends the update, reports the play/pause/stop) —
+        nothing to do here for that case, so it's skipped via
+        `_processing_command` (True for as long as the consumer is
+        running that item). This handles only the unprompted one.
         """
-        if self._playback_lock.locked():
+        if self._processing_command:
             return
         if state == self._state:
             return

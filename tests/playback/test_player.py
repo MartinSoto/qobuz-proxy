@@ -1,6 +1,7 @@
 """Tests for QobuzPlayer gapless re-arming."""
 
 import asyncio
+import functools
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,6 +13,8 @@ from qobuz_proxy.playback.queue import QueueTrack, RepeatMode
 def _make_player(next_track_info=None):
     """Build a player with mocked queue/metadata/backend."""
     queue = MagicMock()
+    queue.start = AsyncMock()
+    queue.stop = AsyncMock()
     metadata = MagicMock()
     metadata.get_streaming_url = AsyncMock(return_value="http://proxy:7120/audio/222_9.flac")
     meta_obj = MagicMock()
@@ -48,6 +51,7 @@ def _make_player(next_track_info=None):
     backend.supports_gapless = True
     backend.clear_next_track = AsyncMock()
     backend.set_next_track = AsyncMock(return_value=True)
+    backend.disconnect = AsyncMock()
 
     player = QobuzPlayer(queue=queue, metadata_service=metadata, backend=backend)
     player.set_next_track_callbacks(
@@ -420,32 +424,34 @@ class TestRepeatOneNaturalEnd:
         assert player._gapless_armed is False
         assert player._pending_next_track is None
 
-    async def test_restart_yields_to_user_stop(self):
-        """A user Stop that raced the natural end must not be overridden.
-
-        Stop leaves _current_track set but flips state to STOPPED, so the
-        restart must detect the state change and bail.
-        """
+    async def test_user_command_supersedes_a_pending_natural_end(self):
+        """A user command (e.g. explicit stop) that lands while the natural-
+        track-end continuation is still queued — not yet started — supersedes
+        it via coalescing (cross-source: a WS-driven command dropping a
+        backend-driven one — see Player.enqueue()). Under the old lock/
+        generation mechanism this was `_restart_current_track`'s own
+        staleness re-check; the command queue's serialization now makes
+        that check unreachable once a repeat-one restart actually starts
+        running (nothing can change _current_track/_state mid-flight), so
+        the only place this race can still play out is here — before it
+        starts, in the queue."""
         player, backend = _make_player()
         self._arm_repeat_one(player, backend)
-        ended_track = player._current_track
+        await player.start()
 
-        # Stop ran while we were reporting: same track, but state is STOPPED.
-        player._state = PlaybackState.STOPPED
+        # Block the consumer on an unrelated, already-running item so the
+        # track-ended continuation and the user's stop both land in the
+        # queue, neither started yet.
+        blocker = asyncio.Event()
+        player.enqueue(blocker.wait)
+        await asyncio.sleep(0)  # let the consumer pick up the blocker
 
-        await player._restart_current_track(ended_track)
+        player._on_track_ended()  # enqueues _handle_track_ended, coalesce=True
+        player.enqueue(functools.partial(player.stop_playback), coalesce=True)
 
-        backend.play.assert_not_awaited()
+        blocker.set()
+        await player._command_queue.join()
+        await player.stop()
 
-    async def test_restart_yields_to_user_next(self):
-        """A user Next that swapped the current track must not be overridden."""
-        player, backend = _make_player()
-        self._arm_repeat_one(player, backend)
-        ended_track = player._current_track
-
-        # Next ran while we were reporting: a different track is now current.
-        player._current_track = QueueTrack(queue_item_id=10, track_id="333")
-
-        await player._restart_current_track(ended_track)
-
+        # The repeat-one restart was coalesced away — never ran.
         backend.play.assert_not_awaited()

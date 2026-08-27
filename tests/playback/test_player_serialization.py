@@ -2,11 +2,13 @@
 
 A track switch in the Qobuz app sends a burst of SET_STATE messages, which used
 to fire overlapping load/play/stop calls and concurrent SOAP requests that wedge
-DLNA renderers. The player now serializes commands behind a lock and lets a newer
-command supersede an older one waiting on it.
+DLNA renderers. The player now serializes commands through its command queue's
+single consumer, and coalesce=True (see QobuzPlayer.enqueue()) lets a newer
+command supersede an older one still waiting to run.
 """
 
 import asyncio
+import functools
 from unittest.mock import AsyncMock, MagicMock
 
 from qobuz_proxy.backends.base import AudioBackend
@@ -69,6 +71,8 @@ def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:
     metadata.log_now_playing_info = MagicMock()
 
     queue = MagicMock()
+    queue.start = AsyncMock()
+    queue.stop = AsyncMock()
     queue.set_current_by_item_id = AsyncMock(return_value=True)
     # Player routes track loading through queue.get_track_url/get_track_metadata
     # (see QobuzQueue's own implementation) rather than fetching directly —
@@ -100,11 +104,19 @@ class TestPositionedStart:
 class TestPlaybackSerialization:
     async def test_concurrent_play_track_never_overlaps(self) -> None:
         player, backend = _make_player()
+        await player.start()
 
+        # All enqueued synchronously, before the consumer gets a chance to
+        # run any of them — coalesce=True (see enqueue()) drops every one
+        # but the last before it ever starts.
         track_ids = [f"{i}" for i in range(1, 6)]
-        await asyncio.gather(
-            *(player.play_track(queue_item_id=i, track_id=t) for i, t in enumerate(track_ids))
-        )
+        for i, t in enumerate(track_ids):
+            player.enqueue(
+                functools.partial(player.play_track, queue_item_id=i, track_id=t),
+                coalesce=True,
+            )
+        await player._command_queue.join()
+        await player.stop()
 
         # The critical invariant: backend.play never ran concurrently.
         assert backend.max_active == 1
@@ -115,20 +127,32 @@ class TestPlaybackSerialization:
         # Supersede dropped at least one intermediate request.
         assert len(backend.played) < len(track_ids)
 
-    async def test_generation_supersede_skips_stale_command(self) -> None:
-        """A command whose generation is bumped before it acquires the lock is skipped."""
+    async def test_coalesced_command_is_skipped_without_running(self) -> None:
+        """A coalesce=True command superseded by a newer one before it starts
+        never runs at all — the consumer skips it entirely."""
         player, backend = _make_player()
+        await player.start()
 
-        # Hold the lock, then queue a command and bump the generation behind it.
-        await player._playback_lock.acquire()
-        stale = asyncio.create_task(player.play_track(queue_item_id=0, track_id="stale"))
-        await asyncio.sleep(0)  # let `stale` reach the lock and register its generation
-        player._next_generation()  # a newer command supersedes `stale`
-        player._playback_lock.release()
+        # Block the consumer on an unrelated, already-running item so the
+        # next two enqueues both land in the queue, neither started yet.
+        blocker = asyncio.Event()
+        player.enqueue(blocker.wait)
+        await asyncio.sleep(0)  # let the consumer pick up the blocker
 
-        result = await stale
-        assert result is False
-        assert backend.played == []
+        player.enqueue(
+            functools.partial(player.play_track, queue_item_id=0, track_id="stale"),
+            coalesce=True,
+        )
+        player.enqueue(
+            functools.partial(player.play_track, queue_item_id=1, track_id="fresh"),
+            coalesce=True,
+        )
+
+        blocker.set()
+        await player._command_queue.join()
+        await player.stop()
+
+        assert backend.played == ["fresh"]
 
 
 class TestApplyRemoteStateSerialization:
@@ -141,16 +165,22 @@ class TestApplyRemoteStateSerialization:
 
     async def test_concurrent_apply_remote_state_never_overlaps(self) -> None:
         player, backend = _make_player()
+        await player.start()
 
         track_ids = [str(i) for i in range(1, 6)]
-        await asyncio.gather(
-            *(
-                player.apply_remote_state(
-                    track_id=t, queue_item_id=i, position_ms=0, playing_state=2
-                )
-                for i, t in enumerate(track_ids)
+        for i, t in enumerate(track_ids):
+            player.enqueue(
+                functools.partial(
+                    player.apply_remote_state,
+                    track_id=t,
+                    queue_item_id=i,
+                    position_ms=0,
+                    playing_state=2,
+                ),
+                coalesce=True,
             )
-        )
+        await player._command_queue.join()
+        await player.stop()
 
         # No interleaving of the load/play steps across SET_STATE sequences.
         assert backend.max_active == 1
@@ -160,28 +190,44 @@ class TestApplyRemoteStateSerialization:
         assert backend.played[-1] == track_ids[-1]
 
     async def test_newer_set_state_wins_when_queued_behind_older(self) -> None:
-        """Reproduce the reviewer's interleave: older sequence is in-flight, a newer
-        one is queued behind the lock, and a third (newest) supersedes the queued one.
-        The final track must be the newest, and the superseded one must not run."""
+        """Reproduce the reviewer's interleave: older sequence is in-flight
+        (already running), a newer one queues behind it, and a third (newest)
+        supersedes the queued one before it runs. The final track must be
+        the newest, and the superseded one must never play."""
         player, backend = _make_player()
+        await player.start()
 
-        # Older SET_STATE (track A) grabs the lock first and is mid-flight.
-        older = asyncio.create_task(
-            player.apply_remote_state(track_id="A", queue_item_id=1, position_ms=0, playing_state=2)
-        )
-        await asyncio.sleep(0)  # let A acquire the lock and start loading/playing
+        # Make "A" (the in-flight one) block partway through, so "B" and
+        # "C" are guaranteed to still be queued — not started — when C's
+        # enqueue coalesces B away.
+        release_a = asyncio.Event()
+        original_play = backend.play
 
-        # A newer SET_STATE (track B) queues behind the lock...
-        newer = asyncio.create_task(
-            player.apply_remote_state(track_id="B", queue_item_id=2, position_ms=0, playing_state=2)
-        )
-        await asyncio.sleep(0)  # let B register its generation, then wait on the lock
-        # ...and an even newer SET_STATE (track C) supersedes B before B runs.
-        newest = asyncio.create_task(
-            player.apply_remote_state(track_id="C", queue_item_id=3, position_ms=0, playing_state=2)
-        )
+        async def blocking_play(url, metadata):  # type: ignore[no-untyped-def]
+            if metadata.track_id == "A":
+                await release_a.wait()
+            await original_play(url, metadata)
 
-        await asyncio.gather(older, newer, newest)
+        backend.play = blocking_play  # type: ignore[method-assign]
+
+        def _apply(track_id: str, queue_item_id: int):  # type: ignore[no-untyped-def]
+            return functools.partial(
+                player.apply_remote_state,
+                track_id=track_id,
+                queue_item_id=queue_item_id,
+                position_ms=0,
+                playing_state=2,
+            )
+
+        player.enqueue(_apply("A", 1), coalesce=True)
+        await asyncio.sleep(0)  # let A start running and block on release_a
+
+        player.enqueue(_apply("B", 2), coalesce=True)
+        player.enqueue(_apply("C", 3), coalesce=True)
+
+        release_a.set()
+        await player._command_queue.join()
+        await player.stop()
 
         assert backend.max_active == 1
         # B was superseded by C and must never have played.
