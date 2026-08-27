@@ -582,7 +582,18 @@ class DLNABackend(AudioBackend):
             # too. Not a real signal either way during this window.
             return True
 
-        current_uri = await self._get_current_transport_uri()
+        return self._is_playing_our_content_given(await self._get_current_transport_uri())
+
+    def _is_playing_our_content_given(self, current_uri: Optional[str]) -> bool:
+        """The classification half of is_playing_our_content(), given a
+        transport URI already read this cycle — split out so
+        _poll_state_loop can reuse a single read for both gapless-
+        transition detection and hijack detection when a cycle needs
+        both, instead of each doing its own separate device round trip.
+        Doesn't itself check self._client/self._current_proxy_url/the
+        grace period — is_playing_our_content() still does, for its own
+        callers; _poll_state_loop does the equivalent checks itself
+        before ever reading."""
         if current_uri is None:
             return True  # transient read failure — don't false-positive
 
@@ -815,31 +826,51 @@ class DLNABackend(AudioBackend):
                 if new_state != PlaybackState.PLAYING:
                     self._hijack_check_countdown = 0
 
-                # Gapless transition detection: check if device has moved to next track
-                if (
-                    new_state == PlaybackState.PLAYING
-                    and self._next_track_proxy_url
-                    and self._client
-                ):
-                    current_uri = await self._get_current_transport_uri()
-                    if current_uri and current_uri == self._next_track_proxy_url:
-                        logger.info("Gapless: transition detected — device moved to next track")
-                        # Update state to reflect the new track
-                        self._current_metadata = self._next_track_metadata
-                        self._current_proxy_url = self._next_track_proxy_url
-                        if self._next_track_metadata:
-                            self._duration_ms = self._next_track_metadata.duration_ms
-                        self._position_ms = 0
-                        self._playback_started_at = time.monotonic()
-                        # Clear gapless state — the armed entry is now the
-                        # playing one, so don't remove it from the queue
-                        self._next_track_proxy_url = None
-                        self._next_track_metadata = None
-                        self._next_track_queue_nr = None
-                        # Notify player
-                        self._notify_next_track_started()
-                        self._notify_position_update(0)
-                        continue
+                # Gapless-transition detection and hijack detection are
+                # both ultimately answered by the same question — does the
+                # device's actual current-source URI match what we expect?
+                # (see is_playing_our_content()/_is_playing_our_content_given)
+                # — so a cycle that needs both only ever pays for one
+                # device round trip, and a read that happens for gapless
+                # reasons doubles as a hijack check for free (resetting the
+                # throttle countdown either way) instead of waiting for its
+                # own separately-throttled turn.
+                if new_state == PlaybackState.PLAYING and self._client:
+                    self._hijack_check_countdown -= 1
+                    hijack_check_due = self._hijack_check_countdown <= 0
+                    if hijack_check_due:
+                        self._hijack_check_countdown = _HIJACK_CHECK_INTERVAL_POLLS
+                    armed = bool(self._next_track_proxy_url)
+
+                    if armed or (hijack_check_due and not in_grace_period):
+                        current_uri = await self._get_current_transport_uri()
+
+                        if armed and current_uri == self._next_track_proxy_url:
+                            logger.info("Gapless: transition detected — device moved to next track")
+                            # Update state to reflect the new track
+                            self._current_metadata = self._next_track_metadata
+                            self._current_proxy_url = self._next_track_proxy_url
+                            if self._next_track_metadata:
+                                self._duration_ms = self._next_track_metadata.duration_ms
+                            self._position_ms = 0
+                            self._playback_started_at = time.monotonic()
+                            # Clear gapless state — the armed entry is now
+                            # the playing one, so don't remove it from the
+                            # queue
+                            self._next_track_proxy_url = None
+                            self._next_track_metadata = None
+                            self._next_track_queue_nr = None
+                            # Notify player
+                            self._notify_next_track_started()
+                            self._notify_position_update(0)
+                            continue
+
+                        if not in_grace_period and not self._is_playing_our_content_given(
+                            current_uri
+                        ):
+                            logger.info("External takeover detected on this renderer")
+                            self._notify_external_takeover()
+                            continue
 
                 # Paused -> confirmed external stop: don't trust a single
                 # STOPPED read (transient failures collapse to STOPPED too;
@@ -881,21 +912,6 @@ class DLNABackend(AudioBackend):
                             self._notify_track_ended()
 
                     self._notify_state_change(new_state)
-
-                # Hijack detection: the device can keep reporting PLAYING
-                # throughout a takeover (another app grouping into or
-                # playing directly to a shared renderer) — get_state()
-                # alone can't tell that apart from us still playing.
-                # is_playing_our_content() already gates itself on the
-                # grace period, so no need to check it again here.
-                if new_state == PlaybackState.PLAYING:
-                    self._hijack_check_countdown -= 1
-                    if self._hijack_check_countdown <= 0:
-                        self._hijack_check_countdown = _HIJACK_CHECK_INTERVAL_POLLS
-                        if not await self.is_playing_our_content():
-                            logger.info("External takeover detected on this renderer")
-                            self._notify_external_takeover()
-                            continue
 
                 # Update position while playing
                 if new_state == PlaybackState.PLAYING:

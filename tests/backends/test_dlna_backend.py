@@ -433,7 +433,11 @@ class TestPollStateLoop:
         backend._on_external_takeover = None
         backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
         backend.get_position = AsyncMock(return_value=0)
-        backend.is_playing_our_content = AsyncMock(return_value=True)
+        # Default: device reports the same URI we set — "still ours", no
+        # takeover. Gapless/hijack detection now share this one read (see
+        # _poll_state_loop) rather than going through is_playing_our_content()
+        # directly; tests exercising a takeover override this.
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/track.flac")
         return backend
 
     async def _run_poll_cycles(self, backend: DLNABackend, cycles: int = 1) -> None:
@@ -465,7 +469,9 @@ class TestPollStateLoop:
         backend = self._make_backend()
         backend._state = PlaybackState.PLAYING
         backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
-        backend.is_playing_our_content = AsyncMock(return_value=False)
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://someone-else/spotify-stream"
+        )
         backend._hijack_check_countdown = 1  # force the check on the first cycle
         callback = MagicMock()
         backend.on_external_takeover(callback)
@@ -480,7 +486,7 @@ class TestPollStateLoop:
         backend = self._make_backend()
         backend._state = PlaybackState.PLAYING
         backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
-        backend.is_playing_our_content = AsyncMock(return_value=True)
+        # Fixture default already reports the matching (non-takeover) URI.
         backend._hijack_check_countdown = 1
         callback = MagicMock()
         backend.on_external_takeover(callback)
@@ -497,12 +503,11 @@ class TestPollStateLoop:
         backend = self._make_backend()
         backend._state = PlaybackState.PLAYING
         backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
-        backend.is_playing_our_content = AsyncMock(return_value=True)
         backend._hijack_check_countdown = _HIJACK_CHECK_INTERVAL_POLLS + 5  # not due yet
 
         await self._run_poll_cycles(backend)
 
-        backend.is_playing_our_content.assert_not_called()
+        backend._get_current_transport_uri.assert_not_called()
 
     async def test_hijack_not_checked_while_paused(self) -> None:
         from unittest.mock import AsyncMock
@@ -510,11 +515,70 @@ class TestPollStateLoop:
         backend = self._make_backend()
         backend._state = PlaybackState.PAUSED
         backend.get_state = AsyncMock(return_value=PlaybackState.PAUSED)
-        backend.is_playing_our_content = AsyncMock(return_value=False)
 
         await self._run_poll_cycles(backend)
 
-        backend.is_playing_our_content.assert_not_called()
+        backend._get_current_transport_uri.assert_not_called()
+
+    async def test_gapless_transition_still_detected(self) -> None:
+        """Merging the read with hijack detection must not break the
+        original gapless-transition detection it came from."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/next.flac")
+        callback = MagicMock()
+        backend.on_next_track_started(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_called_once()
+        assert backend._current_proxy_url == "http://proxy/next.flac"
+        assert backend._next_track_proxy_url is None
+
+    async def test_gapless_and_hijack_share_a_single_read_when_both_due(self) -> None:
+        """The whole point of merging them: a cycle where something's
+        armed *and* the hijack throttle is also due must only read the
+        device once, not once for each purpose."""
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._hijack_check_countdown = 1  # due this cycle too
+        # Still playing what we set — no transition, no takeover.
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/track.flac")
+
+        await self._run_poll_cycles(backend)
+
+        backend._get_current_transport_uri.assert_called_once()
+
+    async def test_hijack_checked_opportunistically_when_armed_but_not_due(self) -> None:
+        """A read that happens for gapless reasons also answers the
+        hijack question for free, even before the throttled countdown
+        would otherwise have reached zero."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from qobuz_proxy.backends.dlna.backend import _HIJACK_CHECK_INTERVAL_POLLS
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._hijack_check_countdown = _HIJACK_CHECK_INTERVAL_POLLS + 5  # not due yet
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://someone-else/spotify-stream"
+        )
+        callback = MagicMock()
+        backend.on_external_takeover(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_called_once()
 
     async def test_paused_stop_confirmed_after_consecutive_polls(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
