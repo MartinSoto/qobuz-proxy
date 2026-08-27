@@ -638,9 +638,31 @@ class DLNABackend(AudioBackend):
             # into a stop/track-ended signal instead.
             return True
 
-        # A gapless transition already armed by us is a legitimate URI
-        # change in flight, not a takeover.
+        if self._is_own_proxy_url(current_uri):
+            # Still being served by our own proxy — some track of ours,
+            # whichever one exactly. "Hijacked" means an *external* source
+            # took over; our own bookkeeping of exactly which track is
+            # current can legitimately lag a real transition (a device
+            # advancing to something already in its queue that we didn't
+            # separately re-arm — see sonos-retarget-gapless-desync) without
+            # that ever being evidence of anything external happening. The
+            # narrower "is this specifically the track/next-track we
+            # expect" question belongs to gapless-transition detection
+            # (_poll_state_loop), which needs to know *which* track to
+            # update metadata correctly — this method doesn't.
+            return True
+
         return current_uri in (self._current_proxy_url, self._next_track_proxy_url)
+
+    def _is_own_proxy_url(self, uri: str) -> bool:
+        """Whether `uri` is served by this backend's own proxy — any track,
+        not necessarily the one we currently think is playing. Each Speaker
+        owns a distinct proxy host:port, so a prefix match is unambiguous.
+        False (not just uncertain) when no proxy is configured — callers
+        that reach here already know `uri` is non-empty and want a real
+        answer, and the exact-match fallback they run next still catches
+        the case where it happens to equal what we're tracking."""
+        return self._proxy_server is not None and uri.startswith(self._proxy_server.base_url)
 
     async def _get_current_transport_uri(self) -> Optional[str]:
         """The URI this device reports as its current source — used both
@@ -668,10 +690,12 @@ class DLNABackend(AudioBackend):
         only 0.5% of the file had streamed, immediately followed by that
         same device's queue getting rebuilt out from under an in-progress
         Sonos handoff — see RETARGET_CONFIRMATION_TIMEOUT_SECONDS). If the
-        device still shows *our* content loaded, a STOPPED read is almost
+        device still shows *our* content loaded — any track our own proxy
+        is serving, not necessarily the specific one we currently think is
+        current (see _is_own_proxy_url) — a STOPPED read is almost
         certainly one of those — not evidence of anything. Only an
-        empty/different URI (the device confirming there's nothing, or
-        something else, loaded) counts as real confirmation.
+        empty URI, or one genuinely outside our own proxy, counts as real
+        confirmation.
         """
         if not self._client or not self._current_proxy_url:
             return True  # nothing of ours was loaded to begin with
@@ -682,8 +706,11 @@ class DLNABackend(AudioBackend):
         )
         if current_uri is None:
             return False  # read failed — no evidence either way, not yet
-        if current_uri in (self._current_proxy_url, self._next_track_proxy_url):
-            return False  # still shows our content — not really stopped
+        if self._is_own_proxy_url(current_uri) or current_uri in (
+            self._current_proxy_url,
+            self._next_track_proxy_url,
+        ):
+            return False  # still shows our content (some track of ours) — not really stopped
         return True  # empty, or something else entirely
 
     # =========================================================================

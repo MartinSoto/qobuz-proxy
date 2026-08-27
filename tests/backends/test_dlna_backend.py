@@ -130,6 +130,7 @@ class TestIsPlayingOurContent:
         backend._next_track_proxy_url = None
         backend._playback_started_at = 0.0  # well outside the grace period
         backend._active = True
+        backend._proxy_server = None
         return backend
 
     async def test_true_when_uri_matches(self):
@@ -223,6 +224,40 @@ class TestIsPlayingOurContent:
 
         assert await backend.is_playing_our_content() is True
 
+    async def test_true_when_uri_is_a_different_track_from_our_own_proxy(self):
+        """Regression (test1.log, 2026-08-28): a device can legitimately
+        advance to a track we haven't separately tracked as "current" or
+        "armed" — e.g. one Sonos itself carried over into its queue across
+        a coordinator handoff (see sonos-retarget-gapless-desync). As long
+        as it's still being served by *our own* proxy, that's not a
+        takeover — only a source outside our own proxy is."""
+        import time
+        from unittest.mock import MagicMock
+
+        from qobuz_proxy.backends.dlna.backend import PLAYBACK_START_GRACE_PERIOD_SECONDS
+
+        backend = self._make_backend()
+        backend._playback_started_at = time.monotonic() - PLAYBACK_START_GRACE_PERIOD_SECONDS - 1
+        backend._proxy_server = MagicMock(base_url="http://192.168.1.50:7121")
+        # A different track than _current_proxy_url/_next_track_proxy_url,
+        # but still served by our own proxy.
+        backend._client.get_media_info.return_value = "http://192.168.1.50:7121/audio/999999_1.flac"
+
+        assert await backend.is_playing_our_content() is True
+
+    async def test_false_when_uri_is_outside_our_own_proxy(self):
+        import time
+        from unittest.mock import MagicMock
+
+        from qobuz_proxy.backends.dlna.backend import PLAYBACK_START_GRACE_PERIOD_SECONDS
+
+        backend = self._make_backend()
+        backend._playback_started_at = time.monotonic() - PLAYBACK_START_GRACE_PERIOD_SECONDS - 1
+        backend._proxy_server = MagicMock(base_url="http://192.168.1.50:7121")
+        backend._client.get_media_info.return_value = "http://someone-else/spotify-stream"
+
+        assert await backend.is_playing_our_content() is False
+
 
 class TestDeviceConfirmsStopped:
     """DLNABackend._device_confirms_stopped() — whether a STOPPED
@@ -239,6 +274,7 @@ class TestDeviceConfirmsStopped:
         backend._client = AsyncMock()
         backend._current_proxy_url = proxy_url
         backend._next_track_proxy_url = None
+        backend._proxy_server = None
         return backend
 
     async def test_true_when_nothing_was_playing(self):
@@ -268,6 +304,17 @@ class TestDeviceConfirmsStopped:
 
         assert await backend._device_confirms_stopped() is False
 
+    async def test_false_when_uri_is_a_different_track_from_our_own_proxy(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._proxy_server = MagicMock(base_url="http://192.168.1.50:7121")
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://192.168.1.50:7121/audio/999999_1.flac"
+        )
+
+        assert await backend._device_confirms_stopped() is False
+
     async def test_true_when_uri_is_empty(self):
         from unittest.mock import AsyncMock
 
@@ -293,6 +340,50 @@ class TestDeviceConfirmsStopped:
         backend._get_current_transport_uri = AsyncMock(return_value=None)
 
         assert await backend._device_confirms_stopped() is False
+
+
+class TestIsOwnProxyUrl:
+    """DLNABackend._is_own_proxy_url() — is a URI served by this backend's
+    own proxy at all, regardless of which specific track. Each Speaker owns
+    a distinct proxy host:port, so a prefix match is unambiguous — this is
+    what lets hijack/stop detection tell "an external source took over"
+    apart from "our own bookkeeping of exactly which track is current is
+    stale", which is not the same thing (see is_playing_our_content /
+    _device_confirms_stopped)."""
+
+    def _make_backend(self, proxy_server=None):  # type: ignore[no-untyped-def]
+        backend = DLNABackend.__new__(DLNABackend)
+        backend._proxy_server = proxy_server
+        return backend
+
+    def test_true_for_a_different_track_on_the_same_proxy(self):
+        from unittest.mock import MagicMock
+
+        backend = self._make_backend(MagicMock(base_url="http://192.168.1.50:7121"))
+
+        assert backend._is_own_proxy_url("http://192.168.1.50:7121/audio/999999_1.flac") is True
+
+    def test_false_for_a_different_host(self):
+        from unittest.mock import MagicMock
+
+        backend = self._make_backend(MagicMock(base_url="http://192.168.1.50:7121"))
+
+        assert backend._is_own_proxy_url("http://someone-else/spotify-stream") is False
+
+    def test_false_for_a_different_port(self):
+        # Each Speaker's proxy owns a distinct port — a URL on the wrong
+        # port isn't ours even if the host matches (e.g. another room's
+        # own proxy on the same machine).
+        from unittest.mock import MagicMock
+
+        backend = self._make_backend(MagicMock(base_url="http://192.168.1.50:7121"))
+
+        assert backend._is_own_proxy_url("http://192.168.1.50:7122/audio/1.flac") is False
+
+    def test_false_when_no_proxy_configured(self):
+        backend = self._make_backend(proxy_server=None)
+
+        assert backend._is_own_proxy_url("http://192.168.1.50:7121/audio/1.flac") is False
 
 
 class TestRetarget:
@@ -585,6 +676,7 @@ class TestPollStateLoop:
         backend._awaiting_retarget_confirmation = False
         backend._retarget_confirmation_deadline = 0.0
         backend._active = True
+        backend._proxy_server = None
         backend._on_state_change = None
         backend._on_position_update = None
         backend._on_track_ended = None
