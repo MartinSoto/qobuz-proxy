@@ -606,8 +606,8 @@ class DLNABackend(AudioBackend):
         different source (another app, someone grouping into it) while
         still reporting PLAYING throughout, so get_state() alone can't
         detect this."""
-        if not self._client or not self._current_proxy_url:
-            return True  # nothing of ours to have been displaced yet
+        if not self._client or not self._current_proxy_url or not self._active:
+            return True  # nothing of ours to have been displaced yet (or Qobuz isn't driving this renderer right now)
 
         if time.monotonic() - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS:
             # Track just started, or we just retargeted to a new
@@ -955,11 +955,18 @@ class DLNABackend(AudioBackend):
                 # guards on this; this inline poll-loop path used to skip
                 # it, which is exactly the "hijack detected before there
                 # was ever an active session" false positive observed
-                # directly right after startup.
+                # directly right after startup. self._active (see
+                # AudioBackend.set_active) covers the same gap once a
+                # session has existed but Qobuz isn't driving this renderer
+                # right now — a household has one Speaker/backend polling
+                # per discovered Sonos room, and a mismatch on a room
+                # that's simply not the active one isn't evidence of
+                # anything either.
                 if (
                     new_state == PlaybackState.PLAYING
                     and self._client
                     and self._current_proxy_url is not None
+                    and self._active
                 ):
                     self._hijack_check_countdown -= 1
                     hijack_check_due = self._hijack_check_countdown <= 0

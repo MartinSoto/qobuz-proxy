@@ -71,6 +71,24 @@ class TestSetActiveHandling:
         assert player.is_active_renderer is False
         player.stop_playback.assert_awaited_once()
 
+    async def test_active_state_is_relayed_to_the_backend(self) -> None:
+        """See AudioBackend.set_active — a Sonos auto-discovery household
+        polls every discovered room's device continuously regardless of
+        which one Qobuz is actually driving; the backend needs this signal
+        to know when its own hijack detection is actually meaningful."""
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player, queue=None)
+        player.broadcast_current_volume = AsyncMock()  # type: ignore[method-assign]
+        backend.stop = AsyncMock()  # type: ignore[method-assign]
+
+        assert backend._active is True  # default
+
+        await handler._handle_set_active(_set_active_msg(False))
+        assert backend._active is False
+
+        await handler._handle_set_active(_set_active_msg(True))
+        assert backend._active is True
+
     async def test_missing_field_is_ignored(self) -> None:
         player, _backend = _make_player()
         handler = PlaybackCommandHandler(player, queue=None)

@@ -129,6 +129,7 @@ class TestIsPlayingOurContent:
         backend._current_proxy_url = proxy_url
         backend._next_track_proxy_url = None
         backend._playback_started_at = 0.0  # well outside the grace period
+        backend._active = True
         return backend
 
     async def test_true_when_uri_matches(self):
@@ -189,6 +190,23 @@ class TestIsPlayingOurContent:
         backend._client.get_media_info.return_value = "http://someone-else/spotify-stream"
 
         assert await backend.is_playing_our_content() is False
+
+    async def test_true_when_not_the_active_renderer(self):
+        # A household with Sonos auto-discovery has one backend polling per
+        # discovered room, whether or not it's the one Qobuz is actually
+        # driving right now (see AudioBackend.set_active) — a mismatch on
+        # an inactive room isn't evidence of anything.
+        import time
+
+        from qobuz_proxy.backends.dlna.backend import PLAYBACK_START_GRACE_PERIOD_SECONDS
+
+        backend = self._make_backend()
+        backend._playback_started_at = time.monotonic() - PLAYBACK_START_GRACE_PERIOD_SECONDS - 1
+        backend._active = False
+        backend._client.get_media_info.return_value = "http://someone-else/spotify-stream"
+
+        assert await backend.is_playing_our_content() is True
+        backend._client.get_media_info.assert_not_called()
 
     async def test_true_when_device_reports_empty_uri(self):
         # An empty (but present) URI is the device confirming nothing is
@@ -566,6 +584,7 @@ class TestPollStateLoop:
         backend._hijack_check_countdown = 0
         backend._awaiting_retarget_confirmation = False
         backend._retarget_confirmation_deadline = 0.0
+        backend._active = True
         backend._on_state_change = None
         backend._on_position_update = None
         backend._on_track_ended = None
@@ -653,6 +672,32 @@ class TestPollStateLoop:
         backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
         backend._get_current_transport_uri = AsyncMock(
             return_value="http://the-device/its-own-last-content"
+        )
+        backend._hijack_check_countdown = 1
+        callback = MagicMock()
+        backend.on_external_takeover(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_not_called()
+        backend._get_current_transport_uri.assert_not_called()
+
+    async def test_no_hijack_check_while_not_the_active_renderer(self) -> None:
+        """A Sonos auto-discovery household has one Speaker/backend polling
+        per discovered room, whether or not it's the one Qobuz is actually
+        driving (see AudioBackend.set_active / Player.set_active_renderer).
+        A renderer that used to be active and has since been told
+        otherwise (the user switched rooms in the app) still has
+        self._current_proxy_url set from before — that alone must not be
+        enough to keep declaring takeovers against it."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend._active = False
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://someone-else/spotify-stream"
         )
         backend._hijack_check_countdown = 1
         callback = MagicMock()
