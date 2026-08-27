@@ -673,6 +673,7 @@ class TestPollStateLoop:
         backend._playback_started_at = time.monotonic() - 3600  # well outside grace
         backend._paused_stop_polls = 0
         backend._hijack_check_countdown = 0
+        backend._external_takeover_notified = False
         backend._awaiting_retarget_confirmation = False
         backend._retarget_confirmation_deadline = 0.0
         backend._active = True
@@ -746,6 +747,52 @@ class TestPollStateLoop:
         await self._run_poll_cycles(backend)
 
         callback.assert_not_called()
+
+    async def test_sustained_takeover_notifies_only_once(self) -> None:
+        """Regression (test1.log, 2026-08-28): while something's armed for
+        gapless, the shared read runs every poll cycle rather than the
+        throttled hijack cadence — a real, ongoing takeover must not
+        re-notify on every single one of those (observed directly: ~20s
+        of back-to-back notifications, each forcing its own WebSocket
+        reconnect and racing the others badly enough to desync the
+        connection's own message counter)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._next_track_proxy_url = "http://proxy/next.flac"  # armed: reads every cycle
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://someone-else/spotify-stream"
+        )
+        callback = MagicMock()
+        backend.on_external_takeover(callback)
+
+        await self._run_poll_cycles(backend, cycles=5)
+
+        callback.assert_called_once()
+
+    async def test_takeover_notifies_again_after_resolving_and_recurring(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        uris = iter(
+            [
+                "http://someone-else/spotify-stream",  # takeover #1
+                "http://proxy/track.flac",  # resolved — back to ours
+                "http://someone-else/spotify-stream",  # takeover #2
+            ]
+        )
+        backend._get_current_transport_uri = AsyncMock(side_effect=lambda: next(uris))
+        callback = MagicMock()
+        backend.on_external_takeover(callback)
+
+        await self._run_poll_cycles(backend, cycles=3)
+
+        assert callback.call_count == 2
 
     async def test_no_hijack_check_before_anything_has_ever_played(self) -> None:
         """Right after startup — before a Qobuz session ever existed, let
