@@ -143,8 +143,6 @@ class QobuzPlayer:
         # Callback for next track info changes (from command handler)
         self._on_next_track_changed_callback: Optional[Callable[[], None]] = None
 
-        # Background tasks
-        self._state_update_task: Optional[asyncio.Task] = None
         self._is_running: bool = False
 
         # Wire up queue callbacks to metadata service
@@ -179,9 +177,6 @@ class QobuzPlayer:
         if not self.backend.is_connected():
             await self.backend.connect()
 
-        # Start background tasks
-        self._state_update_task = asyncio.create_task(self._state_update_loop())
-
         logger.info("Player started")
 
     async def stop(self, send_device_stop: bool = True) -> None:
@@ -193,15 +188,6 @@ class QobuzPlayer:
                 AudioBackend.disconnect()).
         """
         self._is_running = False
-
-        # Cancel background tasks
-        for task in [self._state_update_task]:
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
 
         # Close any open play report (incl. a paused listen, which no longer
         # closes on pause) so a shutdown mid-listen still lands in history.
@@ -1568,7 +1554,7 @@ class QobuzPlayer:
                 await self._prepare_next_track_locked()
 
     # =========================================================================
-    # Background Tasks
+    # Backend Callback Handlers
     # =========================================================================
 
     def _on_state_change(self, state: PlaybackState) -> None:
@@ -1639,24 +1625,6 @@ class QobuzPlayer:
                 await self._hijack_detected_callback("external takeover detected")
             except Exception as e:
                 logger.warning(f"Hijack-detected callback failed: {e}")
-
-    async def _state_update_loop(self) -> None:
-        """Periodic state updates (heartbeat)."""
-        while self._is_running:
-            try:
-                await asyncio.sleep(5.0)  # 5 second heartbeat like C++
-
-                # Skip if StateReporter is handling heartbeats
-                if self._state_reporter:
-                    continue
-
-                if self._state == PlaybackState.PLAYING:
-                    await self._send_state_update()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"State update loop error: {e}")
 
     async def _send_state_update(self) -> None:
         """Send state update to app via StateReporter or callback."""
