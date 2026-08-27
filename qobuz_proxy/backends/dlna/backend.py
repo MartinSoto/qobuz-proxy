@@ -629,8 +629,14 @@ class DLNABackend(AudioBackend):
         grace period — is_playing_our_content() still does, for its own
         callers; _poll_state_loop does the equivalent checks itself
         before ever reading."""
-        if current_uri is None:
-            return True  # transient read failure — don't false-positive
+        if not current_uri:
+            # None (transient read failure — no signal either way) or ""
+            # (device confirms nothing is loaded at all). Neither is
+            # evidence that something *else* is now driving this renderer
+            # — an empty URI means it's idle, not hijacked; see
+            # _device_confirms_stopped() for where that's actually turned
+            # into a stop/track-ended signal instead.
+            return True
 
         # A gapless transition already armed by us is a legitimate URI
         # change in flight, not a takeover.
@@ -645,6 +651,36 @@ class DLNABackend(AudioBackend):
         GetMediaInfo.CurrentURI is the *queue* URI, not the track URL."""
         assert self._client
         return await self._client.get_media_info()
+
+    async def _device_confirms_stopped(self) -> bool:
+        """Whether the device's own reported URI backs up a STOPPED
+        transport-state read as a genuine stop, rather than a
+        transient/mid-transition glitch — used before trusting either
+        STOPPED-transition path in _poll_state_loop (natural track-ended,
+        paused-stop confirmation).
+
+        A bare "STOPPED" transport-state string isn't enough evidence on
+        its own: get_state() already collapses a transient SOAP failure to
+        that same value, and Sonos in particular can report STOPPED for a
+        read or two while it's disturbing this device for reasons that have
+        nothing to do with our own playback — e.g. another room joining or
+        leaving its group (observed directly: a "track ended" fired after
+        only 0.5% of the file had streamed, immediately followed by that
+        same device's queue getting rebuilt out from under an in-progress
+        Sonos handoff — see RETARGET_CONFIRMATION_TIMEOUT_SECONDS). If the
+        device still shows *our* content loaded, a STOPPED read is almost
+        certainly one of those — not evidence of anything. Only an
+        empty/different URI (the device confirming there's nothing, or
+        something else, loaded) counts as real confirmation.
+        """
+        if not self._client or not self._current_proxy_url:
+            return True  # nothing of ours was loaded to begin with
+        current_uri = await self._get_current_transport_uri()
+        if current_uri is None:
+            return False  # read failed — no evidence either way, not yet
+        if current_uri in (self._current_proxy_url, self._next_track_proxy_url):
+            return False  # still shows our content — not really stopped
+        return True  # empty, or something else entirely
 
     # =========================================================================
     # Info
@@ -939,13 +975,15 @@ class DLNABackend(AudioBackend):
                 # never gets here since self._state stays whatever it was
                 # before, never PAUSED, in that case).
                 if self._state == PlaybackState.PAUSED and new_state == PlaybackState.STOPPED:
-                    if in_grace_period:
+                    if in_grace_period or not await self._device_confirms_stopped():
                         # Exactly as untrustworthy as a mismatched hijack
-                        # read while the device is still settling — reset
-                        # the count instead of accumulating toward a
-                        # confirmation, and skip straight past the general
-                        # state-change notify below too (same `continue` the
-                        # confirmed-count path already uses).
+                        # read while the device is still settling (or, per
+                        # _device_confirms_stopped, still shows our content
+                        # loaded despite the STOPPED read) — reset the count
+                        # instead of accumulating toward a confirmation, and
+                        # skip straight past the general state-change notify
+                        # below too (same `continue` the confirmed-count
+                        # path already uses).
                         self._paused_stop_polls = 0
                         continue
                     self._paused_stop_polls += 1
@@ -970,11 +1008,16 @@ class DLNABackend(AudioBackend):
                             self._next_track_proxy_url = None
                             self._next_track_metadata = None
 
-                        if in_grace_period:
-                            # During grace period, ignore STOPPED state entirely
-                            # This prevents false track-ended events while device is loading
+                        if in_grace_period or not await self._device_confirms_stopped():
+                            # Ignore the STOPPED read entirely — either
+                            # still within the ordinary grace window, or
+                            # the device itself still shows our content
+                            # loaded (see _device_confirms_stopped), which
+                            # means this STOPPED string isn't trustworthy
+                            # regardless of the timer. Prevents false
+                            # track-ended events either way.
                             logger.debug(
-                                f"Ignoring STOPPED state during grace period "
+                                f"Ignoring unconfirmed STOPPED state "
                                 f"(started {time.monotonic() - self._playback_started_at:.1f}s ago)"
                             )
                             continue  # Skip state update entirely

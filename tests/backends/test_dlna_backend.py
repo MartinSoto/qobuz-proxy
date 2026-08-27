@@ -190,6 +190,91 @@ class TestIsPlayingOurContent:
 
         assert await backend.is_playing_our_content() is False
 
+    async def test_true_when_device_reports_empty_uri(self):
+        # An empty (but present) URI is the device confirming nothing is
+        # loaded at all — that's a stop, not evidence someone else is now
+        # driving this renderer (see _device_confirms_stopped for where an
+        # empty URI actually does become a signal).
+        import time
+
+        from qobuz_proxy.backends.dlna.backend import PLAYBACK_START_GRACE_PERIOD_SECONDS
+
+        backend = self._make_backend()
+        backend._playback_started_at = time.monotonic() - PLAYBACK_START_GRACE_PERIOD_SECONDS - 1
+        backend._client.get_media_info.return_value = ""
+
+        assert await backend.is_playing_our_content() is True
+
+
+class TestDeviceConfirmsStopped:
+    """DLNABackend._device_confirms_stopped() — whether a STOPPED
+    transport-state read is actually backed up by the device's own URI,
+    used before either STOPPED-transition path in _poll_state_loop trusts
+    it (see TestPollStateLoop's natural-track-end and paused-stop-
+    confirmation tests for the integrated behavior)."""
+
+    def _make_backend(self, proxy_url: str = "http://proxy/track.flac"):  # type: ignore[no-untyped-def]
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend.__new__(DLNABackend)
+        backend._client = AsyncMock()
+        backend._current_proxy_url = proxy_url
+        backend._next_track_proxy_url = None
+        return backend
+
+    async def test_true_when_nothing_was_playing(self):
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend(proxy_url="")
+        backend._current_proxy_url = None
+        backend._get_current_transport_uri = AsyncMock()
+
+        assert await backend._device_confirms_stopped() is True
+        backend._get_current_transport_uri.assert_not_called()
+
+    async def test_false_when_still_shows_our_content(self):
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/track.flac")
+
+        assert await backend._device_confirms_stopped() is False
+
+    async def test_false_when_still_shows_the_armed_next_track(self):
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/next.flac")
+
+        assert await backend._device_confirms_stopped() is False
+
+    async def test_true_when_uri_is_empty(self):
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._get_current_transport_uri = AsyncMock(return_value="")
+
+        assert await backend._device_confirms_stopped() is True
+
+    async def test_true_when_uri_shows_something_else(self):
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://someone-else/spotify-stream"
+        )
+
+        assert await backend._device_confirms_stopped() is True
+
+    async def test_false_when_read_fails(self):
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._get_current_transport_uri = AsyncMock(return_value=None)
+
+        assert await backend._device_confirms_stopped() is False
+
 
 class TestRetarget:
     """DLNABackend.retarget() — repoint at a new DLNA endpoint in place,
@@ -642,12 +727,40 @@ class TestPollStateLoop:
         backend = self._make_backend()
         backend._state = PlaybackState.PAUSED
         backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        # The device backs the STOPPED read up: it confirms nothing is
+        # loaded (see _device_confirms_stopped) rather than still showing
+        # our content — the fixture's own default would otherwise leave
+        # this unconfirmed forever.
+        backend._get_current_transport_uri = AsyncMock(return_value="")
         callback = MagicMock()
         backend.on_state_change(callback)
 
         await self._run_poll_cycles(backend, cycles=_PAUSED_STOP_CONFIRMATIONS + 2)
 
         callback.assert_called_once_with(PlaybackState.STOPPED)
+
+    async def test_paused_stop_not_confirmed_while_device_still_shows_our_content(self) -> None:
+        """A STOPPED transport-state read alone isn't enough — if the
+        device's own URI still shows our content loaded, that overrides a
+        bare STOPPED string (see _device_confirms_stopped): Sonos in
+        particular can report STOPPED for a read or two while it's
+        disturbing this device for reasons unrelated to our own playback
+        (e.g. another room joining/leaving its group)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from qobuz_proxy.backends.dlna.backend import _PAUSED_STOP_CONFIRMATIONS
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PAUSED
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        # Fixture default already reports the matching (still-ours) URI.
+        callback = MagicMock()
+        backend.on_state_change(callback)
+
+        await self._run_poll_cycles(backend, cycles=_PAUSED_STOP_CONFIRMATIONS + 2)
+
+        callback.assert_not_called()
+        assert backend._paused_stop_polls == 0
 
     async def test_single_transient_stopped_read_does_not_confirm(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
@@ -694,6 +807,46 @@ class TestPollStateLoop:
         await self._run_poll_cycles(backend, cycles=5)
 
         callback.assert_not_called()
+
+    async def test_natural_track_end_not_confirmed_while_device_still_shows_our_content(
+        self,
+    ) -> None:
+        """Reproduces the false "track ended naturally" (test2.log,
+        2026-08-27): a Sonos-side disruption unrelated to our own
+        playback (another room joining/leaving this device's group) can
+        make a single transport-state read come back STOPPED even though
+        only a fraction of the track has actually streamed. A bare STOPPED
+        string must not be trusted while the device's own URI still shows
+        our content loaded."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        # Fixture default already reports the matching (still-ours) URI.
+        callback = MagicMock()
+        backend.on_track_ended(callback)
+        state_callback = MagicMock()
+        backend.on_state_change(state_callback)
+
+        await self._run_poll_cycles(backend, cycles=3)
+
+        callback.assert_not_called()
+        state_callback.assert_not_called()
+
+    async def test_natural_track_end_confirmed_when_device_shows_nothing_loaded(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        backend._get_current_transport_uri = AsyncMock(return_value="")
+        callback = MagicMock()
+        backend.on_track_ended(callback)
+
+        await self._run_poll_cycles(backend, cycles=1)
+
+        callback.assert_called_once()
 
     async def test_hijack_suppressed_while_awaiting_retarget_confirmation(self) -> None:
         """A room-move handoff (see retarget()) can leave the new
