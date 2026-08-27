@@ -65,6 +65,20 @@ _PAUSED_STOP_CONFIRMATIONS = 3
 # coincident with a departing member being stopped).
 PLAYBACK_START_GRACE_PERIOD_SECONDS = 5.0
 
+# How long a retarget waits to actually see our content playing on the new
+# coordinator before giving up and rejoining normal hijack detection
+# (seconds) — see retarget()'s _awaiting_retarget_confirmation. A Sonos
+# room-move ("move currently playing audio to another room") is not an
+# atomic handoff: it's two separate topology edits (add destination to the
+# group, then remove the source), and the *source* room can audibly stop
+# well over ten seconds before the destination's topology entry — let alone
+# its actual playback — catches up (observed directly). PLAYBACK_START_
+# GRACE_PERIOD_SECONDS's fixed 5s window is nowhere near enough for that;
+# this waits for the actual signal (the new coordinator reporting our
+# proxy URL) instead of guessing a duration, bounded only as a safety net
+# against a handoff that genuinely never completes.
+RETARGET_CONFIRMATION_TIMEOUT_SECONDS = 30.0
+
 # How long play() waits for a detached backend to reconnect before giving
 # up (seconds). A Sonos group_id going pending (see SonosDiscoveryManager)
 # detaches this backend for what's normally a few seconds while the
@@ -168,6 +182,16 @@ class DLNABackend(AudioBackend):
         # while PLAYING — see _HIJACK_CHECK_INTERVAL_POLLS).
         self._hijack_check_countdown: int = 0
 
+        # Set by a successful retarget(), cleared once the new coordinator
+        # actually reports playing our content — see
+        # RETARGET_CONFIRMATION_TIMEOUT_SECONDS. While True, _poll_state_loop
+        # treats this exactly like the ordinary grace period (no hijack
+        # detection, no STOPPED-triggered track-ended/paused-stop
+        # confirmation): none of the new coordinator's reported state can be
+        # trusted as a real signal until this resolves one way or the other.
+        self._awaiting_retarget_confirmation: bool = False
+        self._retarget_confirmation_deadline: float = 0.0
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -268,6 +292,17 @@ class DLNABackend(AudioBackend):
         # wrong while Sonos settles internally — see
         # PLAYBACK_START_GRACE_PERIOD_SECONDS and is_playing_our_content().
         self._playback_started_at = time.monotonic()
+        # A room-move handoff can take much longer than that fixed window
+        # to actually converge — see RETARGET_CONFIRMATION_TIMEOUT_SECONDS.
+        # Only meaningful if we actually had content playing before this
+        # retarget; retargeting a backend that was never playing anything
+        # (e.g. reconnecting after a pending resolve with nothing loaded
+        # yet) has nothing to wait to see confirmed.
+        if self._current_proxy_url is not None:
+            self._awaiting_retarget_confirmation = True
+            self._retarget_confirmation_deadline = (
+                time.monotonic() + RETARGET_CONFIRMATION_TIMEOUT_SECONDS
+            )
         if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self._poll_state_loop())
         if device_info.friendly_name:
@@ -817,11 +852,37 @@ class DLNABackend(AudioBackend):
                 # Get state from device
                 new_state = await self.get_state()
 
+                # A retarget is awaiting confirmation that the new
+                # coordinator is actually playing our content (see
+                # _awaiting_retarget_confirmation) — checked every cycle,
+                # independent of new_state/hijack throttling, since we're
+                # specifically waiting for the one signal that resolves it.
+                # Falls through to normal handling once confirmed or timed
+                # out; still counts as being in the grace period below for
+                # *this* cycle either way, so nothing downstream double-
+                # reads or fires off a stale/premature signal on the same
+                # pass that just resolved it.
+                if self._awaiting_retarget_confirmation:
+                    if time.monotonic() >= self._retarget_confirmation_deadline:
+                        logger.warning(
+                            "Retarget confirmation timed out after "
+                            f"{RETARGET_CONFIRMATION_TIMEOUT_SECONDS:.0f}s — resuming normal "
+                            "hijack detection without ever seeing our content play"
+                        )
+                        self._awaiting_retarget_confirmation = False
+                    elif self._client:
+                        current_uri = await self._get_current_transport_uri()
+                        if current_uri == self._current_proxy_url:
+                            logger.info("Retarget confirmed — device is now playing our content")
+                            self._awaiting_retarget_confirmation = False
+                            self._playback_started_at = time.monotonic()
+
                 # Check if we're in the grace period after starting playback
+                # (or a retarget still awaiting confirmation — see above).
                 in_grace_period = (
                     time.monotonic() - self._playback_started_at
                     < PLAYBACK_START_GRACE_PERIOD_SECONDS
-                )
+                ) or self._awaiting_retarget_confirmation
 
                 if new_state != PlaybackState.PLAYING:
                     self._hijack_check_countdown = 0
@@ -878,6 +939,15 @@ class DLNABackend(AudioBackend):
                 # never gets here since self._state stays whatever it was
                 # before, never PAUSED, in that case).
                 if self._state == PlaybackState.PAUSED and new_state == PlaybackState.STOPPED:
+                    if in_grace_period:
+                        # Exactly as untrustworthy as a mismatched hijack
+                        # read while the device is still settling — reset
+                        # the count instead of accumulating toward a
+                        # confirmation, and skip straight past the general
+                        # state-change notify below too (same `continue` the
+                        # confirmed-count path already uses).
+                        self._paused_stop_polls = 0
+                        continue
                     self._paused_stop_polls += 1
                     if self._paused_stop_polls >= _PAUSED_STOP_CONFIRMATIONS:
                         self._paused_stop_polls = 0

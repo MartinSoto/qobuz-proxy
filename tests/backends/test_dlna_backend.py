@@ -261,6 +261,58 @@ class TestRetarget:
         assert result is True
         assert backend._playback_started_at >= before
 
+    async def test_retarget_arms_confirmation_wait_when_content_was_playing(self):
+        # See _awaiting_retarget_confirmation / RETARGET_CONFIRMATION_TIMEOUT_SECONDS:
+        # a room-move handoff can take much longer than the fixed grace
+        # window to actually converge, so a retarget with content already
+        # playing must wait for the real signal rather than a timer alone.
+        import time
+        from unittest.mock import AsyncMock, patch
+
+        from qobuz_proxy.backends.dlna.backend import RETARGET_CONFIRMATION_TIMEOUT_SECONDS
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = AsyncMock()
+        backend._is_connected = True
+        backend._current_proxy_url = "http://proxy/track.flac"
+
+        new_client = AsyncMock()
+        new_client.connect = AsyncMock(return_value=self._make_device_info())
+        new_client.get_protocol_info = AsyncMock(return_value=None)
+
+        with patch.object(backend, "_client_class", return_value=new_client):
+            before = time.monotonic()
+            result = await backend.retarget("10.0.1.31", 1400)
+
+        assert result is True
+        assert backend._awaiting_retarget_confirmation is True
+        assert (
+            before + RETARGET_CONFIRMATION_TIMEOUT_SECONDS
+            <= backend._retarget_confirmation_deadline
+            <= time.monotonic() + RETARGET_CONFIRMATION_TIMEOUT_SECONDS
+        )
+
+    async def test_retarget_does_not_arm_confirmation_wait_when_nothing_was_playing(self):
+        # Reconnecting a backend with nothing loaded yet (e.g. a pending
+        # group_id resolving with no active track) has nothing to wait to
+        # see confirmed.
+        from unittest.mock import AsyncMock, patch
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = AsyncMock()
+        backend._is_connected = True
+        backend._current_proxy_url = None
+
+        new_client = AsyncMock()
+        new_client.connect = AsyncMock(return_value=self._make_device_info())
+        new_client.get_protocol_info = AsyncMock(return_value=None)
+
+        with patch.object(backend, "_client_class", return_value=new_client):
+            result = await backend.retarget("10.0.1.31", 1400)
+
+        assert result is True
+        assert backend._awaiting_retarget_confirmation is False
+
     async def test_retarget_clears_gapless_state(self):
         from unittest.mock import AsyncMock, patch
 
@@ -425,6 +477,8 @@ class TestPollStateLoop:
         backend._playback_started_at = time.monotonic() - 3600  # well outside grace
         backend._paused_stop_polls = 0
         backend._hijack_check_countdown = 0
+        backend._awaiting_retarget_confirmation = False
+        backend._retarget_confirmation_deadline = 0.0
         backend._on_state_change = None
         backend._on_position_update = None
         backend._on_track_ended = None
@@ -640,6 +694,88 @@ class TestPollStateLoop:
         await self._run_poll_cycles(backend, cycles=5)
 
         callback.assert_not_called()
+
+    async def test_hijack_suppressed_while_awaiting_retarget_confirmation(self) -> None:
+        """A room-move handoff (see retarget()) can leave the new
+        coordinator reporting something else entirely for a long time —
+        far past the ordinary time-based grace window — while Sonos itself
+        is still migrating the audio. None of that must read as a
+        takeover."""
+        import time
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._hijack_check_countdown = 1  # force the check due
+        backend._awaiting_retarget_confirmation = True
+        backend._retarget_confirmation_deadline = time.monotonic() + 3600
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://someone-else/spotify-stream"
+        )
+        callback = MagicMock()
+        backend.on_external_takeover(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_not_called()
+        assert backend._awaiting_retarget_confirmation is True  # still waiting
+
+    async def test_retarget_confirmed_once_uri_matches(self) -> None:
+        import time
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._awaiting_retarget_confirmation = True
+        backend._retarget_confirmation_deadline = time.monotonic() + 3600
+        # Fixture default already reports the matching URI.
+
+        await self._run_poll_cycles(backend)
+
+        assert backend._awaiting_retarget_confirmation is False
+
+    async def test_retarget_confirmation_times_out_and_stops_waiting(self) -> None:
+        import time
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._awaiting_retarget_confirmation = True
+        backend._retarget_confirmation_deadline = time.monotonic() - 1  # already passed
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://someone-else/spotify-stream"
+        )
+
+        await self._run_poll_cycles(backend)
+
+        assert backend._awaiting_retarget_confirmation is False
+
+    async def test_paused_stop_confirmation_suppressed_while_awaiting_retarget_confirmation(
+        self,
+    ) -> None:
+        import time
+        from unittest.mock import AsyncMock, MagicMock
+
+        from qobuz_proxy.backends.dlna.backend import _PAUSED_STOP_CONFIRMATIONS
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PAUSED
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        backend._awaiting_retarget_confirmation = True
+        backend._retarget_confirmation_deadline = time.monotonic() + 3600
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://someone-else/spotify-stream"
+        )
+        callback = MagicMock()
+        backend.on_state_change(callback)
+
+        await self._run_poll_cycles(backend, cycles=_PAUSED_STOP_CONFIRMATIONS + 2)
+
+        callback.assert_not_called()
+        assert backend._paused_stop_polls == 0
 
 
 class TestTranscodeDecision:
