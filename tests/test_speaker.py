@@ -720,6 +720,68 @@ class TestSpeakerRetarget:
         speaker = self._make_speaker()
         assert speaker._backend is None
 
+    async def test_successful_retarget_marks_player_backend_attached(self):
+        from qobuz_proxy.backends.dlna import DLNABackend
+
+        speaker = self._make_speaker()
+        speaker._backend = DLNABackend("10.0.1.30", 1400)
+        speaker._backend.retarget = AsyncMock(return_value=True)
+        speaker._player = MagicMock()
+        speaker._player.set_backend_attached = AsyncMock()
+
+        await speaker.retarget("10.0.1.31", 1400)
+
+        speaker._player.set_backend_attached.assert_awaited_once_with(True)
+
+    async def test_failed_retarget_does_not_mark_player_backend_attached(self):
+        from qobuz_proxy.backends.dlna import DLNABackend
+
+        speaker = self._make_speaker()
+        speaker._backend = DLNABackend("10.0.1.30", 1400)
+        speaker._backend.retarget = AsyncMock(return_value=False)
+        speaker._player = MagicMock()
+        speaker._player.set_backend_attached = AsyncMock()
+
+        await speaker.retarget("10.0.1.31", 1400)
+
+        speaker._player.set_backend_attached.assert_not_called()
+
+
+class TestSpeakerDetach:
+    def _make_speaker(self) -> Speaker:
+        return Speaker(
+            config=_make_speaker_config(name="Kitchen", dlna_ip="10.0.1.30"),
+            api_client=_make_api_client(),
+            app_id="app-id",
+        )
+
+    async def test_disconnects_the_backend(self):
+        speaker = self._make_speaker()
+        speaker._backend = MagicMock()
+        speaker._backend.disconnect = AsyncMock()
+
+        await speaker.detach()
+
+        speaker._backend.disconnect.assert_awaited_once_with(send_device_stop=True)
+
+    async def test_marks_player_backend_detached(self):
+        speaker = self._make_speaker()
+        speaker._backend = MagicMock()
+        speaker._backend.disconnect = AsyncMock()
+        speaker._player = MagicMock()
+        speaker._player.set_backend_attached = AsyncMock()
+
+        await speaker.detach()
+
+        speaker._player.set_backend_attached.assert_awaited_once_with(False)
+
+    async def test_safe_with_no_backend_or_player(self):
+        speaker = self._make_speaker()
+        assert speaker._backend is None
+        assert speaker._player is None
+
+        await speaker.detach()  # must not raise
+
         result = await speaker.retarget("10.0.1.31", 1400)
 
         assert result is False

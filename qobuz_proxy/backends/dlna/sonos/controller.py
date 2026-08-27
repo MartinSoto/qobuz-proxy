@@ -337,12 +337,26 @@ class SonosController:
         will ever tell it to stop. A device leaving any other (merely
         discovered, not playing) group is Sonos's own business to
         (re)direct — touching it risks interrupting playback Sonos itself
-        just set up as part of moving it there."""
+        just set up as part of moving it there.
+
+        A departed member Sonos itself still accounts for in some other
+        current group (still_present_elsewhere — even a solo group of
+        just itself) is skipped the same way: it wasn't abandoned, it was
+        absorbed into a legitimate group elsewhere, the same reasoning
+        _on_room_lost's own still_present check already uses at the
+        group level."""
         speaker = self._speakers_by_group_id.get(tracking_key)
         if speaker is None or not speaker.is_active:
             return
 
         for member in departed:
+            if member.still_present_elsewhere:
+                logger.debug(
+                    f"Sonos discovery: '{member.uuid}' left the active group "
+                    f"'{speaker.name}' but is still accounted for elsewhere — not stopping"
+                )
+                continue
+
             logger.info(
                 f"Sonos discovery: '{member.uuid}' left the active group "
                 f"'{speaker.name}' — stopping it directly"

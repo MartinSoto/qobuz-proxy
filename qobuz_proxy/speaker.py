@@ -175,9 +175,18 @@ class Speaker:
         risks two physical devices both thinking they're in charge at once.
         A later retarget() (see AudioBackend.retarget()) reconnects
         cleanly from this state, even to the same ip/port as before.
+
+        Also tells Player the backend is unreachable
+        (set_backend_attached(False)) — the one narrow signal that
+        reaches into Player's state machine from out here, so the
+        command queue holds instead of dispatching into a per-call wait,
+        and the app sees an honest transitional state instead of a stale,
+        still-ticking PLAYING position (see QobuzPlayer.set_backend_attached).
         """
         if self._backend:
             await self._backend.disconnect(send_device_stop=True)
+        if self._player:
+            await self._player.set_backend_attached(False)
 
     async def retarget(self, ip: str, port: int) -> bool:
         """
@@ -197,6 +206,8 @@ class Speaker:
         if ok:
             self._config.dlna_ip = ip
             self._config.dlna_port = port
+            if self._player:
+                await self._player.set_backend_attached(True)
         return ok
 
     def get_status(self) -> dict:

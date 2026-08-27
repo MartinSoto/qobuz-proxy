@@ -726,6 +726,57 @@ class TestPollOnce:
         assert departed[0].uuid == "RINCON_B"
         assert departed[0].ip == "10.0.1.31"
         assert departed[0].port == 1400
+        # Bedroom didn't vanish — it's now its own solo group in this same
+        # snapshot, so it was absorbed elsewhere, not abandoned.
+        assert departed[0].still_present_elsewhere is True
+
+    async def test_departed_member_not_in_any_current_group_is_not_present_elsewhere(
+        self,
+    ) -> None:
+        # Bedroom leaves Kitchen's group, and this snapshot's groups don't
+        # place it anywhere else at all (still momentarily visible in the
+        # flat member list, but not the coordinator or member of any
+        # SonosGroup) — Sonos itself doesn't currently account for it.
+        manager, *_, departed_calls = _make_manager()
+        manager._known = {
+            "RINCON_A": SonosRoom(
+                "RINCON_A",
+                "Kitchen",
+                "10.0.1.30",
+                1400,
+                False,
+                ("Kitchen", "Bedroom"),
+                ("RINCON_A", "RINCON_B"),
+            )
+        }
+
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(
+                f"{MODULE}.fetch_sonos_topology",
+                AsyncMock(
+                    return_value={
+                        "RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30"),
+                        "RINCON_B": _member("RINCON_B", "Bedroom", "10.0.1.31"),
+                    }
+                ),
+            ),
+            patch(
+                f"{MODULE}.fetch_sonos_groups",
+                AsyncMock(
+                    return_value=[
+                        SonosGroup(coordinator_uuid="RINCON_A", member_uuids=["RINCON_A"]),
+                    ]
+                ),
+            ),
+        ):
+            await manager._poll_once()
+
+        assert len(departed_calls) == 1
+        _, departed = departed_calls[0]
+        assert len(departed) == 1
+        assert departed[0].uuid == "RINCON_B"
+        assert departed[0].still_present_elsewhere is False
 
     async def test_no_departure_reported_when_membership_unchanged(self) -> None:
         manager, *_, departed_calls = _make_manager()

@@ -236,3 +236,114 @@ class TestApplyRemoteStateSerialization:
         assert player.current_track is not None
         assert player.current_track.track_id == "C"
         assert backend.played[-1] == "C"
+
+
+class TestBackendAttached:
+    """Player.set_backend_attached() — see Speaker.detach()/retarget() and
+    the command queue's own hold-while-detached behavior below."""
+
+    async def test_going_detached_while_playing_freezes_to_loading(self) -> None:
+        player, backend = _make_player()
+        player._state = PlaybackState.PLAYING
+
+        await player.set_backend_attached(False)
+
+        assert player.state == PlaybackState.LOADING
+
+    async def test_going_detached_relays_immediately(self) -> None:
+        player, backend = _make_player()
+        player._state = PlaybackState.PLAYING
+        reporter = MagicMock()
+        reporter.report_now = AsyncMock()
+        player._state_reporter = reporter
+
+        await player.set_backend_attached(False)
+
+        reporter.report_now.assert_awaited_once()
+
+    async def test_going_detached_while_not_playing_does_not_change_state(self) -> None:
+        player, backend = _make_player()
+        player._state = PlaybackState.PAUSED
+
+        await player.set_backend_attached(False)
+
+        assert player.state == PlaybackState.PAUSED
+
+    async def test_reattaching_does_not_relay(self) -> None:
+        player, backend = _make_player()
+        reporter = MagicMock()
+        reporter.report_now = AsyncMock()
+        player._state_reporter = reporter
+
+        await player.set_backend_attached(True)  # already attached by default
+
+        reporter.report_now.assert_not_called()
+
+    async def test_redundant_detach_does_not_relay_twice(self) -> None:
+        player, backend = _make_player()
+        player._state = PlaybackState.PLAYING
+        reporter = MagicMock()
+        reporter.report_now = AsyncMock()
+        player._state_reporter = reporter
+
+        await player.set_backend_attached(False)
+        await player.set_backend_attached(False)  # already detached
+
+        reporter.report_now.assert_awaited_once()
+
+
+class TestCommandQueueHoldsWhileDetached:
+    """The command queue holds a coalesce=True item at the front while the
+    backend is detached (see Player.set_backend_attached), rather than
+    dispatching into a per-call wait buried in the backend itself."""
+
+    async def test_coalescable_command_holds_until_reattached(self) -> None:
+        player, backend = _make_player()
+        await player.start()
+        await player.set_backend_attached(False)
+
+        player.enqueue(
+            functools.partial(player.play_track, queue_item_id=0, track_id="1"),
+            coalesce=True,
+        )
+        await asyncio.sleep(0.05)  # comfortably less than the attach-wait bound
+        assert backend.played == []  # still holding
+
+        await player.set_backend_attached(True)
+        await player._command_queue.join()
+        await player.stop()
+
+        assert backend.played == ["1"]
+
+    async def test_coalescable_command_dispatches_anyway_once_the_wait_times_out(
+        self,
+    ) -> None:
+        from unittest.mock import patch
+
+        player, backend = _make_player()
+        await player.start()
+        await player.set_backend_attached(False)
+
+        with patch("qobuz_proxy.playback.player._BACKEND_ATTACH_WAIT_SECONDS", 0.02):
+            player.enqueue(
+                functools.partial(player.play_track, queue_item_id=0, track_id="1"),
+                coalesce=True,
+            )
+            await player._command_queue.join()
+
+        await player.stop()
+
+        assert backend.played == ["1"]
+
+    async def test_non_coalescable_command_is_not_held_while_detached(self) -> None:
+        player, backend = _make_player()
+        await player.start()
+        await player.set_backend_attached(False)
+
+        ran = asyncio.Event()
+        player.enqueue(ran.set)  # coalesce=False (default) — e.g. a volume command
+
+        await player._command_queue.join()
+        await player.stop()
+
+        assert ran.is_set()
