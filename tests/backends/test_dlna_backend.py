@@ -1,5 +1,7 @@
 """Tests for DLNABackend._build_didl metadata generation."""
 
+import pytest
+
 from qobuz_proxy.backends.types import BackendTrackMetadata
 from qobuz_proxy.backends.dlna.backend import DLNABackend
 from qobuz_proxy.backends.dlna.capabilities import DLNACapabilities
@@ -124,6 +126,7 @@ class TestIsPlayingOurContent:
         backend._client = AsyncMock()
         backend._current_proxy_url = proxy_url
         backend._next_track_proxy_url = None
+        backend._playback_started_at = 0.0  # well outside the grace period
         return backend
 
     async def test_true_when_uri_matches(self):
@@ -159,6 +162,31 @@ class TestIsPlayingOurContent:
         backend._client.get_media_info.return_value = None
 
         assert await backend.is_playing_our_content() is True
+
+    async def test_true_during_grace_period_even_on_mismatched_uri(self):
+        # Just started playback (or just retargeted — see TestRetarget) —
+        # the device's own reported state can be transiently wrong while
+        # things settle; a mismatch here must not be treated as evidence
+        # of anything.
+        import time
+
+        backend = self._make_backend()
+        backend._playback_started_at = time.monotonic()
+        backend._client.get_media_info.return_value = "http://someone-else/spotify-stream"
+
+        assert await backend.is_playing_our_content() is True
+        backend._client.get_media_info.assert_not_called()  # short-circuits, no read needed
+
+    async def test_false_once_grace_period_has_elapsed(self):
+        import time
+
+        from qobuz_proxy.backends.dlna.backend import PLAYBACK_START_GRACE_PERIOD_SECONDS
+
+        backend = self._make_backend()
+        backend._playback_started_at = time.monotonic() - PLAYBACK_START_GRACE_PERIOD_SECONDS - 1
+        backend._client.get_media_info.return_value = "http://someone-else/spotify-stream"
+
+        assert await backend.is_playing_our_content() is False
 
 
 class TestRetarget:
@@ -207,6 +235,30 @@ class TestRetarget:
         old_client.stop.assert_not_called()
         old_client.disconnect.assert_awaited_once()
 
+    async def test_retarget_resets_the_grace_period(self):
+        # See PLAYBACK_START_GRACE_PERIOD_SECONDS / is_playing_our_content:
+        # a fresh coordinator's own reported state can be transiently wrong
+        # right after a handoff, so a successful retarget must restart the
+        # same grace window used when playback first starts.
+        import time
+        from unittest.mock import AsyncMock, patch
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = AsyncMock()
+        backend._is_connected = True
+        backend._playback_started_at = time.monotonic() - 3600  # long stale
+
+        new_client = AsyncMock()
+        new_client.connect = AsyncMock(return_value=self._make_device_info())
+        new_client.get_protocol_info = AsyncMock(return_value=None)
+
+        with patch.object(backend, "_client_class", return_value=new_client):
+            before = time.monotonic()
+            result = await backend.retarget("10.0.1.31", 1400)
+
+        assert result is True
+        assert backend._playback_started_at >= before
+
     async def test_retarget_clears_gapless_state(self):
         from unittest.mock import AsyncMock, patch
 
@@ -226,6 +278,33 @@ class TestRetarget:
         assert backend._next_track_proxy_url is None
         assert backend._next_track_metadata is None
         assert backend._next_track_queue_nr is None
+
+    async def test_retarget_reconnects_a_detached_backend_even_to_the_same_address(self):
+        # A backend that was detach()ed (see Speaker.detach — used while a
+        # Sonos group_id is pending) has self._client is None and
+        # _is_connected False, but self._ip/_port still hold the last
+        # target. If that same address is where the group_id resolves back
+        # to, the naive "ip/port unchanged" fast path must NOT no-op —
+        # nothing would ever actually reconnect or resume polling.
+        from unittest.mock import AsyncMock, patch
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = None
+        backend._is_connected = False
+        backend._poll_task = None
+
+        new_client = AsyncMock()
+        new_client.connect = AsyncMock(return_value=self._make_device_info())
+        new_client.get_protocol_info = AsyncMock(return_value=None)
+
+        with patch.object(backend, "_client_class", return_value=new_client):
+            result = await backend.retarget("10.0.1.30", 1400)  # same address as before
+
+        assert result is True
+        assert backend._client is new_client
+        assert backend._is_connected is True
+        assert backend._poll_task is not None
+        backend._poll_task.cancel()
 
     async def test_retarget_keeps_old_target_on_connect_failure(self):
         from unittest.mock import AsyncMock, patch
@@ -252,6 +331,7 @@ class TestRetarget:
         backend = DLNABackend("10.0.1.30", 1400)
         old_client = AsyncMock()
         backend._client = old_client
+        backend._is_connected = True  # already connected to this exact target
 
         with patch.object(backend, "_client_class") as MockClient:
             result = await backend.retarget("10.0.1.30", 1400)
@@ -259,6 +339,62 @@ class TestRetarget:
         assert result is True
         MockClient.assert_not_called()
         assert backend._client is old_client
+
+
+class TestWaitForReconnect:
+    """play() landing while this backend is detached (see Speaker.detach,
+    SonosDiscoveryManager's pending state) must not just fail outright —
+    a legitimate in-flight command (e.g. a track auto-advancing) can race
+    a topology-driven detach that resolves moments later."""
+
+    async def test_true_immediately_if_already_connected(self):
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend.__new__(DLNABackend)
+        backend._client = AsyncMock()
+
+        assert await backend._wait_for_reconnect() is True
+
+    async def test_true_once_client_reappears_within_the_window(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        backend = DLNABackend.__new__(DLNABackend)
+        backend._client = None
+
+        async def reconnect_shortly() -> None:
+            await asyncio.sleep(0.01)
+            backend._client = AsyncMock()
+
+        with patch("qobuz_proxy.backends.dlna.backend._RECONNECT_POLL_INTERVAL_SECONDS", 0.005):
+            task = asyncio.create_task(reconnect_shortly())
+            result = await backend._wait_for_reconnect(timeout=1.0)
+        await task
+
+        assert result is True
+
+    async def test_false_once_the_window_elapses(self):
+        from unittest.mock import patch
+
+        backend = DLNABackend.__new__(DLNABackend)
+        backend._client = None
+
+        with patch("qobuz_proxy.backends.dlna.backend._RECONNECT_POLL_INTERVAL_SECONDS", 0.01):
+            result = await backend._wait_for_reconnect(timeout=0.03)
+
+        assert result is False
+
+    async def test_play_raises_only_after_the_wait_fails(self):
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend.__new__(DLNABackend)
+        backend._client = None
+        backend._wait_for_reconnect = AsyncMock(return_value=False)
+
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await backend.play("http://proxy/audio/1.flac", _make_metadata())
+
+        backend._wait_for_reconnect.assert_awaited_once()
 
 
 class TestTranscodeDecision:
