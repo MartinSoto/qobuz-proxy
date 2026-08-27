@@ -327,6 +327,74 @@ class TestPollOnce:
         assert found_calls == []
         assert set(manager._known) == {"RINCON_A"}
 
+    async def test_solo_group_new_id_reaps_old_before_finding_new(self) -> None:
+        """Regression (test1.log, 2026-08-28): a solo room can get a
+        brand-new group_id with *no* membership or coordinator change at
+        all (observed directly — Sonos-internal churn, not a room-move).
+        That's simultaneously an instant "confirmed elsewhere" reap of the
+        *old* identity (same room, still solo, trivially accounted for)
+        and a genuinely new `added` room for the *new* one, both sharing
+        the same display name. on_room_lost for the old identity must run
+        before on_room_found for the new one — reversed, the caller's
+        collision check (SonosController._on_room_found) sees the old
+        Speaker still registered under that name and skips starting the
+        new one, while the old identity's live session gets torn down
+        anyway — a session lost with nothing replacing it."""
+        order: list[str] = []
+        found_calls: list[SonosRoom] = []
+        lost_calls: list[str] = []
+
+        async def on_found(room: SonosRoom) -> bool:
+            order.append(f"found:{room.group_id}")
+            found_calls.append(room)
+            return True
+
+        async def on_lost(tracking_key: str) -> None:
+            order.append(f"lost:{tracking_key}")
+            lost_calls.append(tracking_key)
+
+        manager, _, _, _, _, pending_calls, _ = _make_manager(on_found=on_found, on_lost=on_lost)
+        manager._known = {
+            "old_id": SonosRoom(
+                "RINCON_A",
+                "Kitchen",
+                "10.0.1.30",
+                1400,
+                False,
+                ("Kitchen",),
+                ("RINCON_A",),
+                group_id="old_id",
+            )
+        }
+
+        with (
+            patch(f"{MODULE}.discover_dlna_devices", AsyncMock(return_value=[SONOS_DEVICE])),
+            patch(
+                f"{MODULE}.fetch_sonos_topology",
+                AsyncMock(return_value={"RINCON_A": _member("RINCON_A", "Kitchen", "10.0.1.30")}),
+            ),
+            patch(
+                f"{MODULE}.fetch_sonos_groups",
+                AsyncMock(
+                    return_value=[
+                        SonosGroup(
+                            coordinator_uuid="RINCON_A",
+                            member_uuids=["RINCON_A"],
+                            group_id="new_id",
+                        )
+                    ]
+                ),
+            ),
+        ):
+            await manager._poll_once()
+
+        assert pending_calls == ["old_id"]
+        assert lost_calls == ["old_id"]
+        assert len(found_calls) == 1
+        assert found_calls[0].group_id == "new_id"
+        assert order == ["lost:old_id", "found:new_id"]
+        assert set(manager._known) == {"new_id"}
+
     async def test_coordinator_ip_change_is_retargeted_not_reset(self) -> None:
         # Same physical coordinator (same uuid), just a new address (e.g.
         # DHCP renewal) — no pairing needed, no reason to drop the Qobuz
