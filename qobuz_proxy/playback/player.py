@@ -1704,7 +1704,9 @@ class QobuzPlayer:
             # transition (repeat-one restart / auto-advance / stop
             # decision); avoid a premature STOPPED flicker before it runs.
             return
-        logger.info(f"Unprompted backend state change: {self._state} -> {state}")
+        logger.info(
+            f"[{self.backend.name}] Unprompted backend state change: {self._state} -> {state}"
+        )
         self._state = state
         asyncio.create_task(self._handle_unprompted_state_change(state))
 
@@ -1733,7 +1735,10 @@ class QobuzPlayer:
         asyncio.create_task(self._handle_external_takeover())
 
     async def _handle_external_takeover(self) -> None:
-        logger.info("External takeover detected on this renderer — treating as stopped")
+        logger.info(
+            f"[{self.backend.name}] External takeover detected on this renderer — "
+            "treating as stopped"
+        )
         self._state = PlaybackState.STOPPED
         self._position_value_ms = 0
         self._position_timestamp_ms = int(time.time() * 1000)
