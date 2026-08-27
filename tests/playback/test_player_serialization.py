@@ -291,6 +291,40 @@ class TestBackendAttached:
 
         reporter.report_now.assert_awaited_once()
 
+    async def test_reattaching_clears_stale_gapless_armed_state(self) -> None:
+        """Regression: a retarget (Speaker.retarget()'s sole call site for
+        attached=True) wipes the *backend's* own next-track bookkeeping
+        (DLNABackend.retarget() — the physical device's queue can't be
+        assumed to carry over what was armed on the old one), but nothing
+        told Player._gapless_armed the same thing — left True, it
+        permanently blocked the ordinary per-position-tick re-arm retry
+        (_on_position_update), so a gapless transition the device carried
+        through anyway on its own went undetected as gapless and read as
+        an external takeover instead (observed directly, test1.log,
+        2026-08-28: Cocina->Cuarto move)."""
+        player, backend = _make_player()
+        player._gapless_armed = True
+        player._pending_next_track = {"trackId": "1", "queueItemId": 1}
+
+        await player.set_backend_attached(True)
+
+        assert player._gapless_armed is False
+        assert player._pending_next_track is None
+
+    async def test_going_detached_does_not_touch_gapless_armed_state(self) -> None:
+        # No position ticks happen while detached (the backend's poll loop
+        # is torn down along with the connection), so there's no risk of a
+        # stale re-arm attempt to guard against here — only reattachment
+        # needs to clear it.
+        player, backend = _make_player()
+        player._gapless_armed = True
+        player._pending_next_track = {"trackId": "1", "queueItemId": 1}
+
+        await player.set_backend_attached(False)
+
+        assert player._gapless_armed is True
+        assert player._pending_next_track == {"trackId": "1", "queueItemId": 1}
+
 
 class TestCommandQueueHoldsWhileDetached:
     """The command queue holds a coalesce=True item at the front while the
