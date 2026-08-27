@@ -307,8 +307,16 @@ class QobuzPlayer:
 
     def set_active_renderer(self, active: bool) -> None:
         """Record whether the Qobuz server currently considers this
-        renderer the active playback target (see SrvrRndrSetActive)."""
+        renderer the active playback target (see SrvrRndrSetActive).
+
+        Also relayed to the backend (see AudioBackend.set_active) — in a
+        Sonos auto-discovery household every discovered room polls its own
+        device continuously regardless of whether Qobuz is driving it, and
+        a backend that reacts to what it sees there (hijack detection) has
+        no way to know "active" is a Qobuz Connect concept it can't see
+        for itself without this."""
         self._is_active_renderer = active
+        self.backend.set_active(active)
 
     async def set_backend_attached(self, attached: bool) -> None:
         """Record whether the backend is currently reachable — called by

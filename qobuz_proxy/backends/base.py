@@ -47,6 +47,12 @@ class AudioBackend(ABC):
         self._volume: int = 50  # 0-100
         self._state: PlaybackState = PlaybackState.STOPPED
         self._is_connected: bool = False
+        # Whether the Qobuz server currently considers this backend's
+        # renderer the active playback target — see set_active(). Defaults
+        # True: most backends (a manually configured single speaker, local
+        # output) never get told otherwise, and should keep behaving as
+        # they always have.
+        self._active: bool = True
 
         # Event callbacks
         self._on_state_change: Optional[StateChangeCallback] = None
@@ -198,6 +204,29 @@ class AudioBackend(ABC):
     def is_connected(self) -> bool:
         """Check if backend is connected."""
         return self._is_connected
+
+    def set_active(self, active: bool) -> None:
+        """Record whether the Qobuz server currently considers this
+        renderer the active playback target (see Player.set_active_renderer
+        / SrvrRndrSetActive) — the narrow signal in the opposite direction
+        from set_backend_attached()'s Speaker->Player one, letting a
+        backend that watches the physical device on its own (see
+        DLNABackend's hijack detection) know when doing so is actually
+        meaningful.
+
+        In a Sonos auto-discovery household every discovered room gets its
+        own Speaker/Player/backend, polling continuously, whether or not
+        it's the one Qobuz is actually driving right now — a mismatch
+        between what an *inactive* renderer reports and what we last set
+        isn't evidence of anything (no session is being driven there; it
+        may simply be someone using that room directly, or nothing may
+        have ever played there at all). Default: no-op. Backends without a
+        notion of watching a device they don't control (local output) or
+        that never receive this signal at all (a manually configured
+        single speaker) need not override it — see the True default on
+        self._active.
+        """
+        self._active = active
 
     async def retarget(self, ip: str, port: int, description_url: Optional[str] = None) -> bool:
         """
