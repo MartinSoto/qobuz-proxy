@@ -33,9 +33,29 @@ logger = logging.getLogger(__name__)
 # State polling interval
 STATE_POLL_INTERVAL_SECONDS = 2.0
 
-# Grace period after starting playback to ignore STOPPED state (seconds)
-# This prevents false track-ended events while the device is loading
+# Grace period during which transport state is expected to be transiently
+# unreliable (seconds) — covers both a track just starting (prevents false
+# track-ended events while the device is loading) and a coordinator
+# retarget just having happened (see retarget()): a Sonos handoff, and any
+# membership change that follows moments later as part of the same user
+# action, can leave the new coordinator's own reported state/TrackURI
+# briefly wrong while Sonos settles internally — without this, that reads
+# as an external takeover and forces an unnecessary WebSocket reconnect
+# (observed directly: a hijack false-positive ~3s after a clean retarget,
+# coincident with a departing member being stopped).
 PLAYBACK_START_GRACE_PERIOD_SECONDS = 5.0
+
+# How long play() waits for a detached backend to reconnect before giving
+# up (seconds). A Sonos group_id going pending (see SonosDiscoveryManager)
+# detaches this backend for what's normally a few seconds while the
+# topology resolves (see Speaker.detach()) — a play() call landing in that
+# window (observed directly: a track's natural end auto-advancing to the
+# next one, racing a detach that happened the same moment) must not just
+# raise; the caller has no way to retry it once the backend reconnects.
+# Comfortably inside PENDING_GRACE_SECONDS so a genuine loss still fails
+# in reasonable time instead of hanging out the full pending window.
+RECONNECT_WAIT_SECONDS = 8.0
+_RECONNECT_POLL_INTERVAL_SECONDS = 0.2
 
 # Class-level capability cache (shared across instances)
 _capability_cache = CapabilityCache()
@@ -107,8 +127,8 @@ class DLNABackend(AudioBackend):
         # Device capabilities
         self._capabilities: Optional[DLNACapabilities] = None
 
-        # Track when playback was started to avoid false track-ended events
-        # during device loading/transition period
+        # Start of the current grace period (see PLAYBACK_START_GRACE_PERIOD_SECONDS)
+        # — reset both when playback starts and on a successful retarget().
         self._playback_started_at: float = 0.0
 
         # Gapless playback state
@@ -175,13 +195,18 @@ class DLNABackend(AudioBackend):
         underlying audio source doesn't need to restart, only where
         *future* commands go and where state gets polled from.
 
+        Also used to reconnect a backend that was previously detached (see
+        detach()) — self._client is None in that case, so there's no old
+        connection to release, just a fresh one to establish and the poll
+        loop to restart.
+
         On failure, keeps talking to the previous target — the caller
         should retry.
 
         Returns:
             True if the new target connected successfully.
         """
-        if ip == self._ip and port == self._port:
+        if ip == self._ip and port == self._port and self._is_connected:
             return True
 
         new_client = self._client_class(ip, port, description_url=description_url)
@@ -210,6 +235,13 @@ class DLNABackend(AudioBackend):
         self._port = port
         self._description_url = description_url
         self._client = new_client
+        self._is_connected = True
+        # New coordinator's own reported state/TrackURI can be transiently
+        # wrong while Sonos settles internally — see
+        # PLAYBACK_START_GRACE_PERIOD_SECONDS and is_playing_our_content().
+        self._playback_started_at = time.monotonic()
+        if self._poll_task is None or self._poll_task.done():
+            self._poll_task = asyncio.create_task(self._poll_state_loop())
         if device_info.friendly_name:
             self.name = device_info.friendly_name
 
@@ -293,6 +325,7 @@ class DLNABackend(AudioBackend):
                 except Exception:
                     pass
             await self._client.disconnect()
+            self._client = None
 
         logger.info(f"Disconnected from DLNA device: {self.name}")
 
@@ -300,9 +333,22 @@ class DLNABackend(AudioBackend):
     # Playback Control
     # =========================================================================
 
+    async def _wait_for_reconnect(self, timeout: float = RECONNECT_WAIT_SECONDS) -> bool:
+        """Wait briefly for self._client to reappear — see
+        RECONNECT_WAIT_SECONDS. Returns False (immediately, no wait) if
+        this backend was never detached in the first place."""
+        if self._client:
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(_RECONNECT_POLL_INTERVAL_SECONDS)
+            if self._client:
+                return True
+        return False
+
     async def play(self, url: str, metadata: BackendTrackMetadata) -> None:
         """Start playback of track."""
-        if not self._client:
+        if not self._client and not await self._wait_for_reconnect():
             raise RuntimeError("Not connected")
 
         # Clear gapless state — explicit play invalidates armed next track
@@ -499,6 +545,14 @@ class DLNABackend(AudioBackend):
         detect this."""
         if not self._client or not self._current_proxy_url:
             return True  # nothing of ours to have been displaced yet
+
+        if time.monotonic() - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS:
+            # Track just started, or we just retargeted to a new
+            # coordinator — its own reported TrackURI can be transiently
+            # wrong while Sonos settles internally, and a departing
+            # member's own stop shortly after a handoff can perturb it
+            # too. Not a real signal either way during this window.
+            return True
 
         current_uri = await self._get_current_transport_uri()
         if current_uri is None:
