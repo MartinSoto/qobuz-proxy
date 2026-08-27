@@ -182,6 +182,14 @@ class DLNABackend(AudioBackend):
         # while PLAYING — see _HIJACK_CHECK_INTERVAL_POLLS).
         self._hijack_check_countdown: int = 0
 
+        # Whether an ongoing external takeover has already been notified —
+        # see _poll_state_loop. Prevents re-notifying every single poll
+        # cycle for as long as the takeover persists (while something's
+        # armed for gapless, the read that also feeds this check runs
+        # unthrottled) — Player only needs to hear about a takeover once
+        # to react to it, not once per 0.5s.
+        self._external_takeover_notified: bool = False
+
         # Set by a successful retarget(), cleared once the new coordinator
         # actually reports playing our content — see
         # RETARGET_CONFIRMATION_TIMEOUT_SECONDS. While True, _poll_state_loop
@@ -282,6 +290,7 @@ class DLNABackend(AudioBackend):
         self._next_track_metadata = None
         self._next_track_queue_nr = None
         self._gapless_supported = True
+        self._external_takeover_notified = False
 
         self._ip = ip
         self._port = port
@@ -961,6 +970,7 @@ class DLNABackend(AudioBackend):
 
                 if new_state != PlaybackState.PLAYING:
                     self._hijack_check_countdown = 0
+                    self._external_takeover_notified = False
 
                 # Gapless-transition detection and hijack detection are
                 # both ultimately answered by the same question — does the
@@ -1030,18 +1040,43 @@ class DLNABackend(AudioBackend):
                             # Notify player
                             self._notify_next_track_started()
                             self._notify_position_update(0)
+                            self._external_takeover_notified = False
                             continue
 
                         if not in_grace_period and not self._is_playing_our_content_given(
                             current_uri
                         ):
-                            logger.info(
-                                f"[{self.name}] External takeover detected on this renderer: "
-                                f"device reports {current_uri!r}, expected "
-                                f"{self._current_proxy_url!r}"
-                            )
-                            self._notify_external_takeover()
+                            # While something's armed (see `armed` above),
+                            # this read runs every single poll cycle rather
+                            # than the throttled hijack-check cadence — a
+                            # genuine, ongoing takeover would otherwise fire
+                            # this on every one of those cycles (observed
+                            # directly: ~20 seconds of back-to-back
+                            # notifications, each independently forcing its
+                            # own WebSocket reconnect and racing the others,
+                            # eventually desyncing the connection's own
+                            # message counter). Only the first read of a
+                            # given takeover is worth telling Player about;
+                            # _external_takeover_notified is cleared the
+                            # moment a read confirms the content is ours
+                            # again (or the device leaves PLAYING) so a
+                            # later, separate takeover still notifies fresh.
+                            if not self._external_takeover_notified:
+                                logger.info(
+                                    f"[{self.name}] External takeover detected on this "
+                                    f"renderer: device reports {current_uri!r}, expected "
+                                    f"{self._current_proxy_url!r}"
+                                )
+                                self._notify_external_takeover()
+                                self._external_takeover_notified = True
                             continue
+                        elif not in_grace_period:
+                            # Content confirmed ours — any previously-
+                            # notified takeover has resolved.
+                            self._external_takeover_notified = False
+                        # else: in_grace_period — no evidence either way
+                        # this cycle, leave the flag as it was and fall
+                        # through to the rest of the loop as normal.
 
                 # Paused -> confirmed external stop: don't trust a single
                 # STOPPED read (transient failures collapse to STOPPED too;
