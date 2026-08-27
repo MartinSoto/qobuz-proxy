@@ -814,12 +814,26 @@ class DLNAClient:
         return None
 
     def _parse_xml_value_exact(self, xml_text: str, tag_name: str) -> Optional[str]:
-        """Extract value from XML response by exact local tag name (without namespace)."""
+        """Extract value from XML response by exact local tag name (without
+        namespace).
+
+        None means the tag wasn't found at all — the SOAP call failed, the
+        response didn't parse, or this response genuinely doesn't carry the
+        tag — a real "don't know". An element that *was* found but is empty
+        (ElementTree's own .text for e.g. `<TrackURI></TrackURI>` is None,
+        not "" — Sonos and other DLNA renderers use exactly that empty
+        element to mean "nothing loaded") is coerced to "" instead of
+        conflating it with the same None as an outright failure: callers
+        checking TrackURI/CurrentURI (see DLNABackend._get_current_transport_uri
+        and its callers) rely on being able to tell "no signal" apart from
+        "device confirms nothing is loaded", and only the latter is real
+        evidence of a stop.
+        """
         try:
             root = ET.fromstring(xml_text)
             for elem in root.iter():
                 if elem.tag.split("}")[-1] == tag_name:
-                    return elem.text
+                    return elem.text or ""
         except ET.ParseError:
             pass
         return None
