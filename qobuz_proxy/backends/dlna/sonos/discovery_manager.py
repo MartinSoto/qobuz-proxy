@@ -161,6 +161,14 @@ class DepartedMember:
     uuid: str
     ip: str
     port: int
+    # Whether this snapshot's topology still accounts for the device in
+    # some *other* current group (including a solo group of just itself)
+    # — the same "confirmed elsewhere" shape _reap_pending already
+    # computes for whole groups (see _apply_topology's `current`),
+    # applied one level down to individual members. False means Sonos
+    # itself doesn't currently know where this device is — it may simply
+    # have gone offline in this same snapshot, not necessarily "gone".
+    still_present_elsewhere: bool = False
 
 
 @dataclass(frozen=True)
@@ -174,17 +182,34 @@ class _PendingRoom:
 
 
 def _departed_members(
-    old: SonosRoom, new: SonosRoom, members: dict[str, SonosZoneMember]
+    old: SonosRoom,
+    new: SonosRoom,
+    members: dict[str, SonosZoneMember],
+    current: dict[str, SonosRoom],
 ) -> tuple[DepartedMember, ...]:
     """uuids in old.member_uuids but not new.member_uuids — i.e. members of
     *this* group that just left it — paired with their current ip/port
     from this snapshot's fresh topology (skipped if a departed uuid isn't
-    in it at all, i.e. it went offline in the very same snapshot)."""
+    in it at all, i.e. it went offline in the very same snapshot) and
+    whether some *other* group in `current` (this update's full topology)
+    still accounts for them — see DepartedMember.still_present_elsewhere.
+    """
+    accounted_for: set[str] = set()
+    for room in current.values():
+        accounted_for.update(room.member_uuids)
+
     result = []
     for uuid in set(old.member_uuids) - set(new.member_uuids):
         m = members.get(uuid)
         if m is not None and m.ip:
-            result.append(DepartedMember(uuid=uuid, ip=m.ip, port=m.port))
+            result.append(
+                DepartedMember(
+                    uuid=uuid,
+                    ip=m.ip,
+                    port=m.port,
+                    still_present_elsewhere=uuid in accounted_for,
+                )
+            )
     return tuple(result)
 
 
@@ -500,12 +525,12 @@ class SonosDiscoveryManager:
                 retargeted.append(room)
             else:
                 renamed.append(room)
-            departed = _departed_members(old, room, members)
+            departed = _departed_members(old, room, members, current)
             if departed:
                 departures.append((key, departed))
         for key in reappeared_keys:
             room = current[key]
-            departed = _departed_members(self._pending[key].room, room, members)
+            departed = _departed_members(self._pending[key].room, room, members, current)
             if departed:
                 departures.append((key, departed))
 

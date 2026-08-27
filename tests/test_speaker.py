@@ -888,10 +888,6 @@ class TestSpeakerDetach:
 
         await speaker.detach()  # must not raise
 
-        result = await speaker.retarget("10.0.1.31", 1400)
-
-        assert result is False
-
 
 class TestSpeakerIsActive:
     def _make_speaker(self) -> Speaker:

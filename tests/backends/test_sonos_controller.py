@@ -479,6 +479,50 @@ class TestRoomMembersDeparted:
 
         MockClient.assert_not_called()
 
+    async def test_skips_a_departed_member_still_present_elsewhere(self) -> None:
+        # A device absorbed into another (legitimate) group in the same
+        # snapshot wasn't abandoned — touching it risks interrupting
+        # playback Sonos itself just set up. Same reasoning _on_room_lost's
+        # own still_present check already uses at the group level.
+        controller = _make_controller()
+        speaker = _mock_speaker("Kitchen")
+        speaker.is_active = True
+        controller._speakers_by_group_id["RINCON_A"] = speaker
+
+        with patch("qobuz_proxy.backends.dlna.sonos.controller.DLNAClient") as MockClient:
+            await controller._on_room_members_departed(
+                "RINCON_A",
+                (
+                    DepartedMember(
+                        uuid="RINCON_B", ip="10.0.1.31", port=1400, still_present_elsewhere=True
+                    ),
+                ),
+            )
+
+        MockClient.assert_not_called()
+
+    async def test_stops_only_the_genuinely_departed_member_in_a_mixed_batch(self) -> None:
+        controller = _make_controller()
+        speaker = _mock_speaker("Kitchen")
+        speaker.is_active = True
+        controller._speakers_by_group_id["RINCON_A"] = speaker
+
+        with patch(
+            "qobuz_proxy.backends.dlna.sonos.controller.DLNAClient",
+            return_value=self._mock_dlna_client(),
+        ) as MockClient:
+            await controller._on_room_members_departed(
+                "RINCON_A",
+                (
+                    DepartedMember(
+                        uuid="RINCON_B", ip="10.0.1.31", port=1400, still_present_elsewhere=True
+                    ),
+                    DepartedMember(uuid="RINCON_C", ip="10.0.1.32", port=1400),
+                ),
+            )
+
+        MockClient.assert_called_once_with("10.0.1.32", 1400)
+
     async def test_a_failed_stop_does_not_raise(self) -> None:
         controller = _make_controller()
         speaker = _mock_speaker("Kitchen")
