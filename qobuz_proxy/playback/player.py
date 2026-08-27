@@ -851,19 +851,16 @@ class QobuzPlayer:
             context_uuid=context_uuid,
         )
 
-        # Pre-fetch URL and metadata
+        # Pre-fetch URL and metadata via the queue's own cache — see
+        # QobuzQueue.get_track_url/get_track_metadata.
         try:
-            url = await self._get_track_url(track_id)
-            if url:
-                self._current_track.set_streaming_url(url)
-            else:
+            url = await self.queue.get_track_url(self._current_track)
+            if not url:
                 logger.error(f"Failed to get URL for track {track_id}")
                 return False
 
-            meta = await self._get_track_metadata(track_id)
+            meta = await self.queue.get_track_metadata(self._current_track)
             if meta:
-                self._current_track.metadata = meta
-                self._current_track.duration_ms = meta.get("duration_ms", 0)
                 self._current_duration_ms = self._current_track.duration_ms
 
             logger.info(f"Track loaded: {track_id}")
@@ -1101,26 +1098,18 @@ class QobuzPlayer:
         await self._send_state_update()
 
         try:
-            # Get streaming URL if not cached. A cached URL past its TTL is
-            # treated as absent: a track loaded PAUSED and played later than
-            # the URL lifetime must not start from an expired URL.
-            url = None if track.url_is_stale() else track.streaming_url
+            # Get streaming URL and metadata via the queue's own cache —
+            # a cached URL past its TTL is treated as absent (a track
+            # loaded PAUSED and played later than the URL lifetime must
+            # not start from an expired URL); see QobuzQueue.get_track_url.
+            url = await self.queue.get_track_url(track)
             if not url:
-                url = await self._get_track_url(track.track_id)
-                if not url:
-                    logger.error(f"Failed to get URL for track {track.track_id}")
-                    self._state = PlaybackState.ERROR
-                    await self._send_state_update()
-                    return False
-                track.set_streaming_url(url)
+                logger.error(f"Failed to get URL for track {track.track_id}")
+                self._state = PlaybackState.ERROR
+                await self._send_state_update()
+                return False
 
-            # Get metadata if not cached
-            meta: Optional[dict] = track.metadata if track.metadata else None
-            if not meta:
-                meta = await self._get_track_metadata(track.track_id)
-                if meta:
-                    track.metadata = meta
-                    track.duration_ms = meta.get("duration_ms", 0)
+            meta = await self.queue.get_track_metadata(track)
 
             # Get actual quality and format info from cache (set during URL fetch)
             actual_quality, sample_rate, bit_depth = self.metadata.get_track_format(track.track_id)

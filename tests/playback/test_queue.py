@@ -74,6 +74,96 @@ class TestQueueTrack:
         assert track.url_fetched_at == 0.0
 
 
+class TestTrackCaching:
+    """QobuzQueue.get_track_url/get_track_metadata — the single place
+    "is this cached, if not fetch and cache it" is implemented, shared by
+    _preload_upcoming and QobuzPlayer (which used to each have their own
+    copy of this logic)."""
+
+    @pytest.fixture
+    def queue(self) -> QobuzQueue:
+        return QobuzQueue()
+
+    @pytest.mark.asyncio
+    async def test_get_track_url_fetches_and_caches_on_miss(self, queue: QobuzQueue) -> None:
+        track = QueueTrack(queue_item_id=1, track_id="A")
+        url_callback = AsyncMock(return_value="https://example.com/a.flac")
+        queue.set_url_callback(url_callback)
+
+        url = await queue.get_track_url(track)
+
+        assert url == "https://example.com/a.flac"
+        assert track.streaming_url == "https://example.com/a.flac"
+        url_callback.assert_awaited_once_with("A")
+
+    @pytest.mark.asyncio
+    async def test_get_track_url_returns_cached_value_without_fetching(
+        self, queue: QobuzQueue
+    ) -> None:
+        track = QueueTrack(queue_item_id=1, track_id="A")
+        track.set_streaming_url("https://cached.example.com/a.flac")
+        url_callback = AsyncMock(return_value="https://fresh.example.com/a.flac")
+        queue.set_url_callback(url_callback)
+
+        url = await queue.get_track_url(track)
+
+        assert url == "https://cached.example.com/a.flac"
+        url_callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_track_url_refetches_a_stale_cached_value(self, queue: QobuzQueue) -> None:
+        track = QueueTrack(queue_item_id=1, track_id="A")
+        track.set_streaming_url("https://cached.example.com/a.flac")
+        track.url_fetched_at -= 300  # past the TTL
+        url_callback = AsyncMock(return_value="https://fresh.example.com/a.flac")
+        queue.set_url_callback(url_callback)
+
+        url = await queue.get_track_url(track)
+
+        assert url == "https://fresh.example.com/a.flac"
+        assert track.streaming_url == "https://fresh.example.com/a.flac"
+
+    @pytest.mark.asyncio
+    async def test_get_track_url_returns_none_without_a_callback(self, queue: QobuzQueue) -> None:
+        track = QueueTrack(queue_item_id=1, track_id="A")
+
+        assert await queue.get_track_url(track) is None
+
+    @pytest.mark.asyncio
+    async def test_get_track_metadata_fetches_and_caches_on_miss(self, queue: QobuzQueue) -> None:
+        track = QueueTrack(queue_item_id=1, track_id="A")
+        metadata_callback = AsyncMock(return_value={"title": "Song", "duration_ms": 123})
+        queue.set_metadata_callback(metadata_callback)
+
+        meta = await queue.get_track_metadata(track)
+
+        assert meta == {"title": "Song", "duration_ms": 123}
+        assert track.metadata == {"title": "Song", "duration_ms": 123}
+        assert track.duration_ms == 123
+        metadata_callback.assert_awaited_once_with("A")
+
+    @pytest.mark.asyncio
+    async def test_get_track_metadata_returns_cached_value_without_fetching(
+        self, queue: QobuzQueue
+    ) -> None:
+        track = QueueTrack(queue_item_id=1, track_id="A", metadata={"title": "Cached"})
+        metadata_callback = AsyncMock(return_value={"title": "Fresh"})
+        queue.set_metadata_callback(metadata_callback)
+
+        meta = await queue.get_track_metadata(track)
+
+        assert meta == {"title": "Cached"}
+        metadata_callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_track_metadata_returns_none_without_a_callback(
+        self, queue: QobuzQueue
+    ) -> None:
+        track = QueueTrack(queue_item_id=1, track_id="A")
+
+        assert await queue.get_track_metadata(track) is None
+
+
 class TestQobuzQueue:
     """Tests for QobuzQueue class."""
 

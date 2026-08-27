@@ -70,6 +70,13 @@ def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:
 
     queue = MagicMock()
     queue.set_current_by_item_id = AsyncMock(return_value=True)
+    # Player routes track loading through queue.get_track_url/get_track_metadata
+    # (see QobuzQueue's own implementation) rather than fetching directly —
+    # mirror what metadata.get_streaming_url/get_metadata above provide.
+    queue.get_track_url = MagicMock(
+        side_effect=lambda track: _coro(f"http://test/{track.track_id}")
+    )
+    queue.get_track_metadata = MagicMock(side_effect=lambda track: _coro(None))
     player = QobuzPlayer(queue=queue, metadata_service=metadata, backend=backend)
     return player, backend
 
