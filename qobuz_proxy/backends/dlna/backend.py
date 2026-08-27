@@ -676,6 +676,10 @@ class DLNABackend(AudioBackend):
         if not self._client or not self._current_proxy_url:
             return True  # nothing of ours was loaded to begin with
         current_uri = await self._get_current_transport_uri()
+        logger.debug(
+            f"[{self.name}] Polled to confirm STOPPED: device reports {current_uri!r}, "
+            f"expecting {self._current_proxy_url!r}"
+        )
         if current_uri is None:
             return False  # read failed — no evidence either way, not yet
         if current_uri in (self._current_proxy_url, self._next_track_proxy_url):
@@ -901,15 +905,23 @@ class DLNABackend(AudioBackend):
                 if self._awaiting_retarget_confirmation:
                     if time.monotonic() >= self._retarget_confirmation_deadline:
                         logger.warning(
-                            "Retarget confirmation timed out after "
+                            f"[{self.name}] Retarget confirmation timed out after "
                             f"{RETARGET_CONFIRMATION_TIMEOUT_SECONDS:.0f}s — resuming normal "
-                            "hijack detection without ever seeing our content play"
+                            "hijack detection without ever seeing our content play "
+                            f"(still expected {self._current_proxy_url!r})"
                         )
                         self._awaiting_retarget_confirmation = False
                     elif self._client:
                         current_uri = await self._get_current_transport_uri()
+                        logger.debug(
+                            f"[{self.name}] Polled while awaiting retarget confirmation: "
+                            f"device reports {current_uri!r}, expecting {self._current_proxy_url!r}"
+                        )
                         if current_uri == self._current_proxy_url:
-                            logger.info("Retarget confirmed — device is now playing our content")
+                            logger.info(
+                                f"[{self.name}] Retarget confirmed — device is now playing "
+                                "our content"
+                            )
                             self._awaiting_retarget_confirmation = False
                             self._playback_started_at = time.monotonic()
 
@@ -957,9 +969,17 @@ class DLNABackend(AudioBackend):
 
                     if armed or (hijack_check_due and not in_grace_period):
                         current_uri = await self._get_current_transport_uri()
+                        logger.debug(
+                            f"[{self.name}] Polled for gapless/hijack check: device reports "
+                            f"{current_uri!r}, expecting current={self._current_proxy_url!r}"
+                            + (f", next={self._next_track_proxy_url!r}" if armed else "")
+                        )
 
                         if armed and current_uri == self._next_track_proxy_url:
-                            logger.info("Gapless: transition detected — device moved to next track")
+                            logger.info(
+                                f"[{self.name}] Gapless: transition detected — device moved "
+                                "to next track"
+                            )
                             # Update state to reflect the new track
                             self._current_metadata = self._next_track_metadata
                             self._current_proxy_url = self._next_track_proxy_url
@@ -981,7 +1001,11 @@ class DLNABackend(AudioBackend):
                         if not in_grace_period and not self._is_playing_our_content_given(
                             current_uri
                         ):
-                            logger.info("External takeover detected on this renderer")
+                            logger.info(
+                                f"[{self.name}] External takeover detected on this renderer: "
+                                f"device reports {current_uri!r}, expected "
+                                f"{self._current_proxy_url!r}"
+                            )
                             self._notify_external_takeover()
                             continue
 
@@ -1033,7 +1057,7 @@ class DLNABackend(AudioBackend):
                             # regardless of the timer. Prevents false
                             # track-ended events either way.
                             logger.debug(
-                                f"Ignoring unconfirmed STOPPED state "
+                                f"[{self.name}] Ignoring unconfirmed STOPPED state "
                                 f"(started {time.monotonic() - self._playback_started_at:.1f}s ago)"
                             )
                             continue  # Skip state update entirely

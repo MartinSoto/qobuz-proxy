@@ -217,6 +217,7 @@ class TestDeviceConfirmsStopped:
         from unittest.mock import AsyncMock
 
         backend = DLNABackend.__new__(DLNABackend)
+        backend.name = "Test Speaker"
         backend._client = AsyncMock()
         backend._current_proxy_url = proxy_url
         backend._next_track_proxy_url = None
@@ -549,6 +550,7 @@ class TestPollStateLoop:
         from unittest.mock import AsyncMock
 
         backend = DLNABackend.__new__(DLNABackend)
+        backend.name = "Test Speaker"
         backend._client = AsyncMock()
         backend._is_connected = True
         backend._state = PlaybackState.STOPPED
