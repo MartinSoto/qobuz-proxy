@@ -634,6 +634,33 @@ class TestPollStateLoop:
 
         callback.assert_not_called()
 
+    async def test_no_hijack_check_before_anything_has_ever_played(self) -> None:
+        """Right after startup — before a Qobuz session ever existed, let
+        alone told this backend to play anything — self._current_proxy_url
+        is None. The physical device may already be playing something of
+        its own (its last queue, another app, radio) with the transport
+        state genuinely PLAYING; that must never read as a takeover, since
+        there was nothing of ours to have been displaced (observed
+        directly: constant "External takeover" from the moment a speaker
+        connects, well before the Qobuz app ever connects)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend._current_proxy_url = None  # never played anything yet
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://the-device/its-own-last-content"
+        )
+        backend._hijack_check_countdown = 1
+        callback = MagicMock()
+        backend.on_external_takeover(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_not_called()
+        backend._get_current_transport_uri.assert_not_called()
+
     async def test_hijack_check_is_throttled_not_run_every_cycle(self) -> None:
         from unittest.mock import AsyncMock
 

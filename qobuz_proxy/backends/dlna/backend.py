@@ -932,7 +932,23 @@ class DLNABackend(AudioBackend):
                 # reasons doubles as a hijack check for free (resetting the
                 # throttle countdown either way) instead of waiting for its
                 # own separately-throttled turn.
-                if new_state == PlaybackState.PLAYING and self._client:
+                # self._current_proxy_url is None until this backend has
+                # actually been told to play something — before that (e.g.
+                # right after startup, before any Qobuz session exists,
+                # while the physical device may already be playing
+                # something of its own) there is nothing of ours to have
+                # been displaced, so neither gapless-transition nor hijack
+                # detection has anything meaningful to compare against.
+                # is_playing_our_content() (the public method) already
+                # guards on this; this inline poll-loop path used to skip
+                # it, which is exactly the "hijack detected before there
+                # was ever an active session" false positive observed
+                # directly right after startup.
+                if (
+                    new_state == PlaybackState.PLAYING
+                    and self._client
+                    and self._current_proxy_url is not None
+                ):
                     self._hijack_check_countdown -= 1
                     hijack_check_due = self._hijack_check_countdown <= 0
                     if hijack_check_due:
