@@ -7,6 +7,7 @@ run concurrently, one per physical audio device.
 """
 
 import asyncio
+import functools
 import logging
 from typing import Optional
 
@@ -36,6 +37,7 @@ from qobuz_proxy.playback import (
     StateReporter,
     VolumeCommandHandler,
 )
+from qobuz_proxy.playback.command_handler import MSG_TYPE_SET_STATE
 from qobuz_proxy.backends import AudioBackend, BackendFactory, PlaybackState
 from qobuz_proxy.playback.play_reporter import PlayReporter
 from qobuz_proxy.playback.state_reporter import PlaybackStateReport
@@ -550,28 +552,52 @@ class Speaker:
                     self._player.on_next_track_info_changed
                 )
 
-                # Register all message-type handlers
-                for msg_type in self._queue_handler.get_message_types():
+                # Register all message-type handlers. Each dispatch is
+                # enqueued on the player's command queue rather than
+                # spawned as its own bare task — a single consumer running
+                # these strictly one at a time is what gives WS-driven
+                # commands (and the backend-driven natural-track-end
+                # continuation, on_track_ended) real ordering/mutual
+                # exclusion, instead of every inbound message racing every
+                # other one with no guarantee at all. coalesce=True on
+                # SET_STATE specifically reproduces the old generation-
+                # based supersede behavior for the one message type that
+                # actually arrives in aggressive bursts (e.g. a seek-bar
+                # scrub) — see QobuzPlayer.enqueue().
+                #
+                # Bound to plain local variables (rather than referencing
+                # self._player/self._x_handler from inside the lambdas)
+                # so mypy can narrow them past their Optional[...]
+                # declared type — narrowing an attribute doesn't survive
+                # into a closure that might run later, a local variable's
+                # does.
+                player = self._player
+                queue_handler = self._queue_handler
+                playback_handler = self._playback_handler
+                volume_handler = self._volume_handler
+
+                for msg_type in queue_handler.get_message_types():
                     self._ws_manager.register_handler(
                         msg_type,
-                        lambda mt, msg, h=self._queue_handler: asyncio.create_task(
-                            h.handle_message(mt, msg)
+                        lambda mt, msg: player.enqueue(
+                            functools.partial(queue_handler.handle_message, mt, msg)
                         ),
                     )
 
-                for msg_type in self._playback_handler.get_message_types():
+                for msg_type in playback_handler.get_message_types():
                     self._ws_manager.register_handler(
                         msg_type,
-                        lambda mt, msg, h=self._playback_handler: asyncio.create_task(
-                            h.handle_message(mt, msg)
+                        lambda mt, msg: player.enqueue(
+                            functools.partial(playback_handler.handle_message, mt, msg),
+                            coalesce=(mt == MSG_TYPE_SET_STATE),
                         ),
                     )
 
-                for msg_type in self._volume_handler.get_message_types():
+                for msg_type in volume_handler.get_message_types():
                     self._ws_manager.register_handler(
                         msg_type,
-                        lambda mt, msg, h=self._volume_handler: asyncio.create_task(
-                            h.handle_message(mt, msg)
+                        lambda mt, msg: player.enqueue(
+                            functools.partial(volume_handler.handle_message, mt, msg)
                         ),
                     )
 
