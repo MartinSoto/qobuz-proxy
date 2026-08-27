@@ -18,8 +18,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# State update interval (matches C++ heartbeat)
-STATE_UPDATE_INTERVAL_SECONDS = 5.0
+# Heartbeat watchdog timeout: a report is sent (while PLAYING) only if
+# nothing else — a command-driven or backend-event-driven send, both of
+# which already funnel through _send_state_update() — has gone out for
+# this long. Not a fixed send cadence any more; see _heartbeat_loop.
+STATE_HEARTBEAT_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -79,8 +82,15 @@ class StateReporter:
     Manages state reporting to Qobuz app.
 
     Sends:
-    - Periodic updates every 5 seconds (heartbeat)
-    - Immediate updates on state changes
+    - Immediate updates on state changes — command-driven (play/pause/
+      stop/seek/error, via report_now()) and backend-event-driven (an
+      external pause, a confirmed external stop, a hijack — Player calls
+      report_now() for these too, right when its own callback handlers
+      react to them).
+    - A heartbeat, but only as a watchdog: if nothing above has actually
+      fired for STATE_HEARTBEAT_TIMEOUT_SECONDS while PLAYING, this sends
+      one itself so position doesn't go stale for long even without a
+      discrete event.
 
     Does NOT handle volume (separate RndrSrvrVolumeChanged message).
     """
@@ -106,12 +116,25 @@ class StateReporter:
         self._is_running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
 
+        # When the last report actually went out (monotonic clock) — the
+        # single thing both event-triggered and heartbeat-triggered sends
+        # update, and what the watchdog measures its idle window against.
+        self._last_report_at: float = 0.0
+        # Set by _send_state_update() on every successful send, so the
+        # watchdog loop can wake early and recompute its deadline instead
+        # of also firing redundantly right after an event-triggered send.
+        self._report_sent_event: asyncio.Event = asyncio.Event()
+
     async def start(self) -> None:
         """Start the state reporter heartbeat."""
         if self._is_running:
             return
 
         self._is_running = True
+        # Start the idle window from now, not from the zero value set at
+        # construction — otherwise the watchdog's very first check would
+        # see itself already past deadline and fire immediately.
+        self._last_report_at = time.monotonic()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info("StateReporter started")
 
@@ -142,14 +165,37 @@ class StateReporter:
         await self._send_state_update()
 
     async def _heartbeat_loop(self) -> None:
-        """Periodic state update loop."""
+        """Heartbeat watchdog.
+
+        Not the primary relay mechanism any more — report_now() (called by
+        Player on every command-driven and backend-event-driven change) is.
+        This only fires a report itself when nothing has been sent —
+        by either path — for STATE_HEARTBEAT_TIMEOUT_SECONDS: it sleeps
+        until _last_report_at's deadline, woken early (and its own wait
+        restarted from the fresh deadline) whenever _send_state_update()
+        signals a send happened elsewhere.
+        """
         while self._is_running:
             try:
-                await asyncio.sleep(STATE_UPDATE_INTERVAL_SECONDS)
+                wait_time = max(
+                    0.0,
+                    self._last_report_at + STATE_HEARTBEAT_TIMEOUT_SECONDS - time.monotonic(),
+                )
+                try:
+                    await asyncio.wait_for(self._report_sent_event.wait(), timeout=wait_time)
+                    self._report_sent_event.clear()
+                    continue  # a send happened elsewhere; recompute the deadline
+                except asyncio.TimeoutError:
+                    pass
 
-                # Only send heartbeat if playing (not stopped/paused)
+                # Idle for the full window. Only PLAYING needs a position
+                # heartbeat — a paused/stopped session has nothing new to
+                # say, but the baseline still advances so this doesn't spin
+                # rechecking a deadline that's already passed.
                 if self._player.state == PlaybackState.PLAYING:
                     await self._send_state_update()
+                else:
+                    self._last_report_at = time.monotonic()
 
             except asyncio.CancelledError:
                 break
@@ -162,6 +208,10 @@ class StateReporter:
         try:
             report = await self._build_state_report()
             await self._send_callback(report)
+            # Only a successful send resets the watchdog clock — a string
+            # of failures must not silently suppress heartbeats too.
+            self._last_report_at = time.monotonic()
+            self._report_sent_event.set()
             logger.debug(
                 f"State update sent: {report.playing_state.name}, "
                 f"pos={report.position_value_ms}ms, ts={report.position_timestamp_ms}"
