@@ -332,6 +332,27 @@ class QobuzPlayer:
         self._backend_attached = attached
         if attached:
             self._backend_attached_event.set()
+            # A retarget just succeeded — this is retarget()'s own sole
+            # call site (see Speaker.retarget()). The backend clears its
+            # own next-track bookkeeping whenever it actually retargets to
+            # a different device (DLNABackend.retarget() — the physical
+            # device's own queue can't be assumed to carry over what we'd
+            # armed on the old one), but nothing told *this* flag its own
+            # armed state might now be stale. Left alone, it stayed True
+            # forever (observed directly: a gapless transition Sonos
+            # itself carried through anyway on the new device went
+            # undetected as gapless — the backend had nothing armed to
+            # compare against — and read as an external takeover instead),
+            # permanently blocking the ordinary per-position-tick re-arm
+            # retry (see _on_position_update) from ever running again.
+            # Cleared here unconditionally, not just on a detached->
+            # attached transition, since Speaker.retarget() calls this on
+            # every successful retarget regardless of whether
+            # backend_attached ever actually went False — costs at most
+            # one harmless re-arm attempt when nothing actually changed
+            # (the backend's own set_next_track dedups an identical
+            # still-armed URL).
+            self._clear_gapless_state()
             return
         self._backend_attached_event.clear()
         if was_attached and self._state == PlaybackState.PLAYING:
