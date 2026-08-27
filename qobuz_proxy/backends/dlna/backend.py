@@ -30,8 +30,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# State polling interval
-STATE_POLL_INTERVAL_SECONDS = 2.0
+# State polling interval. Also the cadence of hijack detection and paused-
+# external-stop confirmation (see _HIJACK_CHECK_INTERVAL_POLLS and
+# _PAUSED_STOP_CONFIRMATIONS below) — this loop is the only thing that ever
+# reads transport state/position from the physical device, so it runs at
+# the faster of the two cadences that used to poll independently rather
+# than the slower one, to avoid regressing external-takeover/stop-detection
+# latency.
+STATE_POLL_INTERVAL_SECONDS = 0.5
+
+# While playing, how many poll cycles between hijack checks (is another
+# source now playing to this renderer instead of us — see
+# is_playing_our_content()). Costs an extra device round trip, unlike the
+# state/position poll every cycle already does, so this is throttled
+# independently — detection within a few seconds is plenty.
+_HIJACK_CHECK_INTERVAL_POLLS = 6
+
+# While paused, a confirmed external stop (the renderer stopped on its own,
+# e.g. someone else's timeout/command) is reported after this many
+# consecutive STOPPED reads — get_state() collapses transient read
+# failures (and unrecognized device state strings) to STOPPED, so one bad
+# poll must not end a normal paused listen or lose its resume position.
+_PAUSED_STOP_CONFIRMATIONS = 3
 
 # Grace period during which transport state is expected to be transiently
 # unreliable (seconds) — covers both a track just starting (prevents false
@@ -139,6 +159,14 @@ class DLNABackend(AudioBackend):
         self._next_track_queue_nr: Optional[int] = None
         self._gapless_supported: bool = True
         self._current_proxy_url: Optional[str] = None
+
+        # Consecutive STOPPED polls seen while paused (external-stop
+        # detection — see _PAUSED_STOP_CONFIRMATIONS).
+        self._paused_stop_polls: int = 0
+
+        # Cycles since the last hijack check (external-takeover detection
+        # while PLAYING — see _HIJACK_CHECK_INTERVAL_POLLS).
+        self._hijack_check_countdown: int = 0
 
     # =========================================================================
     # Lifecycle
@@ -759,7 +787,15 @@ class DLNABackend(AudioBackend):
     # =========================================================================
 
     async def _poll_state_loop(self) -> None:
-        """Poll device state periodically."""
+        """Poll device state periodically.
+
+        The only thing that ever reads transport state/position from the
+        physical device — also owns gapless-transition detection,
+        track-ended/state-change notification, hijack detection (an
+        external source now playing to this renderer instead of us), and
+        paused-external-stop confirmation, all pushed out via callbacks
+        rather than a caller polling this backend independently.
+        """
         while self._is_connected:
             try:
                 await asyncio.sleep(STATE_POLL_INTERVAL_SECONDS)
@@ -775,6 +811,9 @@ class DLNABackend(AudioBackend):
                     time.monotonic() - self._playback_started_at
                     < PLAYBACK_START_GRACE_PERIOD_SECONDS
                 )
+
+                if new_state != PlaybackState.PLAYING:
+                    self._hijack_check_countdown = 0
 
                 # Gapless transition detection: check if device has moved to next track
                 if (
@@ -801,6 +840,19 @@ class DLNABackend(AudioBackend):
                         self._notify_next_track_started()
                         self._notify_position_update(0)
                         continue
+
+                # Paused -> confirmed external stop: don't trust a single
+                # STOPPED read (transient failures collapse to STOPPED too;
+                # a "cold" pause — nothing ever started on this device —
+                # never gets here since self._state stays whatever it was
+                # before, never PAUSED, in that case).
+                if self._state == PlaybackState.PAUSED and new_state == PlaybackState.STOPPED:
+                    self._paused_stop_polls += 1
+                    if self._paused_stop_polls >= _PAUSED_STOP_CONFIRMATIONS:
+                        self._paused_stop_polls = 0
+                        self._notify_state_change(PlaybackState.STOPPED)
+                    continue
+                self._paused_stop_polls = 0
 
                 # Detect state changes
                 if new_state != self._state:
@@ -829,6 +881,21 @@ class DLNABackend(AudioBackend):
                             self._notify_track_ended()
 
                     self._notify_state_change(new_state)
+
+                # Hijack detection: the device can keep reporting PLAYING
+                # throughout a takeover (another app grouping into or
+                # playing directly to a shared renderer) — get_state()
+                # alone can't tell that apart from us still playing.
+                # is_playing_our_content() already gates itself on the
+                # grace period, so no need to check it again here.
+                if new_state == PlaybackState.PLAYING:
+                    self._hijack_check_countdown -= 1
+                    if self._hijack_check_countdown <= 0:
+                        self._hijack_check_countdown = _HIJACK_CHECK_INTERVAL_POLLS
+                        if not await self.is_playing_our_content():
+                            logger.info("External takeover detected on this renderer")
+                            self._notify_external_takeover()
+                            continue
 
                 # Update position while playing
                 if new_state == PlaybackState.PLAYING:

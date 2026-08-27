@@ -130,24 +130,15 @@ class TestPlayerReporting:
         assert api.report_streaming_end.await_args.kwargs["track_id"] == "100"
 
     async def test_external_pause_stops_reporter_clock(self) -> None:
-        """A device-originated pause (detected by the monitor) must pause the
-        played-time clock too, not just an app-driven pause."""
+        """A device-originated pause (the backend noticing on its own, via
+        on_state_change) must pause the played-time clock too, not just an
+        app-driven pause."""
         player, api = _make_player_with_reporter()
         await player.play_track(queue_item_id=1, track_id="100")
 
         # The renderer reports it paused on its own.
-        player.backend.get_state = AsyncMock(return_value=PlaybackState.PAUSED)
-        player.backend.get_position = AsyncMock(return_value=0)
-
-        player._is_running = True
-        task = asyncio.create_task(player._playback_monitor_loop())
-        await asyncio.sleep(0.6)  # allow one poll cycle (loop sleeps 0.5s)
-        player._is_running = False
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        player.backend._notify_state_change(PlaybackState.PAUSED)
+        await asyncio.sleep(0.05)  # let the scheduled handler task run
 
         assert player.state == PlaybackState.PAUSED
         api.report_streaming_end.assert_not_awaited()
@@ -170,33 +161,24 @@ class TestPlayerReporting:
         # A brand-new start was reported (not merged into the old session).
         assert api.report_streaming_start.await_count == 2
 
-    async def _run_monitor_briefly(self, player) -> None:
-        player._is_running = True
-        task = asyncio.create_task(player._playback_monitor_loop())
-        await asyncio.sleep(0.6)  # allow one poll cycle (loop sleeps 0.5s)
-        player._is_running = False
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    async def test_external_stop_while_paused_closes_report_after_confirmation(self) -> None:
-        """An external renderer stop (confirmed by consecutive polls) after an
-        app pause must close the open play-report session."""
-        from qobuz_proxy.playback.player import _PAUSED_STOP_CONFIRMATIONS
-
+    async def test_external_stop_while_paused_closes_report(self) -> None:
+        """A confirmed external renderer stop (the confirmation-against-a-
+        single-transient-read logic now lives in
+        DLNABackend._poll_state_loop — see tests/backends/test_dlna_backend.py)
+        after an app pause must close the open play-report session."""
         player, api = _make_player_with_reporter()
         await player.play_track(queue_item_id=1, track_id="100")
         await player.pause()
-
-        # The renderer is stopped externally; one more poll crosses the
-        # confirmation threshold.
-        player.backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
-        player._paused_stop_polls = _PAUSED_STOP_CONFIRMATIONS - 1
         player._position_value_ms = 60_000  # paused mid-track
 
-        await self._run_monitor_briefly(player)
+        # _Backend's pause()/play() are no-op stubs that don't call
+        # _notify_state_change themselves (unlike DLNABackend) — set the
+        # backend's own last-known state directly so the STOPPED
+        # notification below is a real transition, the way it would be
+        # coming from an actual renderer that really was PAUSED.
+        player.backend._state = PlaybackState.PAUSED
+        player.backend._notify_state_change(PlaybackState.STOPPED)
+        await asyncio.sleep(0.05)  # let the scheduled handler task run
 
         assert player.state == PlaybackState.STOPPED
         api.report_streaming_end.assert_awaited_once()
@@ -204,20 +186,6 @@ class TestPlayerReporting:
         # BUG-19: the stale pause-point must be cleared, or a later "previous"
         # command takes the restart-seek branch on a stopped renderer (a no-op).
         assert player.current_position_ms == 0
-
-    async def test_single_transient_stop_while_paused_does_not_close(self) -> None:
-        """A single STOPPED reading (e.g. a transient SOAP failure, which
-        get_state collapses to STOPPED) must not end a normal paused listen."""
-        player, api = _make_player_with_reporter()
-        await player.play_track(queue_item_id=1, track_id="100")
-        await player.pause()
-
-        player.backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
-
-        await self._run_monitor_briefly(player)  # one poll only
-
-        assert player.state == PlaybackState.PAUSED
-        api.report_streaming_end.assert_not_awaited()
 
     async def test_switching_track_reports_end_then_start(self) -> None:
         player, api = _make_player_with_reporter()
