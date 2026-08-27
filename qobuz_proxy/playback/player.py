@@ -33,20 +33,6 @@ PREVIOUS_TRACK_THRESHOLD_MS = 3000
 # reportStreamingStart to avoid a duplicate Last.fm scrobble.
 _HANDOFF_POSITION_THRESHOLD_MS = 5000
 
-# While paused, the monitor watches for an external renderer stop. A DLNA
-# get_state() collapses transient read failures (and unrecognized device state
-# strings) to STOPPED, so a real stop must be confirmed by this many consecutive
-# STOPPED polls (~0.5s each) before ending the listen — one bad poll must not
-# prematurely stop a normal paused track or lose its resume position.
-_PAUSED_STOP_CONFIRMATIONS = 3
-
-# While playing, how many 0.5s poll cycles between hijack checks (is another
-# source now playing to this renderer instead of us — see
-# AudioBackend.is_playing_our_content()). Costs an extra device round trip,
-# unlike the state/position poll every cycle already does, so this is
-# throttled independently — detection within a few seconds is plenty.
-_HIJACK_CHECK_INTERVAL_POLLS = 6
-
 # After a WebSocket reconnect, the Qobuz server replays its last-known session
 # snapshot via SET_STATE — typically PAUSED at a position from before the drop.
 # If the renderer is actually still playing further along the same track, treat
@@ -116,15 +102,6 @@ class QobuzPlayer:
         # renderer has no controller attached yet.
         self._is_active_renderer: bool = False
 
-        # Consecutive STOPPED polls seen while paused (external-stop detection).
-        self._paused_stop_polls = 0
-
-        # Cycles since the last hijack check (external-takeover detection
-        # while PLAYING) — throttled independently of the 0.5s poll cadence
-        # since it costs an extra device round trip, unlike the plain
-        # state/position poll every cycle already does.
-        self._hijack_check_countdown = 0
-
         # Playback command serialization. A track switch in the Qobuz app sends
         # a burst of SET_STATE messages; without this lock the resulting
         # load/play/stop calls overlap and fire concurrent SOAP control
@@ -167,7 +144,6 @@ class QobuzPlayer:
         self._on_next_track_changed_callback: Optional[Callable[[], None]] = None
 
         # Background tasks
-        self._playback_monitor_task: Optional[asyncio.Task] = None
         self._state_update_task: Optional[asyncio.Task] = None
         self._is_running: bool = False
 
@@ -180,6 +156,8 @@ class QobuzPlayer:
         self.backend.on_playback_error(self._on_playback_error)
         self.backend.on_position_update(self._on_position_update)
         self.backend.on_next_track_started(self._on_next_track_started)
+        self.backend.on_state_change(self._on_state_change)
+        self.backend.on_external_takeover(self._on_external_takeover)
 
         logger.info("QobuzPlayer initialized")
 
@@ -202,7 +180,6 @@ class QobuzPlayer:
             await self.backend.connect()
 
         # Start background tasks
-        self._playback_monitor_task = asyncio.create_task(self._playback_monitor_loop())
         self._state_update_task = asyncio.create_task(self._state_update_loop())
 
         logger.info("Player started")
@@ -218,7 +195,7 @@ class QobuzPlayer:
         self._is_running = False
 
         # Cancel background tasks
-        for task in [self._playback_monitor_task, self._state_update_task]:
+        for task in [self._state_update_task]:
             if task:
                 task.cancel()
                 try:
@@ -1392,8 +1369,18 @@ class QobuzPlayer:
         asyncio.create_task(self._send_state_update())
 
     def _on_position_update(self, position_ms: int) -> None:
-        """Callback when backend reports position update."""
+        """Callback when backend reports position update.
+
+        Only fires while the backend is actually playing (see
+        DLNABackend._poll_state_loop), which makes it a convenient,
+        already-firing "still playing" tick to also retry arming gapless
+        on — the previous track-info-changed event that would normally
+        trigger it (on_next_track_info_changed) can arrive before playback
+        actually starts, or an earlier arm attempt can fail transiently.
+        """
         self._set_position(position_ms)
+        if not self._gapless_armed:
+            asyncio.create_task(self._prepare_next_track_for_gapless())
 
     # =========================================================================
     # Gapless Playback
@@ -1584,110 +1571,74 @@ class QobuzPlayer:
     # Background Tasks
     # =========================================================================
 
-    async def _playback_monitor_loop(self) -> None:
-        """Monitor playback and handle backend state changes."""
-        while self._is_running:
+    def _on_state_change(self, state: PlaybackState) -> None:
+        """Callback when the backend's own state changes.
+
+        Fires both when acking a command we just issued (backend.play/
+        pause/resume/stop, all called with `_playback_lock` held by the
+        `_*_locked` method that's awaiting them) and when the backend's
+        own poll loop notices a change on its own (external pause,
+        confirmed external stop while paused — see
+        DLNABackend._poll_state_loop). The command case is already fully
+        handled by the calling `_*_locked` method right after it awaits
+        the backend call (sets `self._state`, sends the update, reports
+        the play/pause/stop) — nothing to do here for that case, so it's
+        skipped via the same lock that method is holding. This handles
+        only the unprompted one.
+        """
+        if self._playback_lock.locked():
+            return
+        if state == self._state:
+            return
+        if self._state == PlaybackState.PLAYING and state == PlaybackState.STOPPED:
+            # Natural track end — on_track_ended (already wired) owns this
+            # transition (repeat-one restart / auto-advance / stop
+            # decision); avoid a premature STOPPED flicker before it runs.
+            return
+        logger.info(f"Unprompted backend state change: {self._state} -> {state}")
+        self._state = state
+        asyncio.create_task(self._handle_unprompted_state_change(state))
+
+    async def _handle_unprompted_state_change(self, state: PlaybackState) -> None:
+        """Side effects for a state change the backend noticed on its own —
+        see _on_state_change."""
+        if state == PlaybackState.PAUSED:
+            await self._send_state_update()
+            # Stop the played-time clock so this pause is excluded from the
+            # reported duration, like an app-driven pause.
+            self._report_paused()
+        elif state == PlaybackState.STOPPED:
+            # Zero the position like _stop_playback_locked: a stale
+            # pause-point position makes "previous" try a restart-seek on a
+            # stopped renderer (a no-op) instead of navigating.
+            self._position_value_ms = 0
+            self._position_timestamp_ms = int(time.time() * 1000)
+            await self._send_state_update()
+            await self._report_stopped()
+
+    def _on_external_takeover(self) -> None:
+        """Callback when the backend detects another source now driving
+        this renderer instead of us (see
+        AudioBackend.is_playing_our_content())."""
+        logger.debug("External takeover callback")
+        asyncio.create_task(self._handle_external_takeover())
+
+    async def _handle_external_takeover(self) -> None:
+        logger.info("External takeover detected on this renderer — treating as stopped")
+        self._state = PlaybackState.STOPPED
+        self._position_value_ms = 0
+        self._position_timestamp_ms = int(time.time() * 1000)
+        await self._send_state_update()
+        await self._report_stopped()
+        # A plain STOPPED report leaves the app still believing it's
+        # connected to this renderer — there's no protocol message to tell
+        # it otherwise, so force a real reconnect instead, the closest
+        # thing to "I just came back online" available.
+        if self._hijack_detected_callback:
             try:
-                await asyncio.sleep(0.5)
-
-                if self._state == PlaybackState.PLAYING:
-                    self._paused_stop_polls = 0
-                    # Poll backend state
-                    backend_state = await self.backend.get_state()
-
-                    if backend_state == PlaybackState.STOPPED:
-                        # Track finished naturally (handled by callback)
-                        pass
-                    elif backend_state == PlaybackState.PAUSED:
-                        # External pause (e.g., DLNA device)
-                        self._state = PlaybackState.PAUSED
-                        await self._send_state_update()
-                        # Stop the played-time clock so this pause is excluded
-                        # from the reported duration, like an app-driven pause.
-                        self._report_paused()
-                    elif backend_state == PlaybackState.PLAYING:
-                        # Still genuinely "playing" from the transport's own
-                        # perspective — but that's exactly what a hijack (a
-                        # different source now playing to this renderer,
-                        # e.g. someone grouping into it via the Sonos app)
-                        # looks like too; get_state() alone can't tell them
-                        # apart. Throttled — an extra device round trip on
-                        # top of the plain state/position poll every cycle.
-                        self._hijack_check_countdown -= 1
-                        if self._hijack_check_countdown <= 0:
-                            self._hijack_check_countdown = _HIJACK_CHECK_INTERVAL_POLLS
-                            if not await self.backend.is_playing_our_content():
-                                logger.info(
-                                    "External takeover detected on this renderer — "
-                                    "treating as stopped"
-                                )
-                                self._state = PlaybackState.STOPPED
-                                self._position_value_ms = 0
-                                self._position_timestamp_ms = int(time.time() * 1000)
-                                await self._send_state_update()
-                                await self._report_stopped()
-                                # A plain STOPPED report leaves the app
-                                # still believing it's connected to this
-                                # renderer — there's no protocol message to
-                                # tell it otherwise, so force a real
-                                # reconnect instead, the closest thing to
-                                # "I just came back online" available.
-                                if self._hijack_detected_callback:
-                                    try:
-                                        await self._hijack_detected_callback(
-                                            "external takeover detected"
-                                        )
-                                    except Exception as e:
-                                        logger.warning(f"Hijack-detected callback failed: {e}")
-                                continue
-
-                    # Update position from backend
-                    position = await self.backend.get_position()
-                    self._set_position(position)
-
-                    # Try to arm gapless if not already armed
-                    if not self._gapless_armed:
-                        await self._prepare_next_track_for_gapless()
-
-                elif self._state == PlaybackState.PAUSED and not self._backend_engaged:
-                    # Cold pause (see _pause_locked) — the backend was never
-                    # actually started for this track, so there's nothing on
-                    # the device to poll; get_state() would just report
-                    # STOPPED and wipe the remembered resume position below.
-                    pass
-
-                elif self._state == PlaybackState.PAUSED:
-                    # Keep watching while paused: a pause leaves the play-report
-                    # session open, so an external stop/timeout on the renderer
-                    # must close it (otherwise a later play merges into it).
-                    # Require consecutive STOPPED polls before trusting it —
-                    # get_state() reports STOPPED on a transient read failure, and
-                    # one bad poll must not end a normal paused listen.
-                    if await self.backend.get_state() == PlaybackState.STOPPED:
-                        self._paused_stop_polls += 1
-                        if self._paused_stop_polls >= _PAUSED_STOP_CONFIRMATIONS:
-                            self._paused_stop_polls = 0
-                            self._state = PlaybackState.STOPPED
-                            # Zero the position like _stop_playback_locked: a
-                            # stale pause-point position makes "previous" try a
-                            # restart-seek on a stopped renderer (a no-op)
-                            # instead of navigating.
-                            self._position_value_ms = 0
-                            self._position_timestamp_ms = int(time.time() * 1000)
-                            await self._send_state_update()
-                            await self._report_stopped()
-                    else:
-                        self._paused_stop_polls = 0
-
-                else:
-                    self._paused_stop_polls = 0
-                    self._hijack_check_countdown = 0
-
-            except asyncio.CancelledError:
-                break
+                await self._hijack_detected_callback("external takeover detected")
             except Exception as e:
-                logger.error(f"Playback monitor error: {e}")
-                await asyncio.sleep(1.0)
+                logger.warning(f"Hijack-detected callback failed: {e}")
 
     async def _state_update_loop(self) -> None:
         """Periodic state updates (heartbeat)."""

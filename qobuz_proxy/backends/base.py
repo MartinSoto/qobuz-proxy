@@ -24,6 +24,7 @@ BufferStatusCallback = Callable[[BufferStatus], None]
 TrackEndedCallback = Callable[[], None]
 PlaybackErrorCallback = Callable[[str], None]  # error_message
 NextTrackStartedCallback = Callable[[], None]
+ExternalTakeoverCallback = Callable[[], None]
 
 
 class AudioBackend(ABC):
@@ -54,6 +55,7 @@ class AudioBackend(ABC):
         self._on_track_ended: Optional[TrackEndedCallback] = None
         self._on_playback_error: Optional[PlaybackErrorCallback] = None
         self._on_next_track_started: Optional[NextTrackStartedCallback] = None
+        self._on_external_takeover: Optional[ExternalTakeoverCallback] = None
 
     # =========================================================================
     # Playback Control - Required
@@ -239,6 +241,14 @@ class AudioBackend(ABC):
         """Register callback for playback errors."""
         self._on_playback_error = callback
 
+    def on_external_takeover(self, callback: Optional[ExternalTakeoverCallback]) -> None:
+        """Register callback for an external takeover of this renderer —
+        another source now driving it instead of us (see
+        is_playing_our_content()). Default: never fired — a backend
+        without a way to be shared out from under us (e.g. local audio
+        output) never calls _notify_external_takeover()."""
+        self._on_external_takeover = callback
+
     # =========================================================================
     # Event Notification Helpers
     # =========================================================================
@@ -292,6 +302,14 @@ class AudioBackend(ABC):
                 self._on_next_track_started()
             except Exception as e:
                 logger.error(f"Next track started callback error: {e}")
+
+    def _notify_external_takeover(self) -> None:
+        """Notify listeners that another source has taken over this renderer."""
+        if self._on_external_takeover:
+            try:
+                self._on_external_takeover()
+            except Exception as e:
+                logger.error(f"External takeover callback error: {e}")
 
     # =========================================================================
     # Info
