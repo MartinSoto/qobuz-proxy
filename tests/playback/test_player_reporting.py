@@ -61,6 +61,11 @@ def _make_player_with_reporter():
     reporter = PlayReporter(api)
 
     queue = MagicMock()
+    # Player routes track loading through queue.get_track_url/get_track_metadata
+    # rather than fetching directly — mirror metadata.get_streaming_url/
+    # get_metadata above.
+    queue.get_track_url = MagicMock(side_effect=lambda track: _coro(f"http://t/{track.track_id}"))
+    queue.get_track_metadata = MagicMock(side_effect=lambda track: _coro(None))
     player = QobuzPlayer(
         queue=queue, metadata_service=metadata, backend=backend, play_reporter=reporter
     )

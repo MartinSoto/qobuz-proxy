@@ -25,6 +25,25 @@ def _make_player(next_track_info=None):
     metadata.get_metadata = AsyncMock(return_value=meta_obj)
     metadata.get_track_format.return_value = (6, 44100, 16)
 
+    # Player routes track loading through queue.get_track_url/
+    # get_track_metadata rather than fetching directly — mirror
+    # metadata.get_streaming_url/get_metadata above, including the same
+    # cache-onto-the-track side effect QobuzQueue's real methods have.
+    async def _get_track_url(track):
+        track.set_streaming_url(await metadata.get_streaming_url(track.track_id))
+        return track.streaming_url
+
+    async def _get_track_metadata(track):
+        meta_obj = await metadata.get_metadata(track.track_id)
+        meta = meta_obj.to_dict() if meta_obj else None
+        if meta:
+            track.metadata = meta
+            track.duration_ms = meta.get("duration_ms", 0)
+        return meta
+
+    queue.get_track_url = AsyncMock(side_effect=_get_track_url)
+    queue.get_track_metadata = AsyncMock(side_effect=_get_track_metadata)
+
     backend = MagicMock()
     backend.supports_gapless = True
     backend.clear_next_track = AsyncMock()

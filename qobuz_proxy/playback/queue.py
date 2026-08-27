@@ -467,6 +467,53 @@ class QobuzQueue:
             return track
 
     # =========================================================================
+    # Track Caching
+    # =========================================================================
+
+    async def get_track_url(self, track: QueueTrack) -> Optional[str]:
+        """The track's streaming URL — from cache if still fresh (see
+        QueueTrack.url_is_stale), otherwise fetched via the registered URL
+        callback and cached back onto the track.
+
+        The single place "is this cached, if not fetch and cache it" is
+        implemented for streaming URLs — _preload_upcoming and QobuzPlayer
+        both call through this instead of each keeping their own copy of
+        the same check-fetch-store logic.
+        """
+        if not track.url_is_stale():
+            return track.streaming_url
+        if not self._get_url_callback:
+            return None
+        url = await self._get_url_callback(track.track_id)
+        if url:
+            track.set_streaming_url(url)
+            logger.debug(f"Fetched URL for track {track.track_id}")
+        return url
+
+    async def get_track_metadata(self, track: QueueTrack) -> Optional[dict[str, Any]]:
+        """The track's metadata — from cache if already fetched, otherwise
+        fetched via the registered metadata callback and cached back onto
+        the track (including duration_ms, which several callers read
+        separately from the metadata dict itself).
+
+        The single place "is this cached, if not fetch and cache it" is
+        implemented for metadata — see get_track_url.
+        """
+        if track.metadata:
+            return track.metadata
+        if not self._get_metadata_callback:
+            return None
+        meta = await self._get_metadata_callback(track.track_id)
+        if meta:
+            track.metadata = meta
+            track.duration_ms = meta.get("duration_ms", 0)
+            logger.debug(
+                f"Fetched metadata for track {track.track_id}: "
+                f"{meta.get('artist', '?')} - {meta.get('title', '?')}"
+            )
+        return meta
+
+    # =========================================================================
     # Preloading
     # =========================================================================
 
@@ -505,23 +552,8 @@ class QobuzQueue:
         # Preload outside lock
         for track in tracks_to_preload:
             try:
-                # Fetch metadata if missing
-                if not track.metadata and self._get_metadata_callback:
-                    metadata = await self._get_metadata_callback(track.track_id)
-                    if metadata:
-                        track.metadata = metadata
-                        track.duration_ms = metadata.get("duration_ms", 0)
-                        logger.debug(
-                            f"Preloaded metadata for track {track.track_id}: "
-                            f"{metadata.get('artist', '?')} - {metadata.get('title', '?')}"
-                        )
-
-                # Fetch URL if missing or stale
-                if track.url_is_stale() and self._get_url_callback:
-                    url = await self._get_url_callback(track.track_id)
-                    if url:
-                        track.set_streaming_url(url)
-                        logger.debug(f"Preloaded URL for track {track.track_id}")
+                await self.get_track_metadata(track)
+                await self.get_track_url(track)
 
                 # Mark as preloaded
                 async with self._lock:
