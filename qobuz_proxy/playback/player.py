@@ -1465,10 +1465,14 @@ class QobuzPlayer:
         on — the previous track-info-changed event that would normally
         trigger it (on_next_track_info_changed) can arrive before playback
         actually starts, or an earlier arm attempt can fail transiently.
+        Enqueued (plain FIFO, not coalesced — this is a low-stakes retry,
+        never something a later command needs to supersede) rather than a
+        bare task, so it runs properly ordered against everything else
+        driving playback instead of racing it — see enqueue().
         """
         self._set_position(position_ms)
         if not self._gapless_armed:
-            asyncio.create_task(self._prepare_next_track_for_gapless())
+            self.enqueue(self._prepare_next_track_for_gapless)
 
     # =========================================================================
     # Gapless Playback
@@ -1483,9 +1487,16 @@ class QobuzPlayer:
     async def _prepare_next_track_for_gapless(self) -> None:
         """Prepare the next track for gapless playback on the backend.
 
-        Serialized via a lock: overlapping calls (monitor loop racing a
-        re-arm) would each push the next track to the backend, and on Sonos
-        that queues the track twice — making it play twice.
+        Serialized via `_gapless_arm_lock`: this has several independent
+        legitimate callers (the retry on every position tick, a re-arm on
+        next-track-info change, arming the next-next track right after a
+        transition) — overlapping calls would each push the next track to
+        the backend, and on Sonos that queues the track twice, making it
+        play twice. Kept as its own lock rather than relying solely on
+        the command-queue's own serialization (see enqueue()): unlike
+        e.g. the old natural-track-end restart check, this method is
+        meant to be safely callable from more than one place at once by
+        design, not just from a single, always-queued entry point.
         """
         if not self.backend.supports_gapless or self._gapless_armed:
             return
@@ -1559,9 +1570,19 @@ class QobuzPlayer:
             logger.warning(f"Gapless: failed to prepare next track: {e}")
 
     def _on_next_track_started(self) -> None:
-        """Callback when backend reports gapless transition to next track."""
+        """Callback when backend reports gapless transition to next track.
+
+        Enqueued (plain FIFO, not coalesced — see enqueue()) rather than a
+        bare task: the transition already happened physically on the
+        device by the time this fires, so unlike a still-undecided
+        continuation (_on_track_ended's repeat-one/auto-advance), there's
+        nothing here a later command should be allowed to preempt away —
+        only bookkeeping (current track, position, the play-report swap)
+        that must still happen, just correctly ordered against whatever
+        else is driving playback instead of racing it.
+        """
         logger.debug("Gapless: next track started callback from backend")
-        asyncio.create_task(self._handle_gapless_transition())
+        self.enqueue(self._handle_gapless_transition)
 
     async def _handle_gapless_transition(self) -> None:
         """Handle a gapless transition to the next track."""

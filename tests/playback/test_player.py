@@ -155,6 +155,57 @@ class TestPrepareNextTrackConcurrency:
         backend.clear_next_track.assert_awaited()
 
 
+class TestGaplessCallbacksUseTheCommandQueue:
+    """_on_next_track_started/_on_position_update's retry-arm route
+    through the command queue (Player.enqueue()) instead of spawning
+    independent tasks that could race a queued command — see the
+    "detecting the track actually changed" design discussion."""
+
+    async def test_next_track_started_enqueues_the_transition_handler(self) -> None:
+        player, backend = _make_player()
+        await player.start()
+        player._gapless_armed = True
+        player._pending_next_track = {
+            "trackId": "222",
+            "queueItemId": 9,
+            "contextUuid": None,
+            "url": "http://proxy:7120/audio/222_9.flac",
+            "metadata": {"duration_ms": 1000},
+            "backend_meta": None,
+        }
+
+        player._on_next_track_started()
+        await player._command_queue.join()
+        await player.stop()
+
+        assert player._current_track is not None
+        assert player._current_track.track_id == "222"
+
+    async def test_position_update_enqueues_the_retry_arm_when_not_armed(self) -> None:
+        next_info = {"trackId": "222", "queueItemId": 9}
+        player, backend = _make_player(next_track_info=next_info)
+        await player.start()
+        player._gapless_armed = False
+
+        player._on_position_update(1000)
+        await player._command_queue.join()
+        await player.stop()
+
+        backend.set_next_track.assert_awaited()
+
+    async def test_position_update_does_not_enqueue_when_already_armed(self) -> None:
+        next_info = {"trackId": "222", "queueItemId": 9}
+        player, backend = _make_player(next_track_info=next_info)
+        await player.start()
+        player._gapless_armed = True
+
+        player._on_position_update(1000)
+        await player._command_queue.join()
+        await player.stop()
+
+        backend.set_next_track.assert_not_called()
+
+
 class TestContextUuidPropagation:
     """The album/playlist context UUID must reach the played track for scrobbles."""
 
