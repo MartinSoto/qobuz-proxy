@@ -161,6 +161,22 @@ class Speaker:
             logger.info(f"[{new_name}] Renamed")
         return ok
 
+    async def detach(self) -> None:
+        """
+        Give up the current physical target without tearing anything else
+        down — the Qobuz Connect session (WebSocket, mDNS registration),
+        Player, and queue all stay alive. Used when this speaker's Sonos
+        group_id has gone pending (SonosDiscoveryManager can't yet tell
+        whether it's a real loss or a handoff in progress): if this speaker
+        is the one actually being driven, leaving it pointed at a
+        coordinator that may already be transitioning out of the group
+        risks two physical devices both thinking they're in charge at once.
+        A later retarget() (see AudioBackend.retarget()) reconnects
+        cleanly from this state, even to the same ip/port as before.
+        """
+        if self._backend:
+            await self._backend.disconnect(send_device_stop=True)
+
     async def retarget(self, ip: str, port: int) -> bool:
         """
         Repoint this speaker's backend at a different physical device, in

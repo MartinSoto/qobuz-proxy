@@ -2,12 +2,23 @@
 Continuous Sonos household auto-discovery, wired up as Speaker lifecycle.
 
 SonosController is the consumer that turns SonosDiscoveryManager's
-Sonos-topology-only callbacks (found/lost/renamed/retargeted/rekeyed/
+Sonos-topology-only callbacks (found/lost/renamed/retargeted/pending/
 members-departed) into actual Speaker/Qobuz-Connect-session lifecycle
 actions. It owns every Speaker it creates end to end — the app only ever
 starts/stops this controller and reads .speakers for cross-cutting
 concerns (the web UI's speaker list, an app-wide shutdown), the same
 shape as any other top-level component (DiscoveryService, Speaker itself).
+
+A group_id's Speaker is never torn down just because its group_id stopped
+being reported for one topology update — see SonosDiscoveryManager's
+pending state. _on_room_pending is where this controller reacts to that:
+if the affected group is the one actually being played to, detach its
+Speaker's backend (stop the device, stop polling it) rather than risk
+commands continuing to go to a coordinator that may already be
+transitioning out of the group — see split-brain note on _on_room_pending
+itself. A room that's merely discovered, not the one Qobuz is driving, is
+left running untouched either way; if the pending period resolves as a
+real loss, _on_room_lost tears the Speaker down for good.
 """
 
 from __future__ import annotations
@@ -37,6 +48,32 @@ if TYPE_CHECKING:
     from qobuz_proxy.speaker import Speaker
 
 logger = logging.getLogger(__name__)
+
+# A departed member keeps pulling audio from our proxy over its own HTTP
+# connection — Sonos's group-leave doesn't reliably tear that down on its
+# own (observed: a device still mid-download 35s after being told to Stop
+# and after leaving its group). Nothing else will ever stop it, and
+# _on_room_found for this same device — creating a brand-new Speaker on
+# top of what it thinks is a fresh, idle room — runs right after this in
+# the same topology pass, so we verify (and retry) rather than fire-and-
+# forget: a still-playing device would otherwise hand that new Speaker a
+# transport state it never asked for, read by it as an external takeover.
+_STOP_VERIFY_ATTEMPTS = 5
+_STOP_VERIFY_INTERVAL_SECONDS = 0.4
+_STOPPED_TRANSPORT_STATES = {None, "STOPPED", "NO_MEDIA_PRESENT"}
+
+
+async def _stop_and_verify(client: DLNAClient, ip: str) -> None:
+    """Send Stop and confirm the device actually stopped, re-sending it if
+    not — a single Stop can silently not take (see module note above)."""
+    for attempt in range(1, _STOP_VERIFY_ATTEMPTS + 1):
+        await client.stop()
+        state = await client.get_transport_info()
+        if state in _STOPPED_TRANSPORT_STATES:
+            return
+        if attempt < _STOP_VERIFY_ATTEMPTS:
+            await asyncio.sleep(_STOP_VERIFY_INTERVAL_SECONDS)
+    logger.warning(f"Sonos discovery: could not confirm {ip} stopped after leaving its group")
 
 
 class SonosController:
@@ -95,8 +132,8 @@ class SonosController:
             on_room_lost=self._on_room_lost,
             on_room_renamed=self._on_room_renamed,
             on_room_retargeted=self._on_room_retargeted,
-            on_room_rekeyed=self._on_room_rekeyed,
             on_room_members_departed=self._on_room_members_departed,
+            on_room_pending=self._on_room_pending,
             # Enables GENA event subscription (near-instant topology change
             # detection) on top of the polling fallback, via the route
             # already registered on the shared app.
@@ -202,20 +239,47 @@ class SonosController:
         logger.info(f"Sonos discovery: added speaker '{display_name}' ({room.ip})")
         return True
 
-    async def _on_room_lost(self, tracking_key: str, still_present: bool) -> None:
-        """Called when a group's coordinator stops being a coordinator at
-        all — either its last device went offline (still_present=False),
-        or it was absorbed as a plain member into another group
-        (still_present=True). Either way we give up *our* Speaker for it,
-        but only send the device an explicit stop in the offline case —
-        when it's still present, Sonos itself is already directing its
-        audio as part of the other group, and a stop here would just
-        interrupt that."""
+    async def _on_room_lost(self, tracking_key: str) -> None:
+        """Called once a group_id's pending grace period resolves as a
+        real loss (see SonosDiscoveryManager's pending state) — every
+        former member turned up in some other group, or the grace period
+        simply ran out. Tears the Speaker down for good.
+
+        Never sends a live device stop here: if this was the active
+        speaker, _on_room_pending already stopped its coordinator the
+        moment the group_id first went pending — there is nothing left to
+        interrupt. If it wasn't active, there was never anything playing
+        through us to stop in the first place."""
         speaker = self._speakers_by_group_id.pop(tracking_key, None)
         if speaker is None:
             return
         logger.info(f"Sonos discovery: removing speaker '{speaker.name}'")
-        await speaker.stop(send_device_stop=not still_present)
+        await speaker.stop(send_device_stop=False)
+
+    async def _on_room_pending(self, tracking_key: str) -> None:
+        """Called the moment a still-tracked group_id first stops being
+        reported — see SonosDiscoveryManager's pending state for why this
+        isn't yet treated as a real loss. Only matters for the speaker
+        Qobuz is actually driving: if it's not active, leave it exactly as
+        it is (still connected, still polling) — the pending period
+        resolving either way costs it nothing.
+
+        For the active one, detach immediately. The group's own
+        coordinator may already be transitioning out of it — Sonos's own
+        handoff mechanism doesn't reliably stop it for us (see the
+        _stop_and_verify note above), and leaving this speaker's backend
+        pointed at it risks a real split-brain: our backend still polling/
+        commanding a device that a *different*, not-yet-recognized room is
+        about to also claim as its own coordinator, with both ends
+        thinking they're in charge. Detaching first, then retargeting once
+        the group_id resolves (see _on_room_retargeted), makes the
+        handoff strictly two-step: off, then onto whatever's confirmed
+        next — never both at once."""
+        speaker = self._speakers_by_group_id.get(tracking_key)
+        if speaker is None or not speaker.is_active:
+            return
+        logger.info(f"Sonos discovery: '{speaker.name}' pending — detaching")
+        await speaker.detach()
 
     async def _on_room_renamed(self, room: SonosRoom) -> bool:
         """Called when a group's display name changes (regrouping, or a
@@ -238,13 +302,15 @@ class SonosController:
         return await speaker.rename(new_name)
 
     async def _on_room_retargeted(self, room: SonosRoom) -> bool:
-        """Called when a group's coordinator (and/or its address) changed
-        — repoints the existing Speaker's DLNA backend at the new target
-        instead of tearing it down, so the Qobuz Connect session
-        (WebSocket, mDNS registration) survives untouched. Sonos already
-        migrates the audio itself on a handoff; this just moves where
-        future commands go and where state is polled from. The group's
-        tracking_key never changes, so there's no re-keying to do."""
+        """Called when a still-tracked group's coordinator (and/or its
+        address) changed — repoints the existing Speaker's DLNA backend at
+        the new target instead of tearing it down, so the Qobuz Connect
+        session (WebSocket, mDNS registration) survives untouched. Also
+        how a group_id coming back out of pending gets resolved (see
+        _on_room_pending): Speaker.retarget() reconnects cleanly whether
+        the backend is still attached to its old target or was detached
+        while pending, even to the same ip/port as before. The group's
+        tracking_key never changes, so there's nothing else to move."""
         speaker = self._speakers_by_group_id.get(room.tracking_key)
         if speaker is None:
             return False  # not currently running; a found/lost pair will handle it
@@ -259,34 +325,6 @@ class SonosController:
         logger.info(f"Sonos discovery: retargeted speaker '{speaker.name}' to {room.ip}")
         return True
 
-    async def _on_room_rekeyed(self, old_key: str, room: SonosRoom) -> bool:
-        """Called when the *same* physical coordinator (uuid unchanged) is
-        now tracked under a different key — its group_id changed for some
-        reason other than an actual handoff (most likely a plain
-        membership change to a group that otherwise didn't move). Moves
-        the existing Speaker to live under the new key and applies any
-        retarget/rename needed, instead of tearing it down and starting a
-        fresh Qobuz Connect session for a coordinator that never actually
-        went anywhere."""
-        speaker = self._speakers_by_group_id.get(old_key)
-        if speaker is None:
-            return False  # not currently running; a found/lost pair will handle it
-
-        # ip/port are almost always unchanged here (retarget() no-ops in
-        # that case) — this is mostly about moving the dict entry, but a
-        # coincidental address change (e.g. DHCP) rides along for free.
-        if not await speaker.retarget(room.ip, room.port):
-            return False
-
-        new_name = room.display_name
-        if new_name != speaker.name:
-            await speaker.rename(new_name)
-
-        del self._speakers_by_group_id[old_key]
-        self._speakers_by_group_id[room.tracking_key] = speaker
-        logger.info(f"Sonos discovery: re-keyed speaker '{speaker.name}'")
-        return True
-
     async def _on_room_members_departed(
         self, tracking_key: str, departed: tuple[DepartedMember, ...]
     ) -> None:
@@ -297,9 +335,9 @@ class SonosController:
         device leaving it needs to be told to stop, since it's no longer
         part of what the Qobuz app thinks it's driving and nothing else
         will ever tell it to stop. A device leaving any other (merely
-        discovered, not playing) group is Sonos's own business — touching
-        it risks exactly the play/mute race fixed for the
-        absorbed-into-another-group case (see _on_room_lost)."""
+        discovered, not playing) group is Sonos's own business to
+        (re)direct — touching it risks interrupting playback Sonos itself
+        just set up as part of moving it there."""
         speaker = self._speakers_by_group_id.get(tracking_key)
         if speaker is None or not speaker.is_active:
             return
@@ -312,7 +350,7 @@ class SonosController:
             client = DLNAClient(member.ip, member.port)
             try:
                 await client.connect()
-                await client.stop()
+                await _stop_and_verify(client, member.ip)
             except Exception as e:
                 logger.debug(f"Could not stop departed device {member.ip}: {e}")
             finally:

@@ -1,6 +1,6 @@
 """Tests for wiring SonosController into QobuzProxy's speaker lifecycle.
 
-The actual found/lost/renamed/retargeted/rekeyed/members-departed policy
+The actual found/lost/renamed/retargeted/pending/members-departed policy
 lives in (and is tested by) SonosController itself — see
 tests/backends/test_sonos_controller.py. This file only covers what
 QobuzProxy does around it: which path _start_speakers() takes, the manual
