@@ -77,13 +77,19 @@ class SonosGroup:
 
     coordinator_uuid: str
     member_uuids: list[str]
-    # The ZoneGroup's own `ID` attribute (e.g. "RINCON_KITCHEN_LF:1").
-    # Confirmed stable across a coordinator handoff (verified against a
-    # real household: removing the coordinator itself, promoting a former
-    # peer, left the same group_id attached to the continuing group under
-    # its new coordinator) — a reliable anchor for correlating "this is
-    # still the same group" across polls, independent of coordinator_uuid.
-    # This is SonosDiscoveryManager's primary tracking key (SonosRoom.tracking_key).
+    # The ZoneGroup's own `ID` attribute (e.g. "RINCON_KITCHEN_LF:1") — the
+    # group's permanent identity for its entire life, independent of
+    # coordinator_uuid: it survives a coordinator handoff (removing the
+    # coordinator itself and promoting a peer leaves the *same* id attached
+    # to the continuing group under its new coordinator) and a membership
+    # edit that removes/adds a room in one step (the room that's removed
+    # is what gets a new id of its own; the group being edited keeps this
+    # one, even when — per repeated real-household testing — it ends up
+    # with an entirely different coordinator and membership by the end of
+    # the edit). A new id is never the same group again under a different
+    # name: it always means a genuinely new, distinct group. This is
+    # SonosDiscoveryManager's sole tracking key (SonosRoom.tracking_key) —
+    # there is no other identity to fall back on or correlate through.
     group_id: str = ""
 
 
