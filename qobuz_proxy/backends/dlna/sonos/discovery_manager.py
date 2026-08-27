@@ -544,18 +544,32 @@ class SonosDiscoveryManager:
         # speaker's name/port reservation, that needed care to stay safe
         # under concurrency). Categories stay sequential relative to each
         # other: a room's departures/pending status must be settled before
-        # it's treated as newly found/renamed/retargeted, and reappearances
+        # it's treated as newly found/renamed/retargeted; reappearances
         # must be resolved before the pending sweep runs (so a group_id
-        # that just came back is never also reaped in the same pass).
+        # that just came back is never also reaped in the same pass); and
+        # the pending sweep's own "confirmed elsewhere" resolutions must
+        # land before _report_found, not after — a solo group can get a
+        # brand-new group_id with no membership change at all (observed
+        # directly: Cocina, playing solo the whole time, got reassigned a
+        # new id mid-session), which is simultaneously an instant "confirmed
+        # elsewhere" reap of the *old* identity (same room, still solo,
+        # every member trivially accounted for) and an `added` room for the
+        # *new* one, both sharing the same display name. Reaping only after
+        # _report_found meant the still-registered old name collided with
+        # the new one, so _on_room_found skipped it as a name collision
+        # (retried only on the next update, with no session on it in the
+        # meantime) while the old, live session got torn down anyway —
+        # net effect, the app's connection to it simply died. Freeing the
+        # name first lets the same pass replace it cleanly instead.
         await asyncio.gather(
             *(self._report_members_departed(key, departed) for key, departed in departures)
         )
         await asyncio.gather(*(self._report_pending(key) for key in newly_pending_keys))
+        await asyncio.gather(*(self._report_reappeared(current[key]) for key in reappeared_keys))
+        await self._reap_pending(current)
         await asyncio.gather(*(self._report_found(room) for room in added))
         await asyncio.gather(*(self._report_renamed(room) for room in renamed))
         await asyncio.gather(*(self._report_retargeted(room) for room in retargeted))
-        await asyncio.gather(*(self._report_reappeared(current[key]) for key in reappeared_keys))
-        await self._reap_pending(current)
 
     def _log_topology(
         self,
