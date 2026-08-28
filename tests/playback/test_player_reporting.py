@@ -189,6 +189,100 @@ class TestPlayerReporting:
 
         reporter.report_now.assert_awaited_once()
 
+    async def test_load_only_track_change_while_paused_relays_state_immediately(self) -> None:
+        """Regression (test1.log, 2026-08-28): a load-only track change (the
+        app sends the new currentQueueItem before it's ready to send
+        playingState — observed disproportionately on backward navigation,
+        sometimes 13-17s later, and on some swipe-back gestures never at
+        all) must push a state update right away, with the new queue item
+        and a reset position — otherwise the app has no signal anything
+        changed at all (StateReporter's heartbeat stays silent through a
+        STOPPED gap) and keeps showing the outgoing track's stale position,
+        with no sound, until whatever eventually triggers the next update.
+
+        Starting PAUSED (not PLAYING): nothing was audibly playing before
+        this load, so there's no continuity to preserve — see the sibling
+        test below for the PLAYING case, which must NOT stay stopped."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        await player.pause()
+        reporter = MagicMock()
+        reporter.report_now = AsyncMock()
+        player._state_reporter = reporter
+
+        # Load-only change to a new track (no playingState -> no play).
+        await player.apply_remote_state(
+            track_id="200", queue_item_id=2, position_ms=None, playing_state=None
+        )
+
+        reporter.report_now.assert_awaited()
+        assert player.state == PlaybackState.STOPPED
+        assert player.current_track is not None
+        assert player.current_track.queue_item_id == 2
+        assert player.current_position_ms == 0
+
+    async def test_load_only_track_change_while_playing_continues_playing(self) -> None:
+        """A track change with no playingState at all means "no change" —
+        same as every other optional SET_STATE field (currentPosition,
+        nextQueueItem) — not "stop and wait for a fresh instruction". If we
+        were actively playing going into this message, silently dropping to
+        STOPPED and waiting for a separate playingState message that can
+        arrive many seconds late (or, on some swipe-back gestures, never —
+        observed directly, test1.log 2026-08-28) is wrong: the new track
+        must keep playing."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        assert player.state == PlaybackState.PLAYING
+
+        # Load-only change to a new track (no playingState in this message).
+        await player.apply_remote_state(
+            track_id="200", queue_item_id=2, position_ms=None, playing_state=None
+        )
+
+        assert player.state == PlaybackState.PLAYING
+        assert player.current_track is not None
+        assert player.current_track.queue_item_id == 2
+        assert player.current_track.track_id == "200"
+
+    async def test_swipe_while_playing_does_not_flash_stopped(self) -> None:
+        """Regression (test1.log, 2026-08-28): with the auto-continue fix
+        above making most swipes fast, _load_track_locked's interim
+        "STOPPED, loading queue item Y" update — meant to fill the gap for
+        a load that might sit unplayed for a while — started firing on
+        nearly every single swipe instead, since it doesn't know a
+        continuation is already guaranteed. Every reported state while
+        already playing and swiping to a new track must go straight to
+        PLAYING, with no STOPPED report in between — checked by recording
+        player.state at the moment each report actually fires, not just
+        the final settled state."""
+        player, api = _make_player_with_reporter()
+        await player.play_track(queue_item_id=1, track_id="100")
+        reported_states: list[PlaybackState] = []
+
+        async def record_state() -> None:
+            reported_states.append(player.state)
+
+        reporter = MagicMock()
+        reporter.report_now = AsyncMock(side_effect=record_state)
+        player._state_reporter = reporter
+
+        # Load-only change to a new track (no playingState -> auto-continue).
+        await player.apply_remote_state(
+            track_id="200", queue_item_id=2, position_ms=None, playing_state=None
+        )
+
+        assert reported_states  # at least one report happened
+        assert PlaybackState.STOPPED not in reported_states
+
+        # Same, but with the app's own explicit playingState=PLAYING in
+        # the same message as the track change.
+        reported_states.clear()
+        await player.apply_remote_state(
+            track_id="300", queue_item_id=3, position_ms=None, playing_state=2
+        )
+        assert reported_states
+        assert PlaybackState.STOPPED not in reported_states
+
     async def test_reload_while_paused_ends_session_so_next_play_is_fresh(self) -> None:
         """A quality reload while paused must end the play, so the next play of
         the same track reports a fresh start (new quality/blob), not a resume."""

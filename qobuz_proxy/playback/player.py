@@ -115,6 +115,25 @@ class QobuzPlayer:
         # State
         self._state: PlaybackState = PlaybackState.STOPPED
 
+        # Whether the last real play/pause/stop decision was "play" —
+        # distinct from self._state, which _load_track_locked transiently
+        # sets to STOPPED as a normal, necessary part of loading a new
+        # track regardless of whether playback resumes right after. A
+        # command superseded mid-load (see Player._superseded_by_newer_
+        # command) bails out before ever reaching _play_locked, leaving
+        # self._state sitting at that transient STOPPED — a later command
+        # in the same rapid-swipe burst reading self._state to decide
+        # whether to auto-continue playing would then wrongly conclude
+        # nothing was playing (observed directly, test1.log 2026-08-28: a
+        # second rapid swipe correctly skipped the now-stale first target,
+        # but then sat loaded-and-silent for 7+ seconds instead of
+        # auto-continuing, because the skipped command had already flipped
+        # self._state to STOPPED before bailing). This field is updated
+        # only by real play/pause/stop decisions and genuine backend-
+        # reported state changes, never by a load in progress, so it
+        # survives a skipped intermediate command intact.
+        self._intended_playing: bool = False
+
         # Whether the backend actually has the current track loaded/started —
         # False right after a fresh load (e.g. we were just made the active
         # renderer while the track was already paused on another renderer),
@@ -662,13 +681,41 @@ class QobuzPlayer:
         # state (position or context) with its outdated values.
         stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
 
+        # Read from _intended_playing, not self._state — _load_track_locked
+        # always drops self._state to STOPPED as a normal part of loading,
+        # and a command superseded mid-load (see
+        # _superseded_by_newer_command) bails out before ever reaching
+        # _play_locked, leaving self._state sitting at that transient
+        # STOPPED. _intended_playing survives that untouched (observed
+        # directly, test1.log 2026-08-28: see its own docstring for the
+        # exact failure this caused — a second rapid swipe correctly
+        # skipped the stale first target, but then never auto-continued
+        # playing because the skipped command had already flipped
+        # self._state to STOPPED before bailing).
+        was_playing = self._intended_playing
+
         # Load if a track is specified and differs from the loaded one.
+        loaded_new_track = False
         if track_id is not None:
             cur = self._current_track
             if cur is None or cur.track_id != track_id:
                 logger.info(f"Loading new track: {track_id}")
-                if not await self._load_track_locked(queue_item_id or 0, track_id, context_uuid):
+                if not await self._load_track_locked(
+                    queue_item_id or 0,
+                    track_id,
+                    context_uuid,
+                    # A play/pause/stop for the new track is coming right
+                    # after this load either way — either this message
+                    # says so explicitly, or (see was_playing) we were
+                    # already playing and will auto-continue below — so
+                    # the interim state update _load_track_locked would
+                    # otherwise send is redundant noise, not the genuine
+                    # gap-filler it is for a load that might sit unplayed
+                    # for a while.
+                    expect_immediate_continuation=playing_state is not None or was_playing,
+                ):
                     return
+                loaded_new_track = True
             elif (
                 not stale
                 and queue_item_id
@@ -718,6 +765,18 @@ class QobuzPlayer:
                 await self._pause_locked(position_ms)
             elif playing_state == 1:
                 await self._stop_playback_locked()
+        elif loaded_new_track and was_playing and not stale:
+            # No playingState in this message at all — same as every other
+            # optional field here (currentPosition, nextQueueItem), absence
+            # means "no change," not "stop." We were actively playing going
+            # into this track change; nothing told us otherwise, so silently
+            # dropping to STOPPED and waiting for a possibly much-delayed
+            # (or, on some swipe-back gestures, never-arriving — observed
+            # directly) separate playingState message is wrong. Continue
+            # playing the new track instead — this is what "the app is
+            # already playing and the user just navigated to a different
+            # track" actually means.
+            await self._play_locked(position_ms or 0)
 
     def _is_stale_pause_snapshot_locked(
         self,
@@ -777,6 +836,11 @@ class QobuzPlayer:
 
     async def _play_locked(self, position_ms: int = 0) -> bool:
         logger.debug(f"Play command, current state: {self._state}")
+        # Set on entry, not just on success — see _intended_playing. A
+        # later command in the same rapid-swipe burst needs to see "the
+        # last real decision was play" even if this particular attempt
+        # goes on to fail for unrelated reasons (e.g. an empty queue).
+        self._intended_playing = True
 
         # Resume from pause — only when the backend actually has something to
         # resume. A "cold" pause (loaded but never started; see _pause_locked)
@@ -899,6 +963,8 @@ class QobuzPlayer:
         return await self._pause_locked()
 
     async def _pause_locked(self, position_ms: Optional[int] = None) -> bool:
+        # See _intended_playing.
+        self._intended_playing = False
         if (
             self._state == PlaybackState.STOPPED
             and self._current_track
@@ -950,6 +1016,8 @@ class QobuzPlayer:
         await self._stop_playback_locked()
 
     async def _stop_playback_locked(self) -> None:
+        # See _intended_playing.
+        self._intended_playing = False
         # Clear gapless state — explicit stop
         self._clear_gapless_state()
 
@@ -989,7 +1057,23 @@ class QobuzPlayer:
         queue_item_id: int,
         track_id: str,
         context_uuid: Optional[bytes] = None,
+        expect_immediate_continuation: bool = False,
     ) -> bool:
+        """Args:
+        expect_immediate_continuation: True when the caller already knows
+            a play/pause/stop is coming right after this load returns —
+            either the message explicitly says so, or (see
+            apply_remote_state's was_playing) we were already playing and
+            will auto-continue. In that case the interim state update
+            below is pure noise (a STOPPED flash immediately overwritten
+            by whatever comes next) rather than the genuine gap-filler it
+            is for a load that might sit unplayed for a while — see the
+            comment at that update for why it exists at all. Observed
+            directly, test1.log 2026-08-28: with the auto-continue fix
+            making most swipes fast, this flash started showing up on
+            nearly every single one instead of just the slow cases it was
+            meant for.
+        """
         logger.info(f"Loading track: track_id={track_id}, queue_item_id={queue_item_id}")
 
         # Stop current playback if playing
@@ -1012,6 +1096,30 @@ class QobuzPlayer:
             track_id=track_id,
             context_uuid=context_uuid,
         )
+
+        # A load isn't always immediately followed by a play in the same
+        # SET_STATE — the app can send them as two separate messages, and
+        # (observed directly, test1.log 2026-08-28) the gap between them is
+        # sometimes very long (13-17s), disproportionately on backward
+        # navigation — apparently the app's own timing, not anything this
+        # backend does (the delay sits entirely between this load finishing
+        # and the next WS message arriving, before any device/audio I/O
+        # starts). We can't shorten that wait, but leaving it completely
+        # unreported is its own bug: StateReporter's heartbeat only
+        # actively repeats position while PLAYING, so it stays silent
+        # through this STOPPED/loading gap, leaving the app to keep
+        # showing the outgoing track's stale PLAYING position advancing
+        # with no sound. Reset the position (this is a different track
+        # now, not a resume point) and the stale duration (that of the
+        # *outgoing* track — see duration_ms — until the real fetch below
+        # overwrites it) before reporting, so the app sees "loading queue
+        # item Y" rather than a confusing mix of the new item id with the
+        # old track's numbers.
+        self._position_value_ms = 0
+        self._position_timestamp_ms = int(time.time() * 1000)
+        self._current_duration_ms = 0
+        if not expect_immediate_continuation:
+            await self._send_state_update()
 
         # Pre-fetch URL and metadata via the queue's own cache — see
         # QobuzQueue.get_track_url/get_track_metadata.
@@ -1233,6 +1341,11 @@ class QobuzPlayer:
         Returns:
             True if playback started successfully
         """
+        # See _intended_playing — set here too, not just in _play_locked:
+        # play_track()/next_track()/previous_track() and friends all reach
+        # this directly without going through _play_locked.
+        self._intended_playing = True
+
         if not self._current_track:
             return False
 
@@ -1743,11 +1856,16 @@ class QobuzPlayer:
         """Side effects for a state change the backend noticed on its own —
         see _on_state_change."""
         if state == PlaybackState.PAUSED:
+            # See _intended_playing — the device paused itself, so a later
+            # swipe's auto-continue must not try to resume through it.
+            self._intended_playing = False
             await self._send_state_update()
             # Stop the played-time clock so this pause is excluded from the
             # reported duration, like an app-driven pause.
             self._report_paused()
         elif state == PlaybackState.STOPPED:
+            # See _intended_playing.
+            self._intended_playing = False
             # Zero the position like _stop_playback_locked: a stale
             # pause-point position makes "previous" try a restart-seek on a
             # stopped renderer (a no-op) instead of navigating.
@@ -1756,6 +1874,8 @@ class QobuzPlayer:
             await self._send_state_update()
             await self._report_stopped()
         elif state == PlaybackState.PLAYING:
+            # See _intended_playing.
+            self._intended_playing = True
             # Recovering from an unprompted PAUSED/STOPPED that turned out
             # to be transient — e.g. a device-state misread while Sonos
             # settles after a retarget (see PLAYBACK_START_GRACE_PERIOD_
