@@ -73,8 +73,17 @@ class AudioBackend(ABC):
         pass
 
     @abstractmethod
-    async def pause(self) -> None:
-        """Pause current playback."""
+    async def pause(self) -> bool:
+        """Pause current playback.
+
+        Returns:
+            True if the backend paused, False if it could not (e.g. the
+            renderer rejected the command, or was already stopped —
+            observed directly: a device that had already finished
+            playing on its own rejects Pause with a UPnP "transition not
+            available" error; the caller must not report a successful
+            pause over that).
+        """
         pass
 
     @abstractmethod

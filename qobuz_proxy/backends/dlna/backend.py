@@ -30,9 +30,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# State polling interval. Also the cadence of hijack detection and paused-
-# external-stop confirmation (see _HIJACK_CHECK_INTERVAL_POLLS and
-# _PAUSED_STOP_CONFIRMATIONS below) — this loop is the only thing that ever
+# State polling interval. Also the cadence of hijack detection and
+# stopped-confirmation (see _HIJACK_CHECK_INTERVAL_POLLS and
+# _STOP_CONFIRMATIONS below) — this loop is the only thing that ever
 # reads transport state/position from the physical device, so it runs at
 # the faster of the two cadences that used to poll independently rather
 # than the slower one, to avoid regressing external-takeover/stop-detection
@@ -46,12 +46,30 @@ STATE_POLL_INTERVAL_SECONDS = 0.5
 # independently — detection within a few seconds is plenty.
 _HIJACK_CHECK_INTERVAL_POLLS = 6
 
-# While paused, a confirmed external stop (the renderer stopped on its own,
-# e.g. someone else's timeout/command) is reported after this many
-# consecutive STOPPED reads — get_state() collapses transient read
-# failures (and unrecognized device state strings) to STOPPED, so one bad
-# poll must not end a normal paused listen or lose its resume position.
-_PAUSED_STOP_CONFIRMATIONS = 3
+# A STOPPED read while we think we're still PAUSED or PLAYING (a confirmed
+# external stop, or a natural end nothing else caught) is trusted only
+# once _device_confirms_stopped() has actually returned True this many
+# consecutive reads — get_state() collapses transient read failures (and
+# unrecognized device state strings) to STOPPED, so one bad poll must not
+# end a normal paused listen or lose its resume position. This is the fast
+# path; see _UNCONFIRMED_STOP_TIMEOUT_SECONDS below for what happens when
+# _device_confirms_stopped() never actually confirms at all.
+_STOP_CONFIRMATIONS = 3
+
+# Fallback for when _device_confirms_stopped() structurally never returns
+# True: Sonos in particular can keep GetPositionInfo.TrackURI reporting
+# the last track's own URI indefinitely after it genuinely finishes, not
+# just mid-disturbance (observed directly: the last queued track, nothing
+# armed next, playback stuck reporting PLAYING forever — _STOP_CONFIRMATIONS'
+# fast path never got a single confirmed read to count). Once a raw
+# STOPPED read has persisted this long with nothing else changing, that
+# persistence is itself the evidence — a real transient disturbance
+# resolves in a poll or two (see _HIJACK_CHECK_INTERVAL_POLLS's cadence),
+# nowhere close to this long. Deliberately generous — comparable to
+# RETARGET_CONFIRMATION_TIMEOUT_SECONDS's "how long Sonos can plausibly
+# take to settle" — since a false trigger here (reporting stopped/track-
+# ended while genuinely still playing) is worse than a slow correct one.
+_UNCONFIRMED_STOP_TIMEOUT_SECONDS = 10.0
 
 # Grace period during which transport state is expected to be transiently
 # unreliable (seconds) — covers both a track just starting (prevents false
@@ -189,9 +207,15 @@ class DLNABackend(AudioBackend):
         # philosophy as _awaiting_retarget_confirmation.
         self._current_track_confirmed: bool = False
 
-        # Consecutive STOPPED polls seen while paused (external-stop
-        # detection — see _PAUSED_STOP_CONFIRMATIONS).
-        self._paused_stop_polls: int = 0
+        # Consecutive *confirmed* STOPPED polls seen while paused or
+        # playing (external-stop / natural-end detection — see
+        # _STOP_CONFIRMATIONS). Reset to 0 by any unconfirmed or
+        # not-STOPPED read.
+        self._unconfirmed_stop_polls: int = 0
+        # When the current run of raw STOPPED reads (while paused/playing,
+        # confirmed or not) started — 0.0 when not currently in one. See
+        # _UNCONFIRMED_STOP_TIMEOUT_SECONDS.
+        self._unconfirmed_stop_since: float = 0.0
 
         # Cycles since the last hijack check (external-takeover detection
         # while PLAYING — see _HIJACK_CHECK_INTERVAL_POLLS).
@@ -581,10 +605,20 @@ class DLNABackend(AudioBackend):
             return "play"
         return None
 
-    async def pause(self) -> None:
-        """Pause playback."""
+    async def pause(self) -> bool:
+        """Pause playback.
+
+        Returns True only when the renderer accepted the pause command —
+        observed directly: a device that already finished playing on its
+        own (e.g. the last queued track, naturally stopped) rejects Pause
+        with a UPnP "transition not available" error; a failed SOAP call
+        must not be reported as a successful pause, the same reasoning
+        resume() already applies.
+        """
         if self._client and await self._client.pause():
             self._notify_state_change(PlaybackState.PAUSED)
+            return True
+        return False
 
     async def resume(self) -> bool:
         """Resume playback.
@@ -1187,61 +1221,85 @@ class DLNABackend(AudioBackend):
                         # this cycle, leave the flag as it was and fall
                         # through to the rest of the loop as normal.
 
-                # Paused -> confirmed external stop: don't trust a single
-                # STOPPED read (transient failures collapse to STOPPED too;
-                # a "cold" pause — nothing ever started on this device —
-                # never gets here since self._state stays whatever it was
-                # before, never PAUSED, in that case).
-                if self._state == PlaybackState.PAUSED and new_state == PlaybackState.STOPPED:
-                    if in_grace_period or not await self._device_confirms_stopped():
-                        # Exactly as untrustworthy as a mismatched hijack
-                        # read while the device is still settling (or, per
-                        # _device_confirms_stopped, still shows our content
-                        # loaded despite the STOPPED read) — reset the count
-                        # instead of accumulating toward a confirmation, and
-                        # skip straight past the general state-change notify
-                        # below too (same `continue` the confirmed-count
-                        # path already uses).
-                        self._paused_stop_polls = 0
+                # A STOPPED read while we think we're still PAUSED or
+                # PLAYING — a confirmed external stop, or (PLAYING case) a
+                # natural end — is never trusted from a single unconfirmed
+                # read alone. Two independent paths to trusting it, either
+                # one enough:
+                #   (a) the fast path — _device_confirms_stopped() actually
+                #       returns True. While PAUSED that must happen
+                #       _STOP_CONFIRMATIONS times running (an external stop
+                #       specifically needs the extra debounce — Sonos can
+                #       report STOPPED for a read or two while disturbing
+                #       this device for unrelated reasons); while PLAYING
+                #       a single confirmed read is trusted immediately, as
+                #       before — natural end already has the grace period
+                #       and gapless-armed handling protecting it.
+                #   (b) the fallback — a raw STOPPED read has persisted for
+                #       _UNCONFIRMED_STOP_TIMEOUT_SECONDS regardless of (a)
+                #       ever succeeding, for a device that never clears its
+                #       own TrackURI at all. See both constants' own
+                #       comments.
+                # A "cold" pause — nothing ever started on this device —
+                # never reaches this since self._state stays whatever it
+                # was before, never PAUSED, in that case.
+                if new_state == PlaybackState.STOPPED and self._state in (
+                    PlaybackState.PAUSED,
+                    PlaybackState.PLAYING,
+                ):
+                    was_playing = self._state == PlaybackState.PLAYING
+                    if self._unconfirmed_stop_since == 0.0:
+                        self._unconfirmed_stop_since = time.monotonic()
+                    timed_out = (
+                        time.monotonic() - self._unconfirmed_stop_since
+                        >= _UNCONFIRMED_STOP_TIMEOUT_SECONDS
+                    )
+
+                    if was_playing and self._next_track_proxy_url:
+                        # If gapless was armed but device stopped anyway,
+                        # clear and fall through to normal track-ended.
+                        logger.debug(
+                            "Gapless: device stopped despite armed next track, "
+                            "falling through to normal track-ended"
+                        )
+                        self._next_track_proxy_url = None
+                        self._next_track_metadata = None
+
+                    if in_grace_period:
+                        confirmed = False
+                        self._unconfirmed_stop_polls = 0
+                    elif await self._device_confirms_stopped():
+                        if was_playing:
+                            confirmed = True
+                        else:
+                            self._unconfirmed_stop_polls += 1
+                            confirmed = self._unconfirmed_stop_polls >= _STOP_CONFIRMATIONS
+                    else:
+                        confirmed = False
+                        self._unconfirmed_stop_polls = 0
+
+                    if not confirmed and not timed_out:
+                        # Still unresolved either way — _unconfirmed_stop_
+                        # since deliberately keeps counting across this.
                         continue
-                    self._paused_stop_polls += 1
-                    if self._paused_stop_polls >= _PAUSED_STOP_CONFIRMATIONS:
-                        self._paused_stop_polls = 0
-                        self._notify_state_change(PlaybackState.STOPPED)
+                    if timed_out and not confirmed:
+                        logger.info(
+                            f"[{self.name}] Trusting STOPPED after "
+                            f"{_UNCONFIRMED_STOP_TIMEOUT_SECONDS:.0f}s without the "
+                            "device's own TrackURI ever confirming it"
+                        )
+                    self._unconfirmed_stop_polls = 0
+                    self._unconfirmed_stop_since = 0.0
+                    if was_playing:
+                        self._notify_track_ended()
+                    self._notify_state_change(PlaybackState.STOPPED)
                     continue
-                self._paused_stop_polls = 0
+                self._unconfirmed_stop_polls = 0
+                self._unconfirmed_stop_since = 0.0
 
                 # Detect state changes
                 if new_state != self._state:
                     logger.debug(f"State changed: {self._state} -> {new_state}")
-
-                    # Check for track end before updating state
-                    if self._state == PlaybackState.PLAYING and new_state == PlaybackState.STOPPED:
-                        # If gapless was armed but device stopped, clear and fall through
-                        if self._next_track_proxy_url:
-                            logger.debug(
-                                "Gapless: device stopped despite armed next track, "
-                                "falling through to normal track-ended"
-                            )
-                            self._next_track_proxy_url = None
-                            self._next_track_metadata = None
-
-                        if in_grace_period or not await self._device_confirms_stopped():
-                            # Ignore the STOPPED read entirely — either
-                            # still within the ordinary grace window, or
-                            # the device itself still shows our content
-                            # loaded (see _device_confirms_stopped), which
-                            # means this STOPPED string isn't trustworthy
-                            # regardless of the timer. Prevents false
-                            # track-ended events either way.
-                            logger.debug(
-                                f"[{self.name}] Ignoring unconfirmed STOPPED state "
-                                f"(started {time.monotonic() - self._playback_started_at:.1f}s ago)"
-                            )
-                            continue  # Skip state update entirely
-                        else:
-                            self._notify_track_ended()
-
                     self._notify_state_change(new_state)
 
                 # Update position while playing

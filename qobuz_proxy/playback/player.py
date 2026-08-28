@@ -1138,7 +1138,19 @@ class QobuzPlayer:
         self._position_value_ms = self.current_position_ms
         self._position_timestamp_ms = int(time.time() * 1000)
 
-        await self.backend.pause()
+        if not await self.backend.pause():
+            # The renderer rejected the pause (e.g. it already finished
+            # playing on its own and has nothing left to pause — see
+            # AudioBackend.pause()) — don't claim PAUSED over a command
+            # the device didn't actually accept, the same reasoning the
+            # resume path above already applies. Push the current best-
+            # known state so the app corrects immediately rather than
+            # waiting on the next heartbeat; if the device really has
+            # already stopped, the poll loop's own natural-end detection
+            # will catch up shortly and report that properly.
+            logger.warning("Backend failed to pause; leaving state unchanged")
+            await self._send_state_update()
+            return False
         self._state = PlaybackState.PAUSED
         await self._send_state_update()
         # A pause does not end the listen — keeping the play-reporting session
