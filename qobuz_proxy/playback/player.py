@@ -577,9 +577,16 @@ class QobuzPlayer:
         natural track end racing a user's explicit skip — still only ever
         runs its last one, matching what the old generation-based
         supersede mechanism did. An item already running can't be
-        coalesced away (nothing interleaves with it either way, so there's
-        nothing to gain by trying). Volume/queue commands (coalesce=False,
-        the default) were never covered by that and stay plain FIFO.
+        preempted outright (nothing interrupts an in-flight device round
+        trip), but apply_remote_state() cooperatively checks
+        _superseded_by_newer_command() at its own natural checkpoints and
+        bails out early rather than committing more device work toward a
+        target a newer command has already moved past — see there for why
+        that matters (rapid swiping can otherwise visibly land on a track
+        in the middle of the swipe instead of the final one, on a renderer
+        slow enough that commands stop overlapping cleanly). Volume/queue
+        commands (coalesce=False, the default) were never covered by any
+        of this and stay plain FIFO.
         """
         if coalesce:
             for pending in self._pending_coalescable:
@@ -589,6 +596,18 @@ class QobuzPlayer:
         if coalesce:
             self._pending_coalescable.append(item)
         self._command_queue.put_nowait(item)
+
+    def _superseded_by_newer_command(self) -> bool:
+        """Whether a newer coalescible command is already queued behind
+        whatever's currently running — see enqueue(). apply_remote_state()
+        checks this at its own checkpoints, between awaits, to bail out of
+        driving the device toward a target that's already known to be
+        stale rather than running it to completion first: the goal is
+        always the *latest* desired state, not every intermediate one a
+        burst of rapid commands happened to name along the way — the
+        queued command that will run next does its own complete job
+        regardless, so nothing here is lost by stopping early."""
+        return bool(self._pending_coalescable)
 
     async def _command_consumer_loop(self) -> None:
         """The only thing that ever runs a queued command — one at a time,
@@ -699,6 +718,30 @@ class QobuzPlayer:
         if track_id is not None:
             cur = self._current_track
             if cur is None or cur.track_id != track_id:
+                if self._superseded_by_newer_command():
+                    # A newer coalescible command is already queued right
+                    # behind this one (see enqueue()) — e.g. a burst of
+                    # rapid next/previous swipes outpacing how fast the
+                    # renderer can actually be driven. Coalescing already
+                    # guarantees only the *last* one will run, but that
+                    # guarantee only covers commands still waiting — once
+                    # this one started running, nothing stopped it from
+                    # driving the device through a track the user has
+                    # already swiped past by the time it gets there
+                    # (observed directly: rapid swiping visibly landing on
+                    # a track in the middle of the swipe instead of the
+                    # final one). The desired end state is whatever the
+                    # newest command wants, not every intermediate one on
+                    # the way there — so don't bother loading (let alone
+                    # the actual device round trip below) a track this
+                    # message wants when we already know something newer
+                    # superseded it; the queued command will do its own
+                    # complete load once it runs.
+                    logger.debug(
+                        f"Skipping stale load of track {track_id} — a newer command "
+                        "is already queued"
+                    )
+                    return
                 logger.info(f"Loading new track: {track_id}")
                 if not await self._load_track_locked(
                     queue_item_id or 0,
@@ -752,6 +795,19 @@ class QobuzPlayer:
                             track_id=track_id,
                             context_uuid=self._format_context_uuid(context_uuid),
                         )
+
+        # A newer coalescible command already queued behind this one (see
+        # enqueue()) means the desired end state has already moved on —
+        # don't bother seeking or committing a play/pause/stop for a
+        # target this message wants when we already know it's stale; the
+        # queued command will do its own complete job once it runs. Same
+        # rapid-swiping symptom as the load check above (observed
+        # directly), covering the seek/play device round trip specifically
+        # — the single most expensive step, and the one most likely to
+        # still be worth skipping even if the load above already ran.
+        if self._superseded_by_newer_command():
+            logger.debug("Skipping stale seek/play/pause/stop — a newer command is already queued")
+            return
 
         # Position, then play/pause/stop — same order as the app expects.
         if position_ms is not None and not stale:

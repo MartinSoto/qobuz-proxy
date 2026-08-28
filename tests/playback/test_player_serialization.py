@@ -237,6 +237,123 @@ class TestApplyRemoteStateSerialization:
         assert player.current_track.track_id == "C"
         assert backend.played[-1] == "C"
 
+    async def test_stale_in_flight_command_skips_device_work_once_superseded(self) -> None:
+        """The "newer wins" guarantee above only covers commands still
+        waiting to run. Once a command has actually started — e.g. a
+        burst of rapid next/previous swipes outpacing how fast the
+        renderer's own commands complete — coalescing alone doesn't stop
+        it from finishing its own device round trip for a target the user
+        has already swiped past by the time it gets there (observed
+        directly: rapid swiping visibly landing on a track in the middle
+        of the swipe instead of the final one). This checks the in-flight
+        command's own cooperative bail-out instead (see
+        Player._superseded_by_newer_command): "A" is still loading — not
+        yet as far as backend.play() — when B and C arrive and coalesce
+        down to just C, so A must never touch the device at all; only C
+        should."""
+        player, backend = _make_player()
+        await player.start()
+
+        # Make "A" block partway through *loading* (before it would ever
+        # reach backend.play()), so B and C are guaranteed to already be
+        # queued behind it by the time it resumes and checks whether it's
+        # been superseded.
+        release_a = asyncio.Event()
+        original_get_track_url = player.queue.get_track_url
+
+        async def blocking_get_track_url(track):  # type: ignore[no-untyped-def]
+            if track.track_id == "A":
+                await release_a.wait()
+            return await original_get_track_url(track)
+
+        player.queue.get_track_url = blocking_get_track_url  # type: ignore[method-assign]
+
+        def _apply(track_id: str, queue_item_id: int):  # type: ignore[no-untyped-def]
+            return functools.partial(
+                player.apply_remote_state,
+                track_id=track_id,
+                queue_item_id=queue_item_id,
+                position_ms=0,
+                playing_state=2,
+            )
+
+        player.enqueue(_apply("A", 1), coalesce=True)
+        await asyncio.sleep(0)  # let A start running and block on the load
+
+        player.enqueue(_apply("B", 2), coalesce=True)
+        player.enqueue(_apply("C", 3), coalesce=True)
+
+        release_a.set()
+        await player._command_queue.join()
+        await player.stop()
+
+        # A never reached the device at all — it caught its own
+        # supersession before ever calling backend.play().
+        assert "A" not in backend.played
+        assert "B" not in backend.played
+        assert player.current_track is not None
+        assert player.current_track.track_id == "C"
+        assert backend.played == ["C"]
+
+    async def test_superseded_load_does_not_poison_the_next_commands_auto_continue(
+        self,
+    ) -> None:
+        """Regression (test1.log, 2026-08-28): a command superseded
+        mid-load (see the test above) bails out before ever calling
+        _play_locked, but _load_track_locked has already dropped
+        self._state to STOPPED as a normal part of loading — that's fine
+        for the command that gets skipped, but the *next* command must
+        not read that transient STOPPED as "nothing was playing" when
+        deciding whether to auto-continue (see Player._intended_playing).
+        Reproduces exactly what was observed: track A is playing, a rapid
+        swipe to B gets superseded mid-load by a swipe to C, and both B
+        and C's SET_STATE messages carry no playingState at all (the
+        ordinary case — see test_load_only_track_change_while_playing_
+        continues_playing) — C must still auto-continue playing, not sit
+        loaded-and-silent waiting for a playingState that may not come."""
+        player, backend = _make_player()
+        await player.start()
+
+        await player.apply_remote_state(
+            track_id="A", queue_item_id=1, position_ms=0, playing_state=2
+        )
+        assert backend.played == ["A"]
+
+        release_b = asyncio.Event()
+        original_get_track_url = player.queue.get_track_url
+
+        async def blocking_get_track_url(track):  # type: ignore[no-untyped-def]
+            if track.track_id == "B":
+                await release_b.wait()
+            return await original_get_track_url(track)
+
+        player.queue.get_track_url = blocking_get_track_url  # type: ignore[method-assign]
+
+        def _apply_load_only(track_id: str, queue_item_id: int):  # type: ignore[no-untyped-def]
+            # No playingState — the ordinary case for a rapid swipe.
+            return functools.partial(
+                player.apply_remote_state,
+                track_id=track_id,
+                queue_item_id=queue_item_id,
+                position_ms=None,
+                playing_state=None,
+            )
+
+        player.enqueue(_apply_load_only("B", 2), coalesce=True)
+        await asyncio.sleep(0)  # let B start running and block on the load
+
+        player.enqueue(_apply_load_only("C", 3), coalesce=True)
+
+        release_b.set()
+        await player._command_queue.join()
+        await player.stop()
+
+        assert "B" not in backend.played
+        assert player.state == PlaybackState.PLAYING
+        assert player.current_track is not None
+        assert player.current_track.track_id == "C"
+        assert backend.played[-1] == "C"
+
 
 class TestBackendAttached:
     """Player.set_backend_attached() — see Speaker.detach()/retarget() and
