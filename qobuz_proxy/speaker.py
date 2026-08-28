@@ -176,38 +176,36 @@ class Speaker:
         A later retarget() (see AudioBackend.retarget()) reconnects
         cleanly from this state, even to the same ip/port as before.
 
-        Also tells Player the backend is unreachable
-        (set_backend_attached(False)) — the one narrow signal that
-        reaches into Player's state machine from out here, so the
-        command queue holds instead of dispatching into a per-call wait,
-        and the app sees an honest transitional state instead of a stale,
-        still-ticking PLAYING position (see QobuzPlayer.set_backend_attached).
+        Delegates to Player.detach(), which runs the actual disconnect +
+        set_backend_attached(False) as an item on Player's own command
+        queue — so it can never overlap a play/pause/seek/etc. call the
+        queue's consumer is already in the middle of (see there for why
+        that matters). Safe to call before the speaker has finished
+        starting (no player yet) — a no-op in that case.
         """
-        if self._backend:
-            await self._backend.disconnect(send_device_stop=True)
         if self._player:
-            await self._player.set_backend_attached(False)
+            await self._player.detach()
 
     async def retarget(self, ip: str, port: int) -> bool:
         """
         Repoint this speaker's backend at a different physical device, in
         place — the Qobuz Connect session (WebSocket, mDNS registration)
-        is untouched. Delegates to AudioBackend.retarget(), which is a
-        no-op returning False for backends without a meaningful notion of
-        this (e.g. local output).
+        is untouched. Delegates to Player.retarget(), which runs the
+        actual AudioBackend.retarget() call as an item on Player's own
+        command queue (see detach() above for why), itself a no-op
+        returning False for backends without a meaningful notion of this
+        (e.g. local output).
 
         Returns:
             True if the retarget succeeded.
         """
-        if not self._backend:
+        if not self._player:
             return False
 
-        ok = await self._backend.retarget(ip, port)
+        ok = await self._player.retarget(ip, port)
         if ok:
             self._config.dlna_ip = ip
             self._config.dlna_port = port
-            if self._player:
-                await self._player.set_backend_attached(True)
         return ok
 
     def get_status(self) -> dict:

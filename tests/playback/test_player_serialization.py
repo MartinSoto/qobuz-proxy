@@ -24,6 +24,9 @@ class ConcurrencyTrackingBackend(AudioBackend):
         self.active = 0
         self.max_active = 0
         self.played: list[str] = []
+        # Ordered log of lifecycle calls (disconnect/retarget) — used by
+        # TestPlayerDetachAndRetarget to prove they never overlap play().
+        self.events: list[str] = []
 
     async def play(self, url: str, metadata: BackendTrackMetadata) -> None:
         self.active += 1
@@ -54,7 +57,12 @@ class ConcurrencyTrackingBackend(AudioBackend):
     async def connect(self) -> bool:
         return True
 
-    async def disconnect(self, send_device_stop: bool = True) -> None: ...
+    async def disconnect(self, send_device_stop: bool = True) -> None:
+        self.events.append("disconnect")
+
+    async def retarget(self, ip: str, port: int) -> bool:
+        self.events.append("retarget")
+        return True
 
 
 def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:
@@ -498,3 +506,91 @@ class TestCommandQueueHoldsWhileDetached:
         await player.stop()
 
         assert ran.is_set()
+
+
+class TestPlayerDetachAndRetarget:
+    """Player.detach()/retarget() — see Speaker.detach()/retarget(), the
+    sole callers. Both now run as items on Player's own command queue
+    instead of being driven directly from the Sonos discovery manager's
+    own task, so they can never overlap a command already talking to the
+    device — see docs/playback-concurrency.md, "Suggested order of work"
+    step 2."""
+
+    async def test_detach_disconnects_backend_and_marks_not_attached(self) -> None:
+        player, backend = _make_player()
+
+        await player.detach()
+
+        assert backend.events == ["disconnect"]
+        assert player._backend_attached is False
+
+    async def test_retarget_success_marks_attached_and_clears_gapless(self) -> None:
+        player, backend = _make_player()
+        player._gapless_armed = True
+        player._pending_next_track = {"trackId": "1", "queueItemId": 1}
+
+        result = await player.retarget("10.0.1.31", 1400)
+
+        assert result is True
+        assert backend.events == ["retarget"]
+        assert player._backend_attached is True
+        assert player._gapless_armed is False
+
+    async def test_failed_retarget_does_not_mark_attached(self) -> None:
+        player, backend = _make_player()
+        backend.retarget = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        await player.set_backend_attached(False)
+
+        result = await player.retarget("10.0.1.31", 1400)
+
+        assert result is False
+        assert player._backend_attached is False
+
+    async def test_detach_never_overlaps_an_in_flight_command(self) -> None:
+        """Regression: Speaker.detach()/retarget() used to call the
+        backend directly from the Sonos discovery manager's own task,
+        able to run concurrently with whatever the command queue's
+        consumer was in the middle of. Both now go through the same
+        queue as every other command, so a detach requested mid-command
+        waits its turn instead of racing it."""
+        player, backend = _make_player()
+        await player.start()
+
+        # Deterministically park the consumer "in flight" on an earlier
+        # command, the same pattern used above for coalescing tests.
+        blocker = asyncio.Event()
+        player.enqueue(blocker.wait)
+        await asyncio.sleep(0)  # let the consumer pick up the blocker
+
+        detach_task = asyncio.create_task(player.detach())
+        await asyncio.sleep(0)  # let detach() enqueue and start waiting its turn
+        assert backend.events == []  # still queued behind the blocker — not run yet
+
+        blocker.set()
+        await detach_task
+
+        # Assert before stop() — stop() disconnects the backend again as
+        # part of its own unconditional shutdown, which would otherwise
+        # add a second "disconnect" unrelated to what this test covers.
+        assert backend.events == ["disconnect"]
+        await player.stop()
+
+    async def test_retarget_never_overlaps_an_in_flight_command(self) -> None:
+        player, backend = _make_player()
+        await player.start()
+
+        blocker = asyncio.Event()
+        player.enqueue(blocker.wait)
+        await asyncio.sleep(0)
+
+        retarget_task = asyncio.create_task(player.retarget("10.0.1.31", 1400))
+        await asyncio.sleep(0)
+        assert backend.events == []
+
+        blocker.set()
+        assert await retarget_task is True
+
+        # Assert before stop() — see the equivalent comment in
+        # test_detach_never_overlaps_an_in_flight_command above.
+        assert backend.events == ["retarget"]
+        await player.stop()

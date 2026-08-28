@@ -670,6 +670,11 @@ class TestSpeakerRename:
 
 
 class TestSpeakerRetarget:
+    """Speaker.retarget() is a thin delegator to Player.retarget() (see
+    tests/playback/test_player_serialization.py::TestPlayerDetachAndRetarget
+    for the actual backend-retargeting/attached-flag/command-queue-
+    serialization behavior, which now lives on Player)."""
+
     def _make_speaker(self) -> Speaker:
         return Speaker(
             config=_make_speaker_config(name="Kitchen", dlna_ip="10.0.1.30"),
@@ -677,77 +682,43 @@ class TestSpeakerRetarget:
             app_id="app-id",
         )
 
-    async def test_retargets_dlna_backend_and_updates_config(self):
-        from qobuz_proxy.backends.dlna import DLNABackend
-
+    async def test_delegates_to_player_and_updates_config_on_success(self):
         speaker = self._make_speaker()
-        speaker._backend = DLNABackend("10.0.1.30", 1400)
-        speaker._backend.retarget = AsyncMock(return_value=True)
+        speaker._player = MagicMock()
+        speaker._player.retarget = AsyncMock(return_value=True)
 
         result = await speaker.retarget("10.0.1.31", 1400)
 
         assert result is True
-        speaker._backend.retarget.assert_awaited_once_with("10.0.1.31", 1400)
+        speaker._player.retarget.assert_awaited_once_with("10.0.1.31", 1400)
         assert speaker._config.dlna_ip == "10.0.1.31"
         assert speaker._config.dlna_port == 1400
 
-    async def test_returns_false_when_backend_retarget_fails(self):
-        from qobuz_proxy.backends.dlna import DLNABackend
-
+    async def test_does_not_update_config_when_player_retarget_fails(self):
         speaker = self._make_speaker()
-        speaker._backend = DLNABackend("10.0.1.30", 1400)
-        speaker._backend.retarget = AsyncMock(return_value=False)
+        speaker._player = MagicMock()
+        speaker._player.retarget = AsyncMock(return_value=False)
 
         result = await speaker.retarget("10.0.1.31", 1400)
 
         assert result is False
         assert speaker._config.dlna_ip == "10.0.1.30"  # unchanged
 
-    async def test_returns_false_for_a_backend_that_does_not_support_retargeting(self):
-        # AudioBackend.retarget()'s base default — a backend not meaningfully
-        # "the same session, different device" (e.g. local output) never
-        # overrides it.
-        from qobuz_proxy.backends.local.backend import LocalAudioBackend
-
+    async def test_returns_false_with_no_player_at_all(self):
         speaker = self._make_speaker()
-        speaker._backend = LocalAudioBackend()
+        assert speaker._player is None
 
         result = await speaker.retarget("10.0.1.31", 1400)
 
         assert result is False
 
-    async def test_returns_false_with_no_backend_at_all(self):
-        speaker = self._make_speaker()
-        assert speaker._backend is None
-
-    async def test_successful_retarget_marks_player_backend_attached(self):
-        from qobuz_proxy.backends.dlna import DLNABackend
-
-        speaker = self._make_speaker()
-        speaker._backend = DLNABackend("10.0.1.30", 1400)
-        speaker._backend.retarget = AsyncMock(return_value=True)
-        speaker._player = MagicMock()
-        speaker._player.set_backend_attached = AsyncMock()
-
-        await speaker.retarget("10.0.1.31", 1400)
-
-        speaker._player.set_backend_attached.assert_awaited_once_with(True)
-
-    async def test_failed_retarget_does_not_mark_player_backend_attached(self):
-        from qobuz_proxy.backends.dlna import DLNABackend
-
-        speaker = self._make_speaker()
-        speaker._backend = DLNABackend("10.0.1.30", 1400)
-        speaker._backend.retarget = AsyncMock(return_value=False)
-        speaker._player = MagicMock()
-        speaker._player.set_backend_attached = AsyncMock()
-
-        await speaker.retarget("10.0.1.31", 1400)
-
-        speaker._player.set_backend_attached.assert_not_called()
-
 
 class TestSpeakerDetach:
+    """Speaker.detach() is a thin delegator to Player.detach() (see
+    tests/playback/test_player_serialization.py::TestPlayerDetachAndRetarget
+    for the actual disconnect/attached-flag/command-queue-serialization
+    behavior, which now lives on Player)."""
+
     def _make_speaker(self) -> Speaker:
         return Speaker(
             config=_make_speaker_config(name="Kitchen", dlna_ip="10.0.1.30"),
@@ -755,36 +726,20 @@ class TestSpeakerDetach:
             app_id="app-id",
         )
 
-    async def test_disconnects_the_backend(self):
+    async def test_delegates_to_player(self):
         speaker = self._make_speaker()
-        speaker._backend = MagicMock()
-        speaker._backend.disconnect = AsyncMock()
-
-        await speaker.detach()
-
-        speaker._backend.disconnect.assert_awaited_once_with(send_device_stop=True)
-
-    async def test_marks_player_backend_detached(self):
-        speaker = self._make_speaker()
-        speaker._backend = MagicMock()
-        speaker._backend.disconnect = AsyncMock()
         speaker._player = MagicMock()
-        speaker._player.set_backend_attached = AsyncMock()
+        speaker._player.detach = AsyncMock()
 
         await speaker.detach()
 
-        speaker._player.set_backend_attached.assert_awaited_once_with(False)
+        speaker._player.detach.assert_awaited_once_with()
 
-    async def test_safe_with_no_backend_or_player(self):
+    async def test_safe_with_no_player(self):
         speaker = self._make_speaker()
-        assert speaker._backend is None
         assert speaker._player is None
 
         await speaker.detach()  # must not raise
-
-        result = await speaker.retarget("10.0.1.31", 1400)
-
-        assert result is False
 
 
 class TestSpeakerIsActive:
