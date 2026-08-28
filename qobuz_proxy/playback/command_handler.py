@@ -199,19 +199,13 @@ class PlaybackCommandHandler:
         # else: nextQueueItem simply absent from this message — no signal
         # either way (see above); leave whatever's already stored as-is.
 
-        # Keep the queue's current index in sync with the item the app shows.
-        # Without this, queue-based fallbacks (auto-advance at track end,
-        # get_current_track) act on a stale index — e.g. restarting the same
-        # track instead of advancing.
-        if current_queue_item_id is not None:
-            await self.queue.set_current_by_item_id(current_queue_item_id)
-
         # Store the server's queue version so our own state reports echo it
         # back — this was never done for a renderer session (queue.py's
-        # version only otherwise updates via SRVR_CTRL_QUEUE_STATE/
-        # QUEUE_TRACKS_LOADED, which the server never sends to a renderer;
-        # see QueueHandler), so every outbound report always claimed queue
-        # version 0.0 regardless of what the server had just told us
+        # version only otherwise updated via SRVR_CTRL_QUEUE_STATE/
+        # QUEUE_TRACKS_LOADED, which never actually arrive for a renderer
+        # session — see queue.py's module docstring), so every outbound
+        # report always claimed queue version 0.0 regardless of what the
+        # server had just told us
         # (observed directly, test1.log 2026-08-28: every message from the
         # app carried queueVersion, e.g. 4.1, while every one of our own
         # reports echoed 0.0 back). Worth fixing on its own — the version

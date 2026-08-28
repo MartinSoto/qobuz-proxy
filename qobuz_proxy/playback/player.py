@@ -27,9 +27,6 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-# Threshold for restart vs previous track (milliseconds)
-PREVIOUS_TRACK_THRESHOLD_MS = 3000
-
 # When we begin a track at a position beyond this, treat it as adopted mid-play
 # from the controlling app (a Connect handoff) rather than a play we initiated.
 # The app already reported/scrobbled that play, so we suppress our own
@@ -253,9 +250,6 @@ class QobuzPlayer:
 
         self._is_running = True
 
-        # Start queue preloading
-        await self.queue.start()
-
         # Connect backend
         if not self.backend.is_connected():
             await self.backend.connect()
@@ -302,9 +296,6 @@ class QobuzPlayer:
         # Close any open play report (incl. a paused listen, which no longer
         # closes on pause) so a shutdown mid-listen still lands in history.
         await self._report_stopped()
-
-        # Stop queue
-        await self.queue.stop()
 
         # Disconnect backend
         await self.backend.disconnect(send_device_stop=send_device_stop)
@@ -1025,15 +1016,13 @@ class QobuzPlayer:
                 await self.seek(position_ms)
             return True
 
-        # Get track to play (if not already loaded)
+        # A bare PLAY with nothing already loaded has no track to fall
+        # back on — there's no queue to pull one from (see queue.py's
+        # module docstring); every real play path loads a track directly
+        # from SET_STATE (_load_track_locked) before this is ever reached.
         if not self._current_track:
-            track = await self.queue.get_current_track()
-            if not track:
-                track = await self.queue.advance_to_next()
-            if not track:
-                logger.warning("No track to play - queue empty")
-                return False
-            self._current_track = track
+            logger.warning("No track to play - nothing loaded")
+            return False
 
         # A cold pause (see above) already has the resume position recorded
         # in _position_value_ms — a plain PLAY with no explicit position
@@ -1373,7 +1362,9 @@ class QobuzPlayer:
             enabled: True to enable shuffle
         """
         logger.debug(f"Set shuffle mode: {enabled}")
-        await self.queue.set_shuffle(enabled)
+        # There's no track list here to shuffle (see queue.py's module
+        # docstring) and shuffle isn't part of the outbound state report
+        # either — acknowledged but not implemented, same as autoplay below.
 
     async def set_autoplay_mode(self, enabled: bool) -> None:
         """
@@ -1386,97 +1377,16 @@ class QobuzPlayer:
         # Autoplay is handled at queue level - just log for now
         # Full implementation would require fetching similar tracks
 
-    async def next_track(self) -> bool:
-        """
-        Skip to next track.
-
-        Returns:
-            True if advanced to next track, False if at end
-        """
-        return await self._next_track_locked()
-
-    async def _next_track_locked(self) -> bool:
-        # Clear gapless state — explicit skip
-        self._clear_gapless_state()
-
-        logger.debug("Next track command")
-
-        # Stop current playback
-        if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-            await self.backend.stop()
-
-        # Get next track from queue
-        track = await self.queue.advance_to_next()
-
-        if not track:
-            # End of queue
-            self._state = PlaybackState.STOPPED
-            self._current_track = None
-            self._position_value_ms = 0
-            await self._send_state_update()
-            # Report the finished play so the last track lands in listening
-            # history / is scrobbled, and the lingering session is closed (an
-            # open session would inflate the next play's reported duration).
-            await self._report_stopped()
-            logger.info("End of queue - playback stopped")
-            return False
-
-        # Start playing next track
-        self._current_track = track
-        await self._start_playback()
-        return True
-
-    async def previous_track(self) -> bool:
-        """
-        Go to previous track or restart current track.
-
-        - If position > 3 seconds: Restart current track
-        - If position <= 3 seconds: Go to previous track
-
-        Returns:
-            True if action taken successfully
-        """
-        return await self._previous_track_locked()
-
-    async def _previous_track_locked(self) -> bool:
-        # Clear gapless state — explicit navigation
-        self._clear_gapless_state()
-
-        logger.debug("Previous track command")
-
-        current_pos = self.current_position_ms
-
-        # Restart if past threshold
-        if current_pos > PREVIOUS_TRACK_THRESHOLD_MS:
-            logger.debug(
-                f"Restarting track (position {current_pos}ms > {PREVIOUS_TRACK_THRESHOLD_MS}ms)"
-            )
-            await self.backend.seek(0)
-            self._position_value_ms = 0
-            self._position_timestamp_ms = int(time.time() * 1000)
-            await self._send_state_update()
-            if self._state == PlaybackState.PAUSED:
-                # Restarting a paused track ends the prior listen so the next
-                # resume reports the replay as a fresh play instead of merging
-                # into the open (paused) session.
-                await self._report_stopped()
-            return True
-
-        # Stop current playback
-        if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-            await self.backend.stop()
-
-        # Get previous track from queue
-        track = await self.queue.go_to_previous()
-
-        if not track:
-            logger.warning("No previous track")
-            return False
-
-        # Start playing previous track
-        self._current_track = track
-        await self._start_playback()
-        return True
+    # Deliberately no next_track()/previous_track() here. They used to
+    # walk QobuzQueue's ordered track list (advance_to_next()/
+    # go_to_previous()), which is gone — see queue.py's module docstring:
+    # a Renderer session never receives the messages that would populate
+    # one, and nothing in this app ever called these two methods either
+    # (no inbound message type maps to them — next/previous navigation
+    # arrives as just another SET_STATE naming the new track, apparently
+    # decided client-side by the app itself). If a real caller ever needs
+    # skip-forward/back again, it needs a real design behind it, not a
+    # resurrection of the dead track-list machinery this removed.
 
     # =========================================================================
     # Internal Playback Management
@@ -1495,8 +1405,8 @@ class QobuzPlayer:
             True if playback started successfully
         """
         # See _intended_playing — set here too, not just in _play_locked:
-        # play_track()/next_track()/previous_track() and friends all reach
-        # this directly without going through _play_locked.
+        # play_track() and friends reach this directly without going
+        # through _play_locked.
         self._intended_playing = True
 
         if not self._current_track:

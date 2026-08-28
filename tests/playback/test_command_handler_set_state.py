@@ -40,44 +40,18 @@ def _set_state_msg(
 
 
 class TestSetStateHandling:
-    async def test_set_state_syncs_queue_index(self) -> None:
-        """Regression for BUG-33: the queue's current index must follow the
-        currentQueueItem of SET_STATE, or queue-based fallbacks (auto-advance,
-        get_current_track) act on a stale index."""
-        from qobuz_proxy.playback.queue import QobuzQueue, QueueVersion
-
-        player, backend = _make_player()
-        queue = QobuzQueue()
-        handler = PlaybackCommandHandler(player, queue=queue)
-
-        await queue.load_queue(
-            tracks=[
-                {"queueItemId": 1, "trackId": 3001},
-                {"queueItemId": 2, "trackId": 3002},
-                {"queueItemId": 3, "trackId": 3003},
-            ],
-            version=QueueVersion(major=1, minor=0),
-        )
-
-        await handler._handle_set_state(_set_state_msg(track_id=3003, queue_item_id=3))
-
-        state = await queue.get_state()
-        assert state.current_queue_item_id == 3
-        current = await queue.get_current_track()
-        assert current is not None
-        assert current.track_id == "3003"
-
     async def test_set_state_stores_queue_version(self) -> None:
         """Regression (test1.log, 2026-08-28): the server's queueVersion
         was never stored anywhere for a renderer session — it only ever
-        updated via SRVR_CTRL_QUEUE_STATE/QUEUE_TRACKS_LOADED, which the
-        server never sends to a renderer (see QueueHandler) — so every
-        outbound state report always echoed back 0.0 regardless of what
-        the server had just sent (observed directly: every SET_STATE
-        carried queueVersion, e.g. 4.1, every report we sent back claimed
-        0.0). QueueVersion's own docstring says it exists "for
-        synchronization" — a plausible reason a client-side sync check on
-        the app's end would hold back further navigation commands."""
+        updated via SRVR_CTRL_QUEUE_STATE/QUEUE_TRACKS_LOADED, which never
+        actually arrive for a renderer session (see queue.py's module
+        docstring) — so every outbound state report always echoed back
+        0.0 regardless of what the server had just sent (observed
+        directly: every SET_STATE carried queueVersion, e.g. 4.1, every
+        report we sent back claimed 0.0). QueueVersion's own docstring
+        says it exists "for synchronization" — a plausible reason a
+        client-side sync check on the app's end would hold back further
+        navigation commands."""
         from qobuz_proxy.playback.queue import QobuzQueue, QueueVersion
 
         player, backend = _make_player()
@@ -179,8 +153,6 @@ class TestNoTrackSentinel:
         # this is exactly the state a just-reset Sonos coordinator's Speaker
         # starts in, which is what first exposed this bug in practice.
         player, backend = _make_player()
-        player.queue.get_current_track = AsyncMock(return_value=None)
-        player.queue.advance_to_next = AsyncMock(return_value=None)
         handler = PlaybackCommandHandler(player)
 
         msg = _set_state_msg(track_id=0xFFFFFFFF, queue_item_id=0xFFFFFFFFFFFFFFFF)
@@ -193,8 +165,6 @@ class TestNoTrackSentinel:
         # A real (small) trackId paired with the queueItemId sentinel must
         # also be treated as "no track" — either field alone marks it.
         player, backend = _make_player()
-        player.queue.get_current_track = AsyncMock(return_value=None)
-        player.queue.advance_to_next = AsyncMock(return_value=None)
         handler = PlaybackCommandHandler(player)
 
         msg = _set_state_msg(track_id=2001, queue_item_id=0xFFFFFFFFFFFFFFFF)

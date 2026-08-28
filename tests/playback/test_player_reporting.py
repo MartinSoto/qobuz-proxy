@@ -65,10 +65,6 @@ def _make_player_with_reporter():
     # get_metadata above.
     queue.get_track_url = MagicMock(side_effect=lambda track: _coro(f"http://t/{track.track_id}"))
     queue.get_track_metadata = MagicMock(side_effect=lambda track: _coro(None))
-    # Only needed by tests that call player.start() to run the command
-    # queue's consumer (see TestPlayerReporting's unprompted-change tests) —
-    # a plain MagicMock() attribute isn't awaitable on its own.
-    queue.start = AsyncMock()
     player = QobuzPlayer(
         queue=queue, metadata_service=metadata, backend=backend, play_reporter=reporter
     )
@@ -363,20 +359,6 @@ class TestPlayerReporting:
 
         api.report_streaming_start.assert_awaited_once_with(track_id="900", format_id=27)
 
-    async def test_restart_paused_track_reports_fresh_play_on_resume(self) -> None:
-        """Restarting a paused track (previous past threshold) ends the prior
-        listen; the resumed replay reports as a fresh play, not a merge."""
-        player, api = _make_player_with_reporter()
-        await player.play_track(queue_item_id=1, track_id="100")
-        await player.pause()
-        player._position_value_ms = 10_000  # past the restart threshold
-
-        await player.previous_track()  # restart current track
-        api.report_streaming_end.assert_awaited_once()
-
-        await player.play()  # resume -> fresh play of the restarted track
-        assert api.report_streaming_start.await_count == 2
-
     async def test_same_track_new_queue_item_reports_fresh_play(self) -> None:
         """Replaying the same track from a different queue slot while paused must
         report a fresh play (keyed by queue item), not merge into the old one."""
@@ -435,7 +417,6 @@ class TestPlayerReporting:
     async def test_shutdown_while_paused_reports_end(self) -> None:
         """Shutting down mid-listen (paused) must still close the play report."""
         player, api = _make_player_with_reporter()
-        player.queue.stop = AsyncMock()
         await player.play_track(queue_item_id=1, track_id="100")
         await player.pause()
         api.report_streaming_end.assert_not_awaited()
