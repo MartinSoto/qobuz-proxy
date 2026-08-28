@@ -250,7 +250,7 @@ class DLNABackend(AudioBackend):
             self._is_connected = True
 
             # Start state polling
-            self._poll_task = asyncio.create_task(self._poll_state_loop())
+            self._start_polling()
 
             logger.info(f"Connected to DLNA device: {self.name}")
             return True
@@ -331,8 +331,7 @@ class DLNABackend(AudioBackend):
             self._retarget_confirmation_deadline = (
                 time.monotonic() + RETARGET_CONFIRMATION_TIMEOUT_SECONDS
             )
-        if self._poll_task is None or self._poll_task.done():
-            self._poll_task = asyncio.create_task(self._poll_state_loop())
+        self._start_polling()
         if device_info.friendly_name:
             self.name = device_info.friendly_name
 
@@ -402,12 +401,7 @@ class DLNABackend(AudioBackend):
         """
         self._is_connected = False
 
-        if self._poll_task:
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
+        await self._stop_polling()
 
         if self._client:
             if send_device_stop:
@@ -419,6 +413,62 @@ class DLNABackend(AudioBackend):
             self._client = None
 
         logger.info(f"Disconnected from DLNA device: {self.name}")
+
+    def _start_polling(self) -> None:
+        """Start (or resume) _poll_state_loop if it isn't already running —
+        idempotent. Called unconditionally from connect()/retarget() (a
+        freshly connected/retargeted backend always needs to poll,
+        regardless of active status — see set_active()'s own docstring
+        for why the two are independent), and from set_active(True) when
+        transitioning out of inactive. No-ops if there's no client to
+        poll yet (e.g. active flips while detached, mid Sonos handoff) —
+        connect()/retarget() will start it once there is one."""
+        if not self._client:
+            return
+        if self._poll_task is None or self._poll_task.done():
+            self._poll_task = asyncio.create_task(self._poll_state_loop())
+
+    async def _stop_polling(self) -> None:
+        """Stop _poll_state_loop if running, and wait for it to actually
+        exit — the mirror of _start_polling(). Called from disconnect()
+        and from set_active(False)."""
+        if self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+            self._poll_task = None
+
+    async def set_active(self, active: bool) -> None:
+        """Extends AudioBackend.set_active() with actually starting/
+        stopping _poll_state_loop, rather than only recording the flag
+        for one narrow check (the hijack-detection gate) to consult.
+
+        A Sonos room that's merely discovered — not the one Qobuz is
+        actually driving — has no reason to keep polling the physical
+        device at all: _poll_state_loop is the sole source of every
+        Channel 3 event (state-change, track-ended, external-takeover,
+        ...), and the ordinary state-change block in it was never gated
+        on self._active the way the hijack check next to it was —
+        capable of triggering a spurious auto-advance or play-report for
+        a renderer nobody asked us to touch (observed as a real gap, not
+        yet as a bug in practice). Stopping the loop outright removes
+        the risk structurally instead of auditing every event handler
+        for a missing check.
+
+        Deliberately independent of *connected*: a newly-discovered room
+        stays connected (SOAP session established, capabilities probed)
+        so it's a valid, quickly-selectable target — reconnecting from
+        scratch on every activation would cost real latency on someone's
+        first "play". Only the poll loop is gated here.
+        """
+        was_active = self._active
+        await super().set_active(active)
+        if active and not was_active:
+            self._start_polling()
+        elif not active and was_active:
+            await self._stop_polling()
 
     # =========================================================================
     # Playback Control

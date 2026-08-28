@@ -63,7 +63,7 @@ class TestSetActiveHandling:
     async def test_active_false_marks_the_player_inactive_and_stops_playback(self) -> None:
         player, _backend = _make_player()
         handler = PlaybackCommandHandler(player, queue=None)
-        player.set_active_renderer(True)
+        await player.set_active_renderer(True)
         player.stop_playback = AsyncMock()  # type: ignore[method-assign]
 
         await handler._handle_set_active(_set_active_msg(False))
@@ -92,7 +92,7 @@ class TestSetActiveHandling:
     async def test_missing_field_is_ignored(self) -> None:
         player, _backend = _make_player()
         handler = PlaybackCommandHandler(player, queue=None)
-        player.set_active_renderer(True)
+        await player.set_active_renderer(True)
 
         msg = pb.QConnectMessage()
         msg.messageType = 43  # no srvrRndrSetActive payload set

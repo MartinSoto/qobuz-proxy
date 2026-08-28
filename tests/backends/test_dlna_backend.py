@@ -590,6 +590,78 @@ class TestRetarget:
         assert backend._client is old_client
 
 
+class TestSetActive:
+    """DLNABackend.set_active() — see AudioBackend.set_active(). Extends
+    the base flag-set with actually starting/stopping _poll_state_loop:
+    a merely-discovered Sonos room that isn't the one Qobuz is driving
+    has no reason to keep polling the physical device at all, and the
+    poll loop is the sole source of every event it produces."""
+
+    async def test_going_inactive_stops_polling(self):
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = AsyncMock()
+        backend._active = True
+        backend._poll_task = asyncio.create_task(asyncio.sleep(3600))
+
+        await backend.set_active(False)
+
+        assert backend._active is False
+        assert backend._poll_task is None
+
+    async def test_going_active_again_resumes_polling(self):
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = AsyncMock()
+        backend._active = False
+        backend._poll_task = None
+
+        await backend.set_active(True)
+
+        assert backend._active is True
+        assert backend._poll_task is not None
+        backend._poll_task.cancel()
+
+    async def test_redundant_activation_does_not_replace_the_running_poll_task(self):
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = AsyncMock()
+        backend._active = True
+        original_task = asyncio.create_task(asyncio.sleep(3600))
+        backend._poll_task = original_task
+
+        await backend.set_active(True)  # already active — no transition
+
+        assert backend._poll_task is original_task
+        original_task.cancel()
+
+    async def test_going_inactive_without_a_client_does_not_crash(self):
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = None
+        backend._active = True
+        backend._poll_task = None
+
+        await backend.set_active(False)  # must not raise
+
+        assert backend._active is False
+
+    async def test_going_active_without_a_client_does_not_start_polling(self):
+        # e.g. active flips while detached mid Sonos handoff — connect()/
+        # retarget() will start polling once there's actually a client.
+        backend = DLNABackend("10.0.1.30", 1400)
+        backend._client = None
+        backend._active = False
+        backend._poll_task = None
+
+        await backend.set_active(True)
+
+        assert backend._active is True
+        assert backend._poll_task is None
+
+
 class TestWaitForReconnect:
     """play() landing while this backend is detached (see Speaker.detach,
     SonosDiscoveryManager's pending state) must not just fail outright —
