@@ -8,7 +8,7 @@ import asyncio
 import functools
 import logging
 import time
-from typing import Awaitable, Callable, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Optional, TypeVar, TYPE_CHECKING
 
 from qobuz_proxy.backends import (
     AudioBackend,
@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from .play_reporter import PlayReporter
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # Threshold for restart vs previous track (milliseconds)
 PREVIOUS_TRACK_THRESHOLD_MS = 3000
@@ -259,9 +261,25 @@ class QobuzPlayer:
             await self.backend.connect()
 
         # Start the command queue's single consumer
-        self._command_task = asyncio.create_task(self._command_consumer_loop())
+        self._ensure_command_consumer_running()
 
         logger.info("Player started")
+
+    def _ensure_command_consumer_running(self) -> None:
+        """Start the command queue's consumer if it isn't already running —
+        idempotent, and independent of the rest of start()'s work (queue
+        preloading, backend connect).
+
+        detach()/retarget() can legitimately be called before start() —
+        e.g. a Sonos group_id going pending or getting retargeted before
+        the Qobuz app has ever connected to this speaker, see Speaker.
+        detach()/retarget() — and both need somewhere for their enqueued
+        item to actually be picked up rather than waiting forever on a
+        consumer nothing ever started. Called from both start() and
+        _enqueue_and_wait() for that reason, rather than each managing
+        _command_task itself."""
+        if self._command_task is None or self._command_task.done():
+            self._command_task = asyncio.create_task(self._command_consumer_loop())
 
     async def stop(self, send_device_stop: bool = True) -> None:
         """Stop the player and clean up.
@@ -339,8 +357,9 @@ class QobuzPlayer:
 
     async def set_backend_attached(self, attached: bool) -> None:
         """Record whether the backend is currently reachable — called by
-        Speaker.detach()/retarget() around a Sonos group_id going pending
-        (see SonosDiscoveryManager's pending state). Going False also
+        this Player's own detach()/retarget() (themselves invoked from
+        Speaker.detach()/retarget(), see there) around a Sonos group_id
+        going pending (see SonosDiscoveryManager's pending state). Going False also
         nudges self._state toward an honest transitional state and relays
         it immediately, so the app sees a real signal during a handoff
         instead of either silence or a stale, still-ticking PLAYING
@@ -351,32 +370,104 @@ class QobuzPlayer:
         self._backend_attached = attached
         if attached:
             self._backend_attached_event.set()
-            # A retarget just succeeded — this is retarget()'s own sole
-            # call site (see Speaker.retarget()). The backend clears its
-            # own next-track bookkeeping whenever it actually retargets to
-            # a different device (DLNABackend.retarget() — the physical
-            # device's own queue can't be assumed to carry over what we'd
-            # armed on the old one), but nothing told *this* flag its own
-            # armed state might now be stale. Left alone, it stayed True
-            # forever (observed directly: a gapless transition Sonos
-            # itself carried through anyway on the new device went
-            # undetected as gapless — the backend had nothing armed to
-            # compare against — and read as an external takeover instead),
-            # permanently blocking the ordinary per-position-tick re-arm
-            # retry (see _on_position_update) from ever running again.
-            # Cleared here unconditionally, not just on a detached->
-            # attached transition, since Speaker.retarget() calls this on
-            # every successful retarget regardless of whether
-            # backend_attached ever actually went False — costs at most
-            # one harmless re-arm attempt when nothing actually changed
-            # (the backend's own set_next_track dedups an identical
-            # still-armed URL).
+            # A retarget just succeeded — this is Player.retarget()'s own
+            # sole call site. The backend clears its own next-track
+            # bookkeeping whenever it actually retargets to a different
+            # device (DLNABackend.retarget() — the physical device's own
+            # queue can't be assumed to carry over what we'd armed on the
+            # old one), but nothing told *this* flag its own armed state
+            # might now be stale. Left alone, it stayed True forever
+            # (observed directly: a gapless transition Sonos itself
+            # carried through anyway on the new device went undetected as
+            # gapless — the backend had nothing armed to compare against —
+            # and read as an external takeover instead), permanently
+            # blocking the ordinary per-position-tick re-arm retry (see
+            # _on_position_update) from ever running again. Cleared here
+            # unconditionally, not just on a detached->attached
+            # transition, since Player.retarget() calls this on every
+            # successful retarget regardless of whether backend_attached
+            # ever actually went False — costs at most one harmless
+            # re-arm attempt when nothing actually changed (the backend's
+            # own set_next_track dedups an identical still-armed URL).
             self._clear_gapless_state()
             return
         self._backend_attached_event.clear()
         if was_attached and self._state == PlaybackState.PLAYING:
             self._state = PlaybackState.LOADING
             await self._send_state_update()
+
+    async def detach(self) -> None:
+        """Give up the current backend target without tearing down the
+        Qobuz Connect session — see Speaker.detach(), the sole caller.
+
+        Runs as an ordinary command-queue item (see enqueue()) so it can
+        never overlap whatever backend call the consumer is currently in
+        the middle of — the same hazard (two concurrent SOAP calls
+        wedging the renderer) the command queue exists to prevent for
+        play/pause/seek in the first place applies just as much to a
+        retarget/detach, and previously nothing prevented it since this
+        used to run directly on the Sonos discovery manager's own task
+        instead of through this queue. Unlike a playback-directing
+        command, detach/retarget are never coalesced away — a detach must
+        always actually run, not be silently dropped because something
+        newer landed behind it in the meantime; it simply waits its turn.
+        """
+        await self._enqueue_and_wait(self._detach_locked)
+
+    async def _detach_locked(self) -> None:
+        await self.backend.disconnect(send_device_stop=True)
+        await self.set_backend_attached(False)
+
+    async def retarget(self, ip: str, port: int) -> bool:
+        """Repoint the backend at a different physical device, in place —
+        see Speaker.retarget(), the sole caller. Same command-queue
+        rationale as detach().
+
+        Returns:
+            True if the retarget succeeded.
+        """
+        return await self._enqueue_and_wait(functools.partial(self._retarget_locked, ip, port))
+
+    async def _retarget_locked(self, ip: str, port: int) -> bool:
+        ok = await self.backend.retarget(ip, port)
+        if ok:
+            await self.set_backend_attached(True)
+        return ok
+
+    async def _enqueue_and_wait(self, coro_fn: Callable[[], Awaitable[_T]]) -> _T:
+        """Enqueue coro_fn (plain FIFO, never coalesced — see enqueue())
+        and wait for it to actually run, returning its result.
+
+        For callers (detach()/retarget()) that need "the operation has
+        happened by the time this returns" — the same calling convention
+        Speaker.detach()/retarget() already had when they ran outside
+        this queue entirely — while still gaining the queue's mutual
+        exclusion against every other backend-directed call. Since
+        neither detach nor retarget is ever coalesced away (see
+        enqueue()), the wrapped item is guaranteed to eventually run as
+        long as the command consumer keeps making progress, so this never
+        waits on a future nothing will ever resolve — as long as a
+        consumer is actually running to make that progress, which is why
+        this starts one if start() hasn't been called yet (see
+        _ensure_command_consumer_running()).
+        """
+        self._ensure_command_consumer_running()
+        loop = asyncio.get_running_loop()
+        done: "asyncio.Future[_T]" = loop.create_future()
+
+        async def _wrapped() -> None:
+            try:
+                result = await coro_fn()
+            except Exception as exc:
+                if not done.done():
+                    done.set_exception(exc)
+                raise
+            else:
+                if not done.done():
+                    done.set_result(result)
+
+        self.enqueue(_wrapped)
+        return await done
 
     def set_next_track_callbacks(
         self,
@@ -619,8 +710,14 @@ class QobuzPlayer:
         coalesced-away, or failed) — this is what makes
         ``await self._command_queue.join()`` a valid "wait for everything
         currently queued to finish" barrier (used in tests).
+
+        Runs until cancelled (stop()'s own termination mechanism —
+        self._command_task.cancel()), not gated on self._is_running: this
+        loop can be started by _ensure_command_consumer_running() before
+        start() has ever run (see there), and self._is_running only
+        toggles True once the rest of start()'s work has also happened.
         """
-        while self._is_running:
+        while True:
             try:
                 item = await self._command_queue.get()
             except asyncio.CancelledError:
