@@ -261,7 +261,7 @@ class PlaybackCommandHandler:
 
         active = message.srvrRndrSetActive.active
         logger.info(f"Renderer set active: {active}")
-        self.player.set_active_renderer(active)
+        await self.player.set_active_renderer(active)
 
         if active:
             # A controller just attached — claim a silent, ready state

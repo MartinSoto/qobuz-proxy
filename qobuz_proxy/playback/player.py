@@ -333,18 +333,20 @@ class QobuzPlayer:
         self._fixed_volume = enabled
         logger.info(f"Fixed volume mode: {enabled}")
 
-    def set_active_renderer(self, active: bool) -> None:
+    async def set_active_renderer(self, active: bool) -> None:
         """Record whether the Qobuz server currently considers this
         renderer the active playback target (see SrvrRndrSetActive).
 
-        Also relayed to the backend (see AudioBackend.set_active) — in a
-        Sonos auto-discovery household every discovered room polls its own
-        device continuously regardless of whether Qobuz is driving it, and
-        a backend that reacts to what it sees there (hijack detection) has
-        no way to know "active" is a Qobuz Connect concept it can't see
-        for itself without this."""
+        Also relayed to the backend (see AudioBackend.set_active) — a
+        backend that watches its physical device on its own (DLNABackend's
+        poll loop) has no way to know "active" is a Qobuz Connect concept
+        it can't see for itself without this; DLNABackend actually stops
+        polling while inactive rather than merely recording the flag, so
+        this must be awaited (called from within a command-queue item —
+        see PlaybackCommandHandler._handle_set_active — so awaiting here
+        never overlaps whatever else the queue is doing)."""
         self._is_active_renderer = active
-        self.backend.set_active(active)
+        await self.backend.set_active(active)
 
     async def set_backend_attached(self, attached: bool) -> None:
         """Record whether the backend is currently reachable — called by

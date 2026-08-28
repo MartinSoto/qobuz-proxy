@@ -205,7 +205,7 @@ class AudioBackend(ABC):
         """Check if backend is connected."""
         return self._is_connected
 
-    def set_active(self, active: bool) -> None:
+    async def set_active(self, active: bool) -> None:
         """Record whether the Qobuz server currently considers this
         renderer the active playback target (see Player.set_active_renderer
         / SrvrRndrSetActive) — the narrow signal in the opposite direction
@@ -215,16 +215,14 @@ class AudioBackend(ABC):
         meaningful.
 
         In a Sonos auto-discovery household every discovered room gets its
-        own Speaker/Player/backend, polling continuously, whether or not
-        it's the one Qobuz is actually driving right now — a mismatch
-        between what an *inactive* renderer reports and what we last set
-        isn't evidence of anything (no session is being driven there; it
-        may simply be someone using that room directly, or nothing may
-        have ever played there at all). Default: no-op. Backends without a
-        notion of watching a device they don't control (local output) or
-        that never receive this signal at all (a manually configured
-        single speaker) need not override it — see the True default on
-        self._active.
+        own Speaker/Player/backend — DLNABackend overrides this to actually
+        stop polling the physical device while inactive (see there), not
+        merely record the flag for one check to consult; a backend without
+        a notion of watching a device it doesn't control (local output) or
+        that never receives this signal at all (a manually configured
+        single speaker) can just keep this default no-op — see the True
+        default on self._active. Async so an overriding backend can
+        actually wait for its poll loop to stop before this returns.
         """
         self._active = active
 
