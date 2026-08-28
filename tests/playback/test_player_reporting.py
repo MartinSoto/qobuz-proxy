@@ -17,7 +17,9 @@ class _Backend(AudioBackend):
         super().__init__(name="test")
 
     async def play(self, url: str, metadata: BackendTrackMetadata) -> None: ...
-    async def pause(self) -> None: ...
+    async def pause(self) -> bool:
+        return True
+
     async def resume(self) -> bool:
         return True
 

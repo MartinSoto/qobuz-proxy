@@ -744,7 +744,8 @@ class TestPollStateLoop:
         backend._duration_ms = 0
         backend._playback_started_at = time.monotonic() - 3600  # well outside grace
         backend._current_track_confirmed = True  # device already seen playing it
-        backend._paused_stop_polls = 0
+        backend._unconfirmed_stop_polls = 0
+        backend._unconfirmed_stop_since = 0.0
         backend._hijack_check_countdown = 0
         backend._external_takeover_notified = False
         backend._awaiting_retarget_confirmation = False
@@ -1075,7 +1076,7 @@ class TestPollStateLoop:
     async def test_paused_stop_confirmed_after_consecutive_polls(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
 
-        from qobuz_proxy.backends.dlna.backend import _PAUSED_STOP_CONFIRMATIONS
+        from qobuz_proxy.backends.dlna.backend import _STOP_CONFIRMATIONS
 
         backend = self._make_backend()
         backend._state = PlaybackState.PAUSED
@@ -1088,7 +1089,7 @@ class TestPollStateLoop:
         callback = MagicMock()
         backend.on_state_change(callback)
 
-        await self._run_poll_cycles(backend, cycles=_PAUSED_STOP_CONFIRMATIONS + 2)
+        await self._run_poll_cycles(backend, cycles=_STOP_CONFIRMATIONS + 2)
 
         callback.assert_called_once_with(PlaybackState.STOPPED)
 
@@ -1101,7 +1102,7 @@ class TestPollStateLoop:
         (e.g. another room joining/leaving its group)."""
         from unittest.mock import AsyncMock, MagicMock
 
-        from qobuz_proxy.backends.dlna.backend import _PAUSED_STOP_CONFIRMATIONS
+        from qobuz_proxy.backends.dlna.backend import _STOP_CONFIRMATIONS
 
         backend = self._make_backend()
         backend._state = PlaybackState.PAUSED
@@ -1110,10 +1111,10 @@ class TestPollStateLoop:
         callback = MagicMock()
         backend.on_state_change(callback)
 
-        await self._run_poll_cycles(backend, cycles=_PAUSED_STOP_CONFIRMATIONS + 2)
+        await self._run_poll_cycles(backend, cycles=_STOP_CONFIRMATIONS + 2)
 
         callback.assert_not_called()
-        assert backend._paused_stop_polls == 0
+        assert backend._unconfirmed_stop_polls == 0
 
     async def test_single_transient_stopped_read_does_not_confirm(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
@@ -1135,12 +1136,12 @@ class TestPollStateLoop:
 
         backend = self._make_backend()
         backend._state = PlaybackState.PAUSED
-        backend._paused_stop_polls = 2  # one more STOPPED read would confirm
+        backend._unconfirmed_stop_polls = 2  # one more STOPPED read would confirm
         backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
 
         await self._run_poll_cycles(backend, cycles=1)
 
-        assert backend._paused_stop_polls == 0
+        assert backend._unconfirmed_stop_polls == 0
 
     async def test_cold_pause_backend_never_started_is_not_confirmed_as_stopped(self) -> None:
         """A track loaded paused but never started on this backend (see
@@ -1200,6 +1201,57 @@ class TestPollStateLoop:
         await self._run_poll_cycles(backend, cycles=1)
 
         callback.assert_called_once()
+
+    async def test_natural_track_end_eventually_trusted_via_timeout_fallback(self) -> None:
+        """Reproduces the last-track-in-queue hang (test1.log, 2026-08-28):
+        the last queued track finishes with nothing armed next, but Sonos
+        keeps GetPositionInfo.TrackURI reporting the just-finished track's
+        own URI indefinitely — _device_confirms_stopped() never returns
+        True, so the fast path (test above) never fires. Player was left
+        believing PLAYING forever, frozen at the track's own duration,
+        while the physical device sat idle. See
+        _UNCONFIRMED_STOP_TIMEOUT_SECONDS — a persistent, never-resolving
+        STOPPED read is itself trusted once it's been unconfirmed for
+        long enough."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from qobuz_proxy.backends.dlna import backend as backend_module
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        # Fixture default already reports the matching (still-ours) URI —
+        # never confirms via _device_confirms_stopped().
+        callback = MagicMock()
+        backend.on_track_ended(callback)
+        state_callback = MagicMock()
+        backend.on_state_change(state_callback)
+
+        with patch.object(backend_module, "_UNCONFIRMED_STOP_TIMEOUT_SECONDS", 0.02):
+            await self._run_poll_cycles(backend, cycles=20)
+
+        callback.assert_called_once()
+        state_callback.assert_called_once_with(PlaybackState.STOPPED)
+
+    async def test_paused_stop_eventually_trusted_via_timeout_fallback(self) -> None:
+        """Same fallback, PAUSED case: an external stop whose URI never
+        confirms must not wait on _STOP_CONFIRMATIONS's debounce forever
+        either."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from qobuz_proxy.backends.dlna import backend as backend_module
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PAUSED
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        # Fixture default already reports the matching (still-ours) URI.
+        callback = MagicMock()
+        backend.on_state_change(callback)
+
+        with patch.object(backend_module, "_UNCONFIRMED_STOP_TIMEOUT_SECONDS", 0.02):
+            await self._run_poll_cycles(backend, cycles=20)
+
+        callback.assert_called_once_with(PlaybackState.STOPPED)
 
     async def test_hijack_suppressed_while_awaiting_retarget_confirmation(self) -> None:
         """A room-move handoff (see retarget()) can leave the new
@@ -1265,7 +1317,7 @@ class TestPollStateLoop:
         import time
         from unittest.mock import AsyncMock, MagicMock
 
-        from qobuz_proxy.backends.dlna.backend import _PAUSED_STOP_CONFIRMATIONS
+        from qobuz_proxy.backends.dlna.backend import _STOP_CONFIRMATIONS
 
         backend = self._make_backend()
         backend._state = PlaybackState.PAUSED
@@ -1278,10 +1330,10 @@ class TestPollStateLoop:
         callback = MagicMock()
         backend.on_state_change(callback)
 
-        await self._run_poll_cycles(backend, cycles=_PAUSED_STOP_CONFIRMATIONS + 2)
+        await self._run_poll_cycles(backend, cycles=_STOP_CONFIRMATIONS + 2)
 
         callback.assert_not_called()
-        assert backend._paused_stop_polls == 0
+        assert backend._unconfirmed_stop_polls == 0
 
 
 class TestTranscodeDecision:

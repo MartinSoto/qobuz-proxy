@@ -395,6 +395,40 @@ class TestResumeChecksBackend:
         assert player._state == PlaybackState.PLAYING
 
 
+class TestPauseChecksBackend:
+    """Pause must not report PAUSED unless the backend actually paused —
+    mirrors TestResumeChecksBackend above. Regression (test1.log,
+    2026-08-28): a device that had already finished playing on its own
+    (last queued track, naturally stopped) rejected Pause with a UPnP
+    error, and the app was falsely told PAUSED succeeded anyway."""
+
+    async def test_failed_pause_leaves_state_unchanged(self):
+        player, backend = _make_player()
+        backend.pause = AsyncMock(return_value=False)
+        player._send_state_update = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
+        player._state = PlaybackState.PLAYING
+
+        result = await player.pause()
+
+        assert result is False
+        assert player._state == PlaybackState.PLAYING
+        # The current (unchanged) state is pushed so the app corrects
+        # immediately instead of waiting on the next heartbeat.
+        player._send_state_update.assert_awaited()
+
+    async def test_successful_pause_goes_paused(self):
+        player, backend = _make_player()
+        backend.pause = AsyncMock(return_value=True)
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
+        player._state = PlaybackState.PLAYING
+
+        result = await player.pause()
+
+        assert result is True
+        assert player._state == PlaybackState.PAUSED
+
+
 class TestRepeatOneNaturalEnd:
     """Repeat-one must re-issue play; the backend is already STOPPED on natural end."""
 

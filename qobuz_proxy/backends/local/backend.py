@@ -420,10 +420,12 @@ class LocalAudioBackend(AudioBackend):
 
         return int(position_frames / self._sample_rate * 1000)
 
-    async def pause(self) -> None:
-        if self._stream:
-            self._stream.pause()
+    async def pause(self) -> bool:
+        if not self._stream:
+            return False
+        self._stream.pause()
         self._notify_state_change(PlaybackState.PAUSED)
+        return True
 
     async def resume(self) -> bool:
         # Resume only makes sense with a track loaded (paused mid-play). The

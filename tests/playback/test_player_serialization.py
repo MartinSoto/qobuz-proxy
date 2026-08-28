@@ -38,7 +38,9 @@ class ConcurrencyTrackingBackend(AudioBackend):
         finally:
             self.active -= 1
 
-    async def pause(self) -> None: ...
+    async def pause(self) -> bool:
+        return True
+
     async def resume(self) -> bool:
         return True
 
