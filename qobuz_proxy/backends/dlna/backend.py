@@ -174,6 +174,21 @@ class DLNABackend(AudioBackend):
         self._gapless_supported: bool = True
         self._current_proxy_url: Optional[str] = None
 
+        # Whether a poll has actually observed the device reporting
+        # self._current_proxy_url since the last explicit switch — see
+        # _poll_state_loop's gapless-transition check. A slow device (e.g.
+        # an older Sonos unit) can take much longer than
+        # PLAYBACK_START_GRACE_PERIOD_SECONDS to actually flush what it was
+        # still physically outputting from the *previous* track and start
+        # the new one; gating gapless detection on a fixed timer alone
+        # isn't robust to that (observed directly, more often on an older
+        # Play:3 than newer units — see the in_grace_period gate added
+        # first, which a slow-enough device can simply outlast). This is
+        # evidence rather than a guessed duration, so it's correct
+        # regardless of how fast or slow the device actually is — same
+        # philosophy as _awaiting_retarget_confirmation.
+        self._current_track_confirmed: bool = False
+
         # Consecutive STOPPED polls seen while paused (external-stop
         # detection — see _PAUSED_STOP_CONFIRMATIONS).
         self._paused_stop_polls: int = 0
@@ -301,6 +316,10 @@ class DLNABackend(AudioBackend):
         # wrong while Sonos settles internally — see
         # PLAYBACK_START_GRACE_PERIOD_SECONDS and is_playing_our_content().
         self._playback_started_at = time.monotonic()
+        # Not yet observed on the *new* device either — see
+        # _current_track_confirmed. Whatever the old device had confirmed
+        # doesn't carry over to a different physical player.
+        self._current_track_confirmed = False
         # A room-move handoff can take much longer than that fixed window
         # to actually converge — see RETARGET_CONFIRMATION_TIMEOUT_SECONDS.
         # Only meaningful if we actually had content playing before this
@@ -454,6 +473,8 @@ class DLNABackend(AudioBackend):
             self._position_ms = 0
             self._current_proxy_url = actual_url
             self._playback_started_at = time.monotonic()
+            # Not yet observed on the device — see _current_track_confirmed.
+            self._current_track_confirmed = False
             self._notify_state_change(PlaybackState.PLAYING)
             logger.info(f"Playing: {metadata.artist} - {metadata.title}")
 
@@ -960,6 +981,7 @@ class DLNABackend(AudioBackend):
                             )
                             self._awaiting_retarget_confirmation = False
                             self._playback_started_at = time.monotonic()
+                            self._current_track_confirmed = True
 
                 # Check if we're in the grace period after starting playback
                 # (or a retarget still awaiting confirmation — see above).
@@ -1019,7 +1041,40 @@ class DLNABackend(AudioBackend):
                             + (f", next={self._next_track_proxy_url!r}" if armed else "")
                         )
 
-                        if armed and current_uri == self._next_track_proxy_url:
+                        if current_uri == self._current_proxy_url:
+                            self._current_track_confirmed = True
+
+                        # Gated on the device actually having confirmed the
+                        # *current* track at least once (not just a fixed
+                        # grace period, like the hijack check below uses) —
+                        # the device's own reported URI can be transiently
+                        # wrong right after a fresh explicit track switch:
+                        # Sonos hasn't necessarily flushed what it was
+                        # still physically outputting from the *previous*
+                        # track's buffer yet, and a fixed timer isn't
+                        # robust to how long that actually takes on a given
+                        # device (observed directly: far more common on an
+                        # older, slower Play:3 than on newer units — a
+                        # timer generous enough for the slow device is a
+                        # guess, where waiting for the actual signal isn't;
+                        # same philosophy as _awaiting_retarget_confirmation).
+                        # If the previous track happens to be the one just
+                        # re-armed as gapless-next (the ordinary, expected
+                        # case right after switching backward — the
+                        # forward "next" from the new current track is
+                        # often the very track just switched away from),
+                        # the device transiently reporting the old URI
+                        # looks identical to a genuine gapless transition
+                        # to it — wrongly reverting the just-completed
+                        # switch back to the old track (observed directly,
+                        # test1.log 2026-08-28: a swipe-back appeared to
+                        # play the new track, then the app "turned back" to
+                        # the old one a few seconds later).
+                        if (
+                            armed
+                            and self._current_track_confirmed
+                            and current_uri == self._next_track_proxy_url
+                        ):
                             logger.info(
                                 f"[{self.name}] Gapless: transition detected — device moved "
                                 "to next track"
@@ -1031,6 +1086,10 @@ class DLNABackend(AudioBackend):
                                 self._duration_ms = self._next_track_metadata.duration_ms
                             self._position_ms = 0
                             self._playback_started_at = time.monotonic()
+                            # This read is itself the confirmation for the
+                            # new current track — it's what current_uri
+                            # just matched.
+                            self._current_track_confirmed = True
                             # Clear gapless state — the armed entry is now
                             # the playing one, so don't remove it from the
                             # queue

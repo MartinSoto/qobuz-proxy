@@ -671,6 +671,7 @@ class TestPollStateLoop:
         backend._position_ms = 0
         backend._duration_ms = 0
         backend._playback_started_at = time.monotonic() - 3600  # well outside grace
+        backend._current_track_confirmed = True  # device already seen playing it
         backend._paused_stop_polls = 0
         backend._hijack_check_countdown = 0
         backend._external_takeover_notified = False
@@ -886,6 +887,73 @@ class TestPollStateLoop:
         backend.on_next_track_started(callback)
 
         await self._run_poll_cycles(backend)
+
+        callback.assert_called_once()
+        assert backend._current_proxy_url == "http://proxy/next.flac"
+        assert backend._next_track_proxy_url is None
+
+    async def test_gapless_transition_not_detected_before_current_track_confirmed(
+        self,
+    ) -> None:
+        """Regression (test1.log, 2026-08-28): right after an explicit
+        track switch, the device's own reported URI can transiently still
+        be the *previous* track's — Sonos hasn't necessarily flushed what
+        it was still physically outputting yet. If that previous track is
+        also the one just re-armed as gapless-next (the ordinary case
+        switching backward through a playlist — the forward "next" from
+        the new current track is often the very one just switched away
+        from), that transient reading must not be mistaken for a genuine
+        gapless transition to it — wrongly reverting the switch that was
+        just made (observed directly: a swipe-back appeared to work, then
+        the app "turned back" to the old track a few seconds later).
+
+        Gated on _current_track_confirmed (evidence the device has
+        actually been seen playing the current track) rather than a fixed
+        grace-period timer — a slower device (observed directly: far more
+        often on an older Play:3 than newer units) can take longer than
+        any fixed window to settle, so a timer alone isn't robust to it."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend._current_track_confirmed = False  # not yet seen playing it
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/next.flac")
+        callback = MagicMock()
+        backend.on_next_track_started(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_not_called()
+        assert backend._current_proxy_url == "http://proxy/track.flac"
+        assert backend._next_track_proxy_url == "http://proxy/next.flac"
+
+    async def test_gapless_transition_detected_once_current_track_confirmed(self) -> None:
+        """The flip side of the test above: once a poll has actually
+        observed the device playing the current track (even if that
+        happens well before any fixed grace period would have elapsed —
+        a fast device shouldn't have to wait out a timer sized for a slow
+        one either), a later genuine transition to the armed next track
+        must still be detected normally."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend._current_track_confirmed = False
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        uris = iter(
+            [
+                "http://proxy/track.flac",  # first read: confirms current
+                "http://proxy/next.flac",  # second read: genuine transition
+            ]
+        )
+        backend._get_current_transport_uri = AsyncMock(side_effect=lambda: next(uris))
+        callback = MagicMock()
+        backend.on_next_track_started(callback)
+
+        await self._run_poll_cycles(backend, cycles=2)
 
         callback.assert_called_once()
         assert backend._current_proxy_url == "http://proxy/next.flac"
