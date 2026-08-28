@@ -23,8 +23,9 @@ class TestHijackDetection:
         player, backend = _make_player()
         player._state = PlaybackState.PLAYING
 
+        await player.start()
         backend._notify_external_takeover()
-        await asyncio.sleep(0.05)  # let the scheduled handler task run
+        await player._command_queue.join()  # let the enqueued handler run
 
         assert player.state == PlaybackState.STOPPED
 
@@ -33,8 +34,9 @@ class TestHijackDetection:
         player._state = PlaybackState.PLAYING
         player._position_value_ms = 30_000
 
+        await player.start()
         backend._notify_external_takeover()
-        await asyncio.sleep(0.05)
+        await player._command_queue.join()
 
         assert player.current_position_ms == 0
 
@@ -49,8 +51,9 @@ class TestHijackDetection:
         callback = AsyncMock()
         player.set_hijack_detected_callback(callback)
 
+        await player.start()
         backend._notify_external_takeover()
-        await asyncio.sleep(0.05)
+        await player._command_queue.join()
 
         callback.assert_awaited_once_with("external takeover detected")
 
@@ -59,8 +62,9 @@ class TestHijackDetection:
         player._state = PlaybackState.PLAYING
         player.set_hijack_detected_callback(AsyncMock(side_effect=OSError("no connection")))
 
+        await player.start()
         backend._notify_external_takeover()
-        await asyncio.sleep(0.05)  # must not raise/crash
+        await player._command_queue.join()  # must not raise/crash
 
         assert player.state == PlaybackState.STOPPED
 
