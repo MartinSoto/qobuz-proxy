@@ -67,6 +67,31 @@ class TestSetStateHandling:
         assert current is not None
         assert current.track_id == "3003"
 
+    async def test_set_state_stores_queue_version(self) -> None:
+        """Regression (test1.log, 2026-08-28): the server's queueVersion
+        was never stored anywhere for a renderer session — it only ever
+        updated via SRVR_CTRL_QUEUE_STATE/QUEUE_TRACKS_LOADED, which the
+        server never sends to a renderer (see QueueHandler) — so every
+        outbound state report always echoed back 0.0 regardless of what
+        the server had just sent (observed directly: every SET_STATE
+        carried queueVersion, e.g. 4.1, every report we sent back claimed
+        0.0). QueueVersion's own docstring says it exists "for
+        synchronization" — a plausible reason a client-side sync check on
+        the app's end would hold back further navigation commands."""
+        from qobuz_proxy.playback.queue import QobuzQueue, QueueVersion
+
+        player, backend = _make_player()
+        queue = QobuzQueue()
+        handler = PlaybackCommandHandler(player, queue=queue)
+
+        msg = _set_state_msg(track_id=2001, queue_item_id=5)
+        msg.srvrRndrSetState.queueVersion.major = 4
+        msg.srvrRndrSetState.queueVersion.minor = 1
+
+        await handler._handle_set_state(msg)
+
+        assert await queue.get_version() == QueueVersion(major=4, minor=1)
+
     async def test_single_set_state_loads_and_plays(self) -> None:
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
