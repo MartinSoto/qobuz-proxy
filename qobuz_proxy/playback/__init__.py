@@ -13,7 +13,6 @@ from .queue import (
     QueueVersion,
     RepeatMode,
 )
-from .queue_handler import QueueHandler
 from .player import QobuzPlayer
 from .command_handler import PlaybackCommandHandler
 from .volume_handler import VolumeCommandHandler
@@ -27,7 +26,6 @@ __all__ = [
     "TrackMetadata",
     # Queue
     "QobuzQueue",
-    "QueueHandler",
     "QueueState",
     "QueueTrack",
     "QueueVersion",

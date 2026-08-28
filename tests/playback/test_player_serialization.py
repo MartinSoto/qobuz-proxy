@@ -79,9 +79,6 @@ def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:
     metadata.log_now_playing_info = MagicMock()
 
     queue = MagicMock()
-    queue.start = AsyncMock()
-    queue.stop = AsyncMock()
-    queue.set_current_by_item_id = AsyncMock(return_value=True)
     # Player routes track loading through queue.get_track_url/get_track_metadata
     # (see QobuzQueue's own implementation) rather than fetching directly —
     # mirror what metadata.get_streaming_url/get_metadata above provide.

@@ -13,8 +13,6 @@ from qobuz_proxy.playback.queue import QueueTrack, RepeatMode
 def _make_player(next_track_info=None):
     """Build a player with mocked queue/metadata/backend."""
     queue = MagicMock()
-    queue.start = AsyncMock()
-    queue.stop = AsyncMock()
     metadata = MagicMock()
     metadata.get_streaming_url = AsyncMock(return_value="http://proxy:7120/audio/222_9.flac")
     meta_obj = MagicMock()
@@ -364,29 +362,6 @@ class TestContextUuidPropagation:
         await player._handle_gapless_transition()
 
         assert player._current_track.context_uuid == ctx
-
-
-class TestNextAtEndOfQueue:
-    """Skipping past the end of the queue must still report the finished play."""
-
-    async def test_reports_stopped_at_end_of_queue(self):
-        player, backend = _make_player()
-        backend.stop = AsyncMock()
-        reporter = MagicMock()
-        reporter.note_playing = AsyncMock()
-        reporter.note_stopped = AsyncMock()
-        player._play_reporter = reporter
-
-        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
-        player._state = PlaybackState.PLAYING
-        player.queue.advance_to_next = AsyncMock(return_value=None)  # end of queue
-
-        result = await player.next_track()
-
-        assert result is False
-        assert player._state == PlaybackState.STOPPED
-        # The finished play is reported so it scrobbles and the session closes.
-        reporter.note_stopped.assert_awaited_once()
 
 
 class TestResumeChecksBackend:

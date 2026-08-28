@@ -64,7 +64,6 @@ class TestSpeakerConstruction:
         assert speaker._backend is None
         assert speaker._proxy_server is None
         assert speaker._state_reporter is None
-        assert speaker._queue_handler is None
         assert speaker._playback_handler is None
         assert speaker._volume_handler is None
 

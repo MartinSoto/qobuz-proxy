@@ -33,7 +33,6 @@ from qobuz_proxy.playback import (
     PlaybackCommandHandler,
     QobuzPlayer,
     QobuzQueue,
-    QueueHandler,
     StateReporter,
     VolumeCommandHandler,
 )
@@ -99,7 +98,6 @@ class Speaker:
         self._state_reporter: Optional[StateReporter] = None
 
         # Command handlers
-        self._queue_handler: Optional[QueueHandler] = None
         self._playback_handler: Optional[PlaybackCommandHandler] = None
         self._volume_handler: Optional[VolumeCommandHandler] = None
 
@@ -541,7 +539,6 @@ class Speaker:
                 self._ws_manager.set_max_audio_quality(self._effective_quality)
 
                 # Create handlers
-                self._queue_handler = QueueHandler(self._queue)
                 self._playback_handler = PlaybackCommandHandler(
                     self._player,
                     on_quality_change=self._on_quality_change,
@@ -581,17 +578,8 @@ class Speaker:
                 # into a closure that might run later, a local variable's
                 # does.
                 player = self._player
-                queue_handler = self._queue_handler
                 playback_handler = self._playback_handler
                 volume_handler = self._volume_handler
-
-                for msg_type in queue_handler.get_message_types():
-                    self._ws_manager.register_handler(
-                        msg_type,
-                        lambda mt, msg: player.enqueue(
-                            functools.partial(queue_handler.handle_message, mt, msg)
-                        ),
-                    )
 
                 for msg_type in playback_handler.get_message_types():
                     self._ws_manager.register_handler(
