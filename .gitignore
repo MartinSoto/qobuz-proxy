@@ -64,3 +64,6 @@ config.yaml
 
 # Logs
 *.log
+
+# Local-only notes (deliberately never committed — see git history 2026-08-28)
+/docs/playback-concurrency.md
