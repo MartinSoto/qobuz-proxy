@@ -34,6 +34,9 @@ class QueueHandler:
 
     async def handle_message(self, msg_type: int, message: Any) -> None:
         """Handle a queue-related message."""
+        # TEMP: dump the raw message as-is, no interpretation — remove once
+        # the next/previous investigation is done.
+        logger.info(f"TEMP raw message (type {msg_type}): {message}")
         try:
             if msg_type == QConnectMessageType.SRVR_CTRL_QUEUE_STATE:
                 await self._handle_queue_state(message)
