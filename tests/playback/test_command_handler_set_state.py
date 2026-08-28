@@ -194,3 +194,36 @@ class TestNoTrackSentinel:
         await handler._handle_set_state(sentinel_next)
 
         assert handler.get_next_track_info() is None
+
+    async def test_next_queue_item_absent_from_message_does_not_clear_stored_next_track(
+        self,
+    ) -> None:
+        """Regression (test1.log, 2026-08-28): only the explicit sentinel
+        means "no next track" (see test above) — a SET_STATE that's just a
+        position/state update (a seek, a restart-current-track tap) can
+        legitimately omit nextQueueItem without meaning that. Treating
+        plain field-absence as an implicit clear tore down a still-valid
+        gapless arm on every such message, forcing a needless remove-then-
+        re-add of the armed track on the device (observed directly:
+        "Gapless: armed next track" logged again for the exact same track
+        a few seconds later, with nothing between but an intervening seek)."""
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        on_changed = AsyncMock()
+        handler.set_on_next_track_changed(on_changed)
+
+        real_next = _set_state_msg(track_id=1001, queue_item_id=1)
+        real_next.srvrRndrSetState.nextQueueItem.queueItemId = 2
+        real_next.srvrRndrSetState.nextQueueItem.trackId = 1002
+        await handler._handle_set_state(real_next)
+        assert handler.get_next_track_info() is not None
+        on_changed.reset_mock()  # only care about the seek-only message below
+
+        # A follow-up SET_STATE (e.g. a seek/restart) that just doesn't
+        # mention nextQueueItem at all — not the explicit sentinel.
+        seek_only = _set_state_msg(track_id=1001, queue_item_id=1, position_ms=0)
+        await handler._handle_set_state(seek_only)
+
+        assert handler.get_next_track_info() is not None
+        assert handler.get_next_track_info()["trackId"] == "1002"
+        on_changed.assert_not_awaited()

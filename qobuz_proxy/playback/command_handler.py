@@ -139,44 +139,63 @@ class PlaybackCommandHandler:
         elif state.HasField("currentQueueItem"):
             logger.debug("SET_STATE: currentQueueItem is the server's no-track sentinel")
 
-        # Extract and store next queue item for auto-advance
+        # Extract and store next queue item for auto-advance. The server
+        # signals "no next track" with the explicit all-bits-set sentinel
+        # (_is_no_track_sentinel) — exactly like it does for currentQueueItem
+        # above — not by omitting the field. Previously, simply omitting
+        # nextQueueItem was *also* treated as "clear it", but a SET_STATE
+        # that's only a position/state update (a seek, a restart-current-
+        # track tap) can legitimately leave it out without meaning "there's
+        # no next track any more" — that reading tore down a still-valid
+        # gapless arm on every such message, forcing a needless remove-then-
+        # re-add of the armed track on the device each time (observed
+        # directly: "Gapless: armed next track" logged again for the exact
+        # same track a few seconds later, with nothing between but an
+        # intervening seek). Sonos's queue is fragile to this kind of churn
+        # (see sonos-retarget-gapless-desync) — a real "no next track" still
+        # clears via the sentinel branch below; a message that simply didn't
+        # mention it leaves whatever's already stored alone.
         next_track_changed = False
-        if state.HasField("nextQueueItem") and not _is_no_track_sentinel(state.nextQueueItem):
-            next_item = state.nextQueueItem
-            old_queue_item_id = (
-                self._next_track_info.get("queueItemId") if self._next_track_info else None
-            )
-            old_context_uuid = (
-                self._next_track_info.get("contextUuid") if self._next_track_info else None
-            )
-            new_context_uuid = next_item.contextUuid if next_item.contextUuid else None
-            # Preserve a previously-known context if the server resends the same
-            # next item without the optional contextUuid, so we don't lose it for
-            # the next play (mirrors the current-track behaviour).
-            if new_context_uuid is None and next_item.queueItemId == old_queue_item_id:
-                new_context_uuid = old_context_uuid
-            new_next_info = {
-                "queueItemId": next_item.queueItemId,
-                "trackId": str(next_item.trackId),
-                "contextUuid": new_context_uuid,
-            }
-            # Detect change by queueItemId (handles same track at different
-            # positions) or by a changed/late-arriving context UUID, which the
-            # gapless arm must pick up so the next play reports the right context.
-            if (
-                new_next_info["queueItemId"] != old_queue_item_id
-                or new_next_info["contextUuid"] != old_context_uuid
-            ):
-                next_track_changed = True
-            self._next_track_info = new_next_info
-            logger.debug(
-                f"Next track stored: queueItemId={next_item.queueItemId}, trackId={next_item.trackId}"
-            )
-        elif self._next_track_info is not None:
-            # nextQueueItem disappeared — clear and notify
-            self._next_track_info = None
-            next_track_changed = True
-            logger.debug("Next track cleared (nextQueueItem not present in SET_STATE)")
+        if state.HasField("nextQueueItem"):
+            if _is_no_track_sentinel(state.nextQueueItem):
+                if self._next_track_info is not None:
+                    self._next_track_info = None
+                    next_track_changed = True
+                    logger.debug("Next track cleared (server sent no-track sentinel)")
+            else:
+                next_item = state.nextQueueItem
+                old_queue_item_id = (
+                    self._next_track_info.get("queueItemId") if self._next_track_info else None
+                )
+                old_context_uuid = (
+                    self._next_track_info.get("contextUuid") if self._next_track_info else None
+                )
+                new_context_uuid = next_item.contextUuid if next_item.contextUuid else None
+                # Preserve a previously-known context if the server resends the same
+                # next item without the optional contextUuid, so we don't lose it for
+                # the next play (mirrors the current-track behaviour).
+                if new_context_uuid is None and next_item.queueItemId == old_queue_item_id:
+                    new_context_uuid = old_context_uuid
+                new_next_info = {
+                    "queueItemId": next_item.queueItemId,
+                    "trackId": str(next_item.trackId),
+                    "contextUuid": new_context_uuid,
+                }
+                # Detect change by queueItemId (handles same track at different
+                # positions) or by a changed/late-arriving context UUID, which the
+                # gapless arm must pick up so the next play reports the right context.
+                if (
+                    new_next_info["queueItemId"] != old_queue_item_id
+                    or new_next_info["contextUuid"] != old_context_uuid
+                ):
+                    next_track_changed = True
+                self._next_track_info = new_next_info
+                logger.debug(
+                    f"Next track stored: queueItemId={next_item.queueItemId}, "
+                    f"trackId={next_item.trackId}"
+                )
+        # else: nextQueueItem simply absent from this message — no signal
+        # either way (see above); leave whatever's already stored as-is.
 
         # Keep the queue's current index in sync with the item the app shows.
         # Without this, queue-based fallbacks (auto-advance at track end,
