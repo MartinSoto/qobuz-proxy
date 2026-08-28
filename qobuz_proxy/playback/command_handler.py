@@ -7,6 +7,8 @@ Processes playback commands from the Qobuz app via WsManager.
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
+from .queue import QueueVersion
+
 if TYPE_CHECKING:
     from .player import QobuzPlayer
     from .queue import QobuzQueue
@@ -203,6 +205,24 @@ class PlaybackCommandHandler:
         # track instead of advancing.
         if current_queue_item_id is not None:
             await self.queue.set_current_by_item_id(current_queue_item_id)
+
+        # Store the server's queue version so our own state reports echo it
+        # back — this was never done for a renderer session (queue.py's
+        # version only otherwise updates via SRVR_CTRL_QUEUE_STATE/
+        # QUEUE_TRACKS_LOADED, which the server never sends to a renderer;
+        # see QueueHandler), so every outbound report always claimed queue
+        # version 0.0 regardless of what the server had just told us
+        # (observed directly, test1.log 2026-08-28: every message from the
+        # app carried queueVersion, e.g. 4.1, while every one of our own
+        # reports echoed 0.0 back). Worth fixing on its own — the version
+        # exists specifically "for synchronization" (see QueueVersion) — and
+        # is a plausible reason a client-side sync check on the app's end
+        # would hold back further navigation commands, matching what's been
+        # observed (bare playingState pings instead of a real track change).
+        if state.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=state.queueVersion.major, minor=state.queueVersion.minor)
+            )
 
         # Apply the desired remote state as a single atomic unit. A SET_STATE is
         # a multi-step intent (load this track, seek here, then play/pause/stop)
