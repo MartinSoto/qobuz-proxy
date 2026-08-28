@@ -1649,10 +1649,22 @@ class QobuzPlayer:
         await self._start_playback()
 
     def _on_playback_error(self, message: str) -> None:
-        """Callback when backend reports playback error."""
+        """Callback when backend reports playback error.
+
+        Enqueued rather than a bare task (see enqueue()) — this used to
+        mutate self._state directly from the backend's own poll-loop
+        callback and spawn an unawaited task for the rest, both of which
+        could run concurrently with whatever command-queue item was
+        already in flight. Routing the whole effect through the queue
+        makes Player's command consumer the only thing that ever mutates
+        this state, same as every other backend notification."""
         logger.error(f"Playback error: {message}")
+        self.enqueue(functools.partial(self._handle_playback_error, message))
+
+    async def _handle_playback_error(self, message: str) -> None:
+        """Apply a playback error reported by the backend — see _on_playback_error."""
         self._state = PlaybackState.ERROR
-        asyncio.create_task(self._send_state_update())
+        await self._send_state_update()
 
     def _on_position_update(self, position_ms: int) -> None:
         """Callback when backend reports position update.
@@ -1891,10 +1903,27 @@ class QobuzPlayer:
         `self._state`, sends the update, reports the play/pause/stop) —
         nothing to do here for that case, so it's skipped via
         `_processing_command` (True for as long as the consumer is
-        running that item). This handles only the unprompted one.
+        running that item, which this synchronous check must still catch
+        at the instant the backend call returns control to it — see that
+        field's own docstring). Everything else — including the guard
+        checks below, re-evaluated against *live* state rather than a
+        snapshot taken here — is enqueued (see enqueue()) rather than a
+        bare task, so it can never run concurrently with whatever the
+        command consumer is doing: this used to mutate self._state
+        directly from the backend's own poll-loop callback and spawn an
+        unawaited task for the rest, either of which could interleave
+        with an in-flight command-queue item.
         """
         if self._processing_command:
             return
+        self.enqueue(functools.partial(self._handle_unprompted_state_change, state))
+
+    async def _handle_unprompted_state_change(self, state: PlaybackState) -> None:
+        """Side effects for a state change the backend noticed on its own —
+        see _on_state_change. Re-checks the guard conditions against live
+        state rather than trusting what was true when the callback fired —
+        by the time this item's turn comes up, an intervening command may
+        already have changed self._state."""
         if state == self._state:
             return
         if self._state == PlaybackState.PLAYING and state == PlaybackState.STOPPED:
@@ -1906,11 +1935,6 @@ class QobuzPlayer:
             f"[{self.backend.name}] Unprompted backend state change: {self._state} -> {state}"
         )
         self._state = state
-        asyncio.create_task(self._handle_unprompted_state_change(state))
-
-    async def _handle_unprompted_state_change(self, state: PlaybackState) -> None:
-        """Side effects for a state change the backend noticed on its own —
-        see _on_state_change."""
         if state == PlaybackState.PAUSED:
             # See _intended_playing — the device paused itself, so a later
             # swipe's auto-continue must not try to resume through it.
@@ -1935,8 +1959,8 @@ class QobuzPlayer:
             # Recovering from an unprompted PAUSED/STOPPED that turned out
             # to be transient — e.g. a device-state misread while Sonos
             # settles after a retarget (see PLAYBACK_START_GRACE_PERIOD_
-            # SECONDS) that self-corrects on a later poll. self._state
-            # already flipped back silently in _on_state_change, and
+            # SECONDS) that self-corrects on a later poll. self._state was
+            # already flipped back a few lines up in this same method, and
             # _position_value_ms/_timestamp_ms already got a fresh reading
             # this same poll cycle before this task even runs (see
             # DLNABackend._poll_state_loop: the position notify always
@@ -1957,9 +1981,10 @@ class QobuzPlayer:
     def _on_external_takeover(self) -> None:
         """Callback when the backend detects another source now driving
         this renderer instead of us (see
-        AudioBackend.is_playing_our_content())."""
+        AudioBackend.is_playing_our_content()). Enqueued rather than a
+        bare task (see enqueue()) — see _on_playback_error for why."""
         logger.debug("External takeover callback")
-        asyncio.create_task(self._handle_external_takeover())
+        self.enqueue(self._handle_external_takeover)
 
     async def _handle_external_takeover(self) -> None:
         logger.info(

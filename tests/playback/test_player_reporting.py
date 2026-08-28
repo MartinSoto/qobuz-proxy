@@ -4,7 +4,6 @@ Wires a real PlayReporter (over a mocked API client) into the player and checks
 that play/pause/stop/track-end/track-switch produce the right report calls.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from qobuz_proxy.backends import BackendTrackMetadata, PlaybackState
@@ -66,6 +65,10 @@ def _make_player_with_reporter():
     # get_metadata above.
     queue.get_track_url = MagicMock(side_effect=lambda track: _coro(f"http://t/{track.track_id}"))
     queue.get_track_metadata = MagicMock(side_effect=lambda track: _coro(None))
+    # Only needed by tests that call player.start() to run the command
+    # queue's consumer (see TestPlayerReporting's unprompted-change tests) —
+    # a plain MagicMock() attribute isn't awaitable on its own.
+    queue.start = AsyncMock()
     player = QobuzPlayer(
         queue=queue, metadata_service=metadata, backend=backend, play_reporter=reporter
     )
@@ -142,8 +145,9 @@ class TestPlayerReporting:
         await player.play_track(queue_item_id=1, track_id="100")
 
         # The renderer reports it paused on its own.
+        await player.start()
         player.backend._notify_state_change(PlaybackState.PAUSED)
-        await asyncio.sleep(0.05)  # let the scheduled handler task run
+        await player._command_queue.join()  # let the enqueued handler run
 
         assert player.state == PlaybackState.PAUSED
         api.report_streaming_end.assert_not_awaited()
@@ -162,12 +166,13 @@ class TestPlayerReporting:
         player, api = _make_player_with_reporter()
         await player.play_track(queue_item_id=1, track_id="100")
 
+        await player.start()
         player.backend._notify_state_change(PlaybackState.PAUSED)
-        await asyncio.sleep(0.05)
+        await player._command_queue.join()
         assert player._play_reporter._active.segment_started_ms is None  # clock stopped
 
         player.backend._notify_state_change(PlaybackState.PLAYING)
-        await asyncio.sleep(0.05)
+        await player._command_queue.join()
 
         assert player.state == PlaybackState.PLAYING
         assert player._play_reporter._active is not None
@@ -180,12 +185,13 @@ class TestPlayerReporting:
         reporter.report_now = AsyncMock()
         player._state_reporter = reporter
 
+        await player.start()
         player.backend._notify_state_change(PlaybackState.PAUSED)
-        await asyncio.sleep(0.05)
+        await player._command_queue.join()
         reporter.report_now.reset_mock()  # only care about the recovery below
 
         player.backend._notify_state_change(PlaybackState.PLAYING)
-        await asyncio.sleep(0.05)
+        await player._command_queue.join()
 
         reporter.report_now.assert_awaited_once()
 
@@ -314,8 +320,9 @@ class TestPlayerReporting:
         # notification below is a real transition, the way it would be
         # coming from an actual renderer that really was PAUSED.
         player.backend._state = PlaybackState.PAUSED
+        await player.start()
         player.backend._notify_state_change(PlaybackState.STOPPED)
-        await asyncio.sleep(0.05)  # let the scheduled handler task run
+        await player._command_queue.join()  # let the enqueued handler run
 
         assert player.state == PlaybackState.STOPPED
         api.report_streaming_end.assert_awaited_once()
