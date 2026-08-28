@@ -64,6 +64,39 @@ class TestQueueItemIdGuard:
         assert report.current_queue_item_id == 0
 
 
+class TestSnapshotBeforeAwait:
+    """_build_state_report() must read every Player field before either of
+    its own awaits (queue.get_state()/backend.get_buffer_status()) —
+    otherwise a command completing in that gap could hand back a report
+    that's a torn mix of before/after values. See
+    docs/playback-concurrency.md, "Suggested order of work" step 3."""
+
+    async def test_position_and_state_reflect_the_snapshot_taken_before_the_queue_await(
+        self,
+    ) -> None:
+        reporter, _ = _make_reporter(state=PlaybackState.PLAYING)
+        reporter._player._position_value_ms = 1_000
+
+        async def _mutate_player_mid_await() -> MagicMock:
+            # Simulates a command-queue item completing while this await is
+            # in flight (e.g. an explicit stop landing between the report
+            # starting to build and it actually being sent) — must not
+            # affect a report whose fields were already snapshotted.
+            reporter._player._position_value_ms = 99_999
+            reporter._player.state = PlaybackState.STOPPED
+            queue_state = MagicMock()
+            queue_state.version.major = 1
+            queue_state.version.minor = 0
+            return queue_state
+
+        reporter._queue.get_state = _mutate_player_mid_await
+
+        report = await reporter._build_state_report()
+
+        assert report.playing_state == PlaybackState.PLAYING
+        assert report.position_value_ms == 1_000
+
+
 class TestHeartbeatWatchdog:
     """_heartbeat_loop is a watchdog on top of report_now(), not the
     primary relay mechanism — see the module docstring."""

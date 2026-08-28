@@ -220,12 +220,38 @@ class StateReporter:
             logger.error(f"Failed to send state update: {e}", exc_info=True)
 
     async def _build_state_report(self) -> PlaybackStateReport:
-        """Build current state report."""
-        # Get queue state
-        queue_state = await self._queue.get_state()
+        """Build current state report.
 
-        # Get current track info
+        Every field read directly off Player is snapshotted up front, in
+        one uninterrupted stretch, before either await below —
+        queue.get_state() takes a real lock and backend.get_buffer_status()
+        is free to do real I/O for a given backend, so each is a genuine
+        point where a command-queue item could run and change Player's
+        state in between. Reading Player first and awaiting after (rather
+        than interleaved, as this used to) means there's no gap for a
+        report to end up a torn mix of before/after values.
+        """
+        # Snapshot Player state synchronously — nothing here awaits.
+        state = self._player.state
         current_track = self._player.current_track
+        duration_ms = self._player.duration_ms
+        now_ms = int(time.time() * 1000)
+        if state == PlaybackState.PLAYING:
+            # Timestamp-based position while playing.
+            position_timestamp = self._player._position_timestamp_ms
+            position_value = self._player._position_value_ms
+            logger.debug(
+                f"Building report (PLAYING): player._position_value_ms={position_value}, "
+                f"player._position_timestamp_ms={position_timestamp}"
+            )
+        else:
+            # Paused/stopped: freeze position at its last known value.
+            position_timestamp = now_ms
+            position_value = self._player.current_position_ms
+            logger.debug(
+                f"Building report ({state.name}): player.current_position_ms={position_value}"
+            )
+
         queue_item_id = current_track.queue_item_id if current_track else 0
         # Defense in depth: the outgoing field is a signed int32. A bad
         # upstream value here (e.g. a not-yet-recognized server sentinel)
@@ -235,36 +261,17 @@ class StateReporter:
             logger.warning(f"Ignoring out-of-range queue_item_id={queue_item_id}; reporting 0")
             queue_item_id = 0
 
-        # Get position with current timestamp
-        now_ms = int(time.time() * 1000)
-
-        # For playing state, use timestamp-based position
-        # For paused/stopped, use last known position
-        if self._player.state == PlaybackState.PLAYING:
-            position_timestamp = self._player._position_timestamp_ms
-            position_value = self._player._position_value_ms
-            logger.debug(
-                f"Building report (PLAYING): player._position_value_ms={position_value}, "
-                f"player._position_timestamp_ms={position_timestamp}"
-            )
-        else:
-            # When paused/stopped, freeze position at current value
-            position_timestamp = now_ms
-            position_value = self._player.current_position_ms
-            logger.debug(
-                f"Building report ({self._player.state.name}): "
-                f"player.current_position_ms={position_value}"
-            )
-
-        # Get buffer status from backend
+        # Everything below this point can genuinely yield to the event
+        # loop — nothing above reads Player again after this.
+        queue_state = await self._queue.get_state()
         buffer_status = await self._player.backend.get_buffer_status()
 
         return PlaybackStateReport(
-            playing_state=self._player.state,
+            playing_state=state,
             buffer_state=buffer_status,
             position_timestamp_ms=position_timestamp,
             position_value_ms=position_value,
-            duration_ms=self._player.duration_ms,
+            duration_ms=duration_ms,
             current_queue_item_id=queue_item_id,
             queue_version_major=queue_state.version.major,
             queue_version_minor=queue_state.version.minor,
