@@ -6,6 +6,7 @@ byte-exact-seekable WAV audio. See test_transcoding_reader.py for the
 underlying engine's own (lower-level) tests.
 """
 
+import asyncio
 import io
 import socket
 
@@ -14,10 +15,49 @@ import numpy as np
 import soundfile as sf
 import soxr
 from aiohttp import web
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
-from qobuz_proxy.backends.dlna.proxy_server import AudioProxyServer
+from qobuz_proxy.backends.dlna.proxy_server import AudioProxyServer, RegisteredTrack
 from qobuz_proxy.backends.dlna.transcoding_reader import WAV_HEADER_SIZE
+from qobuz_proxy.playback.stream_resolver import ResolvedStream
+
+FORMAT_ID = 27  # arbitrary — these tests register tracks directly, bypassing resolve_track
+
+
+def _stream(url: str, blob: str = "") -> ResolvedStream:
+    return ResolvedStream(
+        url=url,
+        blob=blob,
+        format_id=FORMAT_ID,
+        sample_rate=SOURCE_SAMPLE_RATE,
+        bit_depth=24,
+        fetched_at=0.0,
+    )
+
+
+def _resolver(url: str, blob: str = "") -> AsyncMock:
+    """A resolver mock that always answers with the same (track_id, format_id)
+    resolution, regardless of force — matches these tests' single-URL upstreams."""
+    resolver = AsyncMock()
+    resolver.resolve = AsyncMock(return_value=_stream(url, blob))
+    return resolver
+
+
+def _register_transcoded(
+    proxy: AudioProxyServer, track_id: str, proxy_key: str | None = None
+) -> None:
+    """Register a track directly for transcoding, bypassing resolve_track's
+    capability-driven decision tree — these tests only care about the
+    transcode-serving path, given a resolver that already knows how to
+    answer for FORMAT_ID."""
+    key = proxy_key or track_id
+    proxy._tracks[key] = RegisteredTrack(
+        track_id=track_id,
+        format_id=FORMAT_ID,
+        content_type="audio/wav",
+        transcode_to_sample_rate=TARGET_SAMPLE_RATE,
+    )
+
 
 SOURCE_SAMPLE_RATE = 96000
 TARGET_SAMPLE_RATE = 48000
@@ -63,12 +103,15 @@ class FakeCdnUpstream:
     """A stand-in Qobuz CDN: serves one fixed FLAC payload with Range
     support, and records every request it receives."""
 
-    def __init__(self, payload: bytes):
+    def __init__(self, payload: bytes, delay: float = 0.0):
         self._payload = payload
+        self._delay = delay  # artificial per-request latency, for concurrency tests
         self._runner: web.AppRunner | None = None
         self.requests: list[tuple[str, str | None]] = []  # (method, Range)
 
     async def _handle(self, request: web.Request) -> web.Response:
+        if self._delay:
+            await asyncio.sleep(self._delay)
         rng = request.headers.get("Range")
         self.requests.append((request.method, rng))
 
@@ -119,14 +162,12 @@ async def test_get_serves_correct_downsampled_wav_audio():
     upstream_url = await upstream.start()
     expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
 
-    provider = MagicMock()
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        proxy_url = proxy.register_track(
-            "42", upstream_url, "audio/flac", transcode_to_sample_rate=TARGET_SAMPLE_RATE
-        )
+        _register_transcoded(proxy, "42")
+        proxy_url = f"{proxy.base_url}/audio/42.wav"
         assert proxy_url.endswith(".wav")
 
         timeout = aiohttp.ClientTimeout(total=15)
@@ -146,6 +187,68 @@ async def test_get_serves_correct_downsampled_wav_audio():
         await upstream.stop()
 
 
+async def test_second_request_supersedes_the_first_without_the_server_raising(caplog):
+    """Regression: an earlier version of the same-track supersession fix
+    used Task.cancel() on the previous request and raced gen.close()
+    against a generator still genuinely executing on its worker thread —
+    asyncio.to_thread cancellation stops the *awaiting coroutine*, not the
+    underlying thread, so the generator wasn't done when close() ran,
+    raising ValueError("generator already executing") out of the aiohttp
+    request handler (observed directly, in production, immediately on
+    every seek). The cooperative fix (_claim_stream/_stream_superseded)
+    must let the first request's stream end cleanly — between its own
+    iterations, never mid-call — while the second completes normally, with
+    nothing raised on the server side either way.
+    """
+    import logging
+
+    flac_bytes, original = _make_test_flac()
+    # A small delay before each upstream response widens the window in
+    # which the first request is genuinely still inside a to_thread()
+    # decode/fetch call when the second one supersedes it.
+    upstream = FakeCdnUpstream(flac_bytes, delay=0.02)
+    upstream_url = await upstream.start()
+    expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
+
+    port = _free_port()
+    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
+    await proxy.start()
+    try:
+        _register_transcoded(proxy, "42")
+        proxy_url = f"{proxy.base_url}/audio/42.wav"
+
+        with caplog.at_level(logging.ERROR):
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                first = asyncio.ensure_future(session.get(proxy_url))
+                await asyncio.sleep(0.01)  # first request is now mid to_thread() decode
+
+                async with session.get(proxy_url) as second_resp:
+                    assert second_resp.status == 200
+                    second_body = await second_resp.read()
+
+                # The first request was superseded — its connection may end
+                # with a short body or a client-side error, both fine; the
+                # point is awaiting it must not hang, and (checked below via
+                # caplog) the server must never have raised handling it.
+                try:
+                    first_resp = await asyncio.wait_for(first, timeout=10)
+                    await first_resp.read()
+                    first_resp.close()
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+    finally:
+        await proxy.stop()
+        await upstream.stop()
+
+    assert "generator already executing" not in caplog.text
+    assert "Error handling request" not in caplog.text
+
+    decoded = _pcm24_bytes_to_float(second_body[WAV_HEADER_SIZE:], CHANNELS)
+    assert len(decoded) == len(expected)
+    np.testing.assert_allclose(decoded, expected, atol=2e-4)
+
+
 async def test_head_probe_reports_correct_content_length_without_full_download():
     flac_bytes, original = _make_test_flac()
     upstream = FakeCdnUpstream(flac_bytes)
@@ -153,14 +256,12 @@ async def test_head_probe_reports_correct_content_length_without_full_download()
     expected_target_frames = round(len(original) * TARGET_SAMPLE_RATE / SOURCE_SAMPLE_RATE)
     expected_content_length = WAV_HEADER_SIZE + expected_target_frames * CHANNELS * 3
 
-    provider = MagicMock()
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        proxy_url = proxy.register_track(
-            "42", upstream_url, "audio/flac", transcode_to_sample_rate=TARGET_SAMPLE_RATE
-        )
+        _register_transcoded(proxy, "42")
+        proxy_url = f"{proxy.base_url}/audio/42.wav"
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.head(proxy_url) as resp:
@@ -182,14 +283,12 @@ async def test_range_request_seeks_to_the_correct_audio():
     upstream_url = await upstream.start()
     expected_full = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
 
-    provider = MagicMock()
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        proxy_url = proxy.register_track(
-            "42", upstream_url, "audio/flac", transcode_to_sample_rate=TARGET_SAMPLE_RATE
-        )
+        _register_transcoded(proxy, "42")
+        proxy_url = f"{proxy.base_url}/audio/42.wav"
         total_target_frames = len(expected_full)
         target_frame = int(total_target_frames * 0.5)
         bytes_per_frame = CHANNELS * 3
@@ -228,6 +327,92 @@ async def test_range_request_seeks_to_the_correct_audio():
     assert total_fetched < len(flac_bytes) * 0.5
 
 
+async def test_misaligned_range_request_serves_exact_bytes_like_a_static_file():
+    """We're simulating a plain static file on disk, the same thing a
+    dumb NAS would serve — the renderer parses our WAV header once (it
+    always fetches from byte 0 first) and finds its own alignment from
+    there; the server's only job is to hand back the literal bytes that
+    exist at the requested offset, exactly as asked, never a rounded or
+    "corrected" position.
+
+    Confirmed directly against a real device: it computes seek byte
+    offsets on a fixed grid unrelated to our 24-bit frame size (so most
+    requests don't land on a true sample boundary), and it genuinely
+    expects Content-Range to echo back exactly the byte it requested — a
+    prior version of this fix that "helpfully" declared a different,
+    frame-aligned start instead made every one of those requests play
+    back as white noise, 100% consistently, while requests that already
+    happened to land on a frame boundary played clean. So: never declare
+    anything but the exact requested byte, and the response body must be
+    byte-for-byte identical to the same slice of the full file — proven
+    here by comparing a misaligned Range response directly against the
+    corresponding slice of an aligned one, the same invariant a real
+    static file server satisfies for free."""
+    flac_bytes, original = _make_test_flac()
+    upstream = FakeCdnUpstream(flac_bytes)
+    upstream_url = await upstream.start()
+    expected_full = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
+
+    port = _free_port()
+    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
+    await proxy.start()
+    try:
+        _register_transcoded(proxy, "42")
+        proxy_url = f"{proxy.base_url}/audio/42.wav"
+        bytes_per_frame = CHANNELS * 3  # 6 — so +1..+5 are all genuinely misaligned
+        target_frame = int(len(expected_full) * 0.5)
+        aligned_start_byte = WAV_HEADER_SIZE + target_frame * bytes_per_frame
+        requested_start_byte = aligned_start_byte + 2  # lands mid-sample, not on it
+        read_len = 4000 * bytes_per_frame
+
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Ground truth: a Range request that already lands exactly on
+            # a frame boundary, so nothing needs trimming.
+            async with session.get(
+                proxy_url, headers={"Range": f"bytes={aligned_start_byte}-"}
+            ) as aligned_resp:
+                assert aligned_resp.status == 206
+                assert aligned_resp.headers["Content-Range"].startswith(
+                    f"bytes {aligned_start_byte}-"
+                )
+                ground_truth = await aligned_resp.content.readexactly(read_len + 2)
+
+            async with session.get(
+                proxy_url, headers={"Range": f"bytes={requested_start_byte}-"}
+            ) as resp:
+                assert resp.status == 206
+                content_range = resp.headers["Content-Range"]
+                # Must echo back exactly the byte the renderer asked for —
+                # never a rounded/corrected one. That's the entire point.
+                assert content_range.startswith(f"bytes {requested_start_byte}-")
+                assert requested_start_byte != aligned_start_byte  # test is actually exercising it
+
+                declared_length = int(resp.headers["Content-Length"])
+                body = await resp.content.readexactly(read_len)
+    finally:
+        await proxy.stop()
+        await upstream.stop()
+
+    # The literal invariant a static file server satisfies: reading from
+    # byte N+2 gives exactly the same bytes as reading from byte N and
+    # skipping 2 — regardless of where N falls relative to any internal
+    # sample-frame boundary.
+    assert body == ground_truth[2 : 2 + read_len]
+
+    # And that ground-truth read is itself genuinely correct audio, not
+    # just internally self-consistent nonsense.
+    decoded = _pcm24_bytes_to_float(
+        ground_truth[: read_len - (read_len % bytes_per_frame)], CHANNELS
+    )
+    expected_slice = expected_full[target_frame : target_frame + len(decoded)]
+    settle = 200  # fresh-resample-run edge transient — see transcoding_reader.py
+    np.testing.assert_allclose(decoded[settle:], expected_slice[settle:], atol=5e-4)
+
+    total_content_length = WAV_HEADER_SIZE + len(expected_full) * bytes_per_frame
+    assert declared_length == total_content_length - requested_start_byte
+
+
 def _range_len(range_header: str, total: int) -> int:
     start_s, end_s = range_header.removeprefix("bytes=").split("-")
     start = int(start_s)
@@ -236,21 +421,18 @@ def _range_len(range_header: str, total: int) -> int:
 
 
 async def test_content_type_wav_route_registered_without_extension_too():
-    """register_track's returned URL always carries an explicit extension,
-    but the bare (no-extension) route must still resolve a transcoded
-    track correctly if ever hit directly."""
+    """The proxy URL always carries an explicit extension, but the bare
+    (no-extension) route must still resolve a transcoded track correctly
+    if ever hit directly."""
     flac_bytes, _original = _make_test_flac()
     upstream = FakeCdnUpstream(flac_bytes)
     upstream_url = await upstream.start()
 
-    provider = MagicMock()
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        proxy.register_track(
-            "42", upstream_url, "audio/flac", transcode_to_sample_rate=TARGET_SAMPLE_RATE
-        )
+        _register_transcoded(proxy, "42")
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.head(f"http://127.0.0.1:{port}/audio/42") as resp:
@@ -330,16 +512,18 @@ async def test_expired_url_is_refreshed_and_transcoding_still_succeeds():
     fresh_url = f"{base_url}?token=fresh"
     expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
 
-    provider = MagicMock()
-    provider.get_streaming_url = AsyncMock(return_value=fresh_url)
+    async def _resolve(track_id, format_id, force=False):
+        return _stream(fresh_url if force else stale_url)
+
+    resolver = AsyncMock()
+    resolver.resolve = AsyncMock(side_effect=_resolve)
 
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        proxy_url = proxy.register_track(
-            "42", stale_url, "audio/flac", transcode_to_sample_rate=TARGET_SAMPLE_RATE
-        )
+        _register_transcoded(proxy, "42")
+        proxy_url = f"{proxy.base_url}/audio/42.wav"
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(proxy_url) as resp:
@@ -353,13 +537,13 @@ async def test_expired_url_is_refreshed_and_transcoding_still_succeeds():
     decoded = _pcm24_bytes_to_float(body[WAV_HEADER_SIZE:], CHANNELS)
     assert len(decoded) == len(expected)
     np.testing.assert_allclose(decoded, expected, atol=2e-4)
-    provider.get_streaming_url.assert_awaited_with("42", force=True)
+    resolver.resolve.assert_awaited_with("42", FORMAT_ID, force=True)
 
 
 async def test_gapless_preloaded_track_gets_the_same_url_refresh_protection():
-    """A gapless-armed track (DLNABackend.set_next_track) is registered via
-    the exact same register_track()/proxy_key="{track_id}_{queue_item_id}"
-    path as any other track, and served through the same _handle_audio ->
+    """A gapless-armed track (DLNABackend.set_next_track) is registered
+    under a composite proxy_key="{track_id}_{queue_item_id}" like any
+    other track, and served through the same _handle_audio ->
     _transcode_stream dispatch — there's no separate code path for it, so
     it gets no less (and no more) URL-refresh protection. Worth proving
     directly rather than just asserting it: a gapless-armed track is often
@@ -374,23 +558,20 @@ async def test_gapless_preloaded_track_gets_the_same_url_refresh_protection():
     fresh_url = f"{base_url}?token=fresh"
     expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
 
-    provider = MagicMock()
-    provider.get_streaming_url = AsyncMock(return_value=fresh_url)
+    async def _resolve(track_id, format_id, force=False):
+        return _stream(fresh_url if force else stale_url)
+
+    resolver = AsyncMock()
+    resolver.resolve = AsyncMock(side_effect=_resolve)
 
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
     await proxy.start()
     try:
         # Mirrors DLNABackend.set_next_track's registration exactly:
         # proxy_key = f"{track_id}_{queue_item_id}".
-        proxy_url = proxy.register_track(
-            "42",
-            stale_url,
-            "audio/flac",
-            proxy_key="42_7",
-            transcode_to_sample_rate=TARGET_SAMPLE_RATE,
-        )
-        assert "42_7" in proxy_url
+        _register_transcoded(proxy, "42", proxy_key="42_7")
+        proxy_url = f"{proxy.base_url}/audio/42_7.wav"
 
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -406,56 +587,5 @@ async def test_gapless_preloaded_track_gets_the_same_url_refresh_protection():
     assert len(decoded) == len(expected)
     np.testing.assert_allclose(decoded, expected, atol=2e-4)
     # Refreshed by the *track_id*, not the composite proxy key — matches
-    # what the url_provider actually indexes tracks by.
-    provider.get_streaming_url.assert_awaited_with("42", force=True)
-
-
-async def test_a_track_armed_long_before_being_requested_is_proactively_refreshed():
-    """The likelier real-world way a gapless-armed track hits an expired
-    URL: it can sit registered for however long the *current* track still
-    has left to play, not just outlive a TTL mid-stream. _handle_audio's
-    freshness check (is_url_expired) runs before dispatch, for every
-    track regardless of transcode vs pass-through or how it was
-    registered — so this is pre-existing protection, not something new
-    this session, but worth confirming it actually reaches the transcode
-    path too."""
-    flac_bytes, original = _make_test_flac()
-    upstream = ExpiringFlacUpstream(flac_bytes)
-    base_url = await upstream.start()
-    fresh_url = f"{base_url}?token=fresh"
-    expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
-
-    provider = MagicMock()
-    provider.get_streaming_url = AsyncMock(return_value=fresh_url)
-
-    port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
-    await proxy.start()
-    try:
-        proxy_url = proxy.register_track(
-            "42",
-            f"{base_url}?token=stale",
-            "audio/flac",
-            proxy_key="42_7",
-            transcode_to_sample_rate=TARGET_SAMPLE_RATE,
-        )
-        # Simulate the gap: armed a while ago, current track still has
-        # most of its runtime left — well past the proxy's staleness
-        # threshold by the time it's actually requested.
-        proxy._tracks["42_7"].url_fetched_at -= 600
-
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(proxy_url) as resp:
-                assert resp.status == 200
-                body = await resp.read()
-    finally:
-        await proxy.stop()
-        await upstream.stop()
-
-    # Refreshed *before* ever touching the stale URL — the stale token
-    # must never have reached the upstream at all.
-    assert upstream.rejected == 0
-    decoded = _pcm24_bytes_to_float(body[WAV_HEADER_SIZE:], CHANNELS)
-    assert len(decoded) == len(expected)
-    np.testing.assert_allclose(decoded, expected, atol=2e-4)
+    # what the resolver actually indexes tracks by.
+    resolver.resolve.assert_awaited_with("42", FORMAT_ID, force=True)

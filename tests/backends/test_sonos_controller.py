@@ -14,6 +14,7 @@ def _make_controller() -> SonosController:
         app_id="test-app-id",
         webui_http_port=8689,
         event_subscriber=MagicMock(),
+        stream_resolver=MagicMock(),
     )
 
 

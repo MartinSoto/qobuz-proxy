@@ -40,7 +40,8 @@ from qobuz_proxy.playback.command_handler import MSG_TYPE_SET_STATE
 from qobuz_proxy.backends import AudioBackend, BackendFactory, PlaybackState
 from qobuz_proxy.playback.play_reporter import PlayReporter
 from qobuz_proxy.playback.state_reporter import PlaybackStateReport
-from qobuz_proxy.backends.dlna import AudioProxyServer, DLNABackend, MetadataServiceURLProvider
+from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
+from qobuz_proxy.backends.dlna import AudioProxyServer, DLNABackend
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class Speaker:
         config: SpeakerConfig,
         api_client: QobuzAPIClient,
         app_id: str,
+        stream_resolver: QobuzStreamResolver,
         web_app: Optional[web.Application] = None,
     ) -> None:
         """
@@ -68,11 +70,15 @@ class Speaker:
             config: Per-speaker configuration
             api_client: Authenticated Qobuz API client (shared across speakers)
             app_id: Qobuz application ID (shared across speakers)
+            stream_resolver: Shared QobuzStreamResolver (one instance
+                app-wide — see its own docstring for why) that owns actual
+                Qobuz CDN URL fetching for every speaker's backend.
             web_app: Optional shared aiohttp Application for discovery routes
         """
         self._config = config
         self._api_client = api_client
         self._app_id = app_id
+        self._stream_resolver = stream_resolver
         self._web_app = web_app
 
         self._is_running: bool = False
@@ -402,19 +408,15 @@ class Speaker:
                 self._quality_source = "auto"
                 logger.info(f"[{self.name}] Local backend, using max quality: Hi-Res (24/192)")
 
-        # Create metadata service
+        # Create metadata service (display metadata only — see MetadataService)
         logger.debug(f"[{self.name}] Creating metadata service...")
-        self._metadata_service = MetadataService(
-            api_client=self._api_client,
-            max_quality=self._effective_quality,
-        )
+        self._metadata_service = MetadataService(api_client=self._api_client)
 
         # Create and start audio proxy server (DLNA only)
         if isinstance(backend, DLNABackend):
             logger.debug(f"[{self.name}] Starting audio proxy server...")
-            url_provider = MetadataServiceURLProvider(self._metadata_service)
             self._proxy_server = AudioProxyServer(
-                url_provider=url_provider,
+                resolver=self._stream_resolver,
                 host=self._config.bind_address,
                 port=self._config.proxy_port,
             )
@@ -424,6 +426,35 @@ class Speaker:
                 f"{self._config.bind_address}:{self._config.proxy_port}"
             )
             backend.set_proxy_server(self._proxy_server)
+        else:
+            # Local backend — no proxy needed, but still needs the shared
+            # resolver to fetch its own Qobuz CDN URLs. Imported locally:
+            # the local backend's deps (sounddevice/numpy) are optional,
+            # same reason backends/__init__.py imports it inside a
+            # try/except rather than at module level.
+            try:
+                from qobuz_proxy.backends.local import LocalAudioBackend
+
+                if isinstance(backend, LocalAudioBackend):
+                    backend.set_stream_resolver(self._stream_resolver)
+            except ImportError:
+                pass
+
+        # Apply the quality decision: config's max_quality (or a live
+        # app-driven change, see _on_quality_change) forces a specific tier;
+        # AUTO on a DLNA backend whose capabilities were actually detected
+        # instead leaves it None, so resolve_track decides dynamically,
+        # per track, from those capabilities (see AudioProxyServer.
+        # resolve_track) rather than a single quality fixed for the whole
+        # session. _effective_quality itself is unchanged below — still the
+        # value shown in status/sent as the device's advertised ceiling.
+        if self._config.max_quality != AUTO_QUALITY:
+            quality_override: Optional[int] = self._effective_quality
+        elif isinstance(backend, DLNABackend) and backend.get_capabilities() is not None:
+            quality_override = None
+        else:
+            quality_override = self._effective_quality
+        backend.set_quality_override(quality_override)
 
         # Create queue and player
         logger.debug(f"[{self.name}] Creating queue and player...")
@@ -654,9 +685,10 @@ class Speaker:
 
         logger.info(f"[{self.name}] Quality changed: {self._effective_quality} -> {new_quality}")
         self._effective_quality = new_quality
+        self._quality_source = "manual"
 
-        if self._metadata_service:
-            self._metadata_service.set_max_quality(new_quality)
+        if self._backend:
+            self._backend.set_quality_override(new_quality)
 
         if self._player:
             await self._player.reload_current_track()

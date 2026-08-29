@@ -23,6 +23,7 @@ from .types import (
     BackendTrackMetadata,
     BufferStatus,
     PlaybackState,
+    PlayResult,
 )
 from .dlna import (
     DLNABackend,
@@ -31,8 +32,7 @@ from .dlna import (
     DLNADeviceInfo,
     AudioProxyServer,
     RegisteredTrack,
-    StreamingURLProvider,
-    MetadataServiceURLProvider,
+    ResolvedTrack,
 )
 
 try:
@@ -46,6 +46,7 @@ __all__ = [
     "BackendTrackMetadata",
     "BufferStatus",
     "PlaybackState",
+    "PlayResult",
     # Base class
     "AudioBackend",
     # Callback types
@@ -67,8 +68,7 @@ __all__ = [
     # Audio proxy
     "AudioProxyServer",
     "RegisteredTrack",
-    "StreamingURLProvider",
-    "MetadataServiceURLProvider",
+    "ResolvedTrack",
     # Local backend
     "LocalAudioBackend",
 ]

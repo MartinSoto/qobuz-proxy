@@ -5,7 +5,7 @@ import functools
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
-from qobuz_proxy.backends import PlaybackState
+from qobuz_proxy.backends import PlaybackState, PlayResult
 from qobuz_proxy.playback.player import QobuzPlayer
 from qobuz_proxy.playback.queue import QueueTrack, RepeatMode
 
@@ -14,7 +14,6 @@ def _make_player(next_track_info=None):
     """Build a player with mocked queue/metadata/backend."""
     queue = MagicMock()
     metadata = MagicMock()
-    metadata.get_streaming_url = AsyncMock(return_value="http://proxy:7120/audio/222_9.flac")
     meta_obj = MagicMock()
     meta_obj.to_dict.return_value = {
         "title": "Track",
@@ -24,16 +23,11 @@ def _make_player(next_track_info=None):
         "artwork_url": "",
     }
     metadata.get_metadata = AsyncMock(return_value=meta_obj)
-    metadata.get_track_format.return_value = (6, 44100, 16)
 
-    # Player routes track loading through queue.get_track_url/
-    # get_track_metadata rather than fetching directly — mirror
-    # metadata.get_streaming_url/get_metadata above, including the same
-    # cache-onto-the-track side effect QobuzQueue's real methods have.
-    async def _get_track_url(track):
-        track.set_streaming_url(await metadata.get_streaming_url(track.track_id))
-        return track.streaming_url
-
+    # Player routes track loading through queue.get_track_metadata rather
+    # than fetching directly — mirror metadata.get_metadata above. The
+    # streaming URL/format itself is resolved inside backend.play()/
+    # set_next_track() now, not fetched here — see set_track_stream_info.
     async def _get_track_metadata(track):
         meta_obj = await metadata.get_metadata(track.track_id)
         meta = meta_obj.to_dict() if meta_obj else None
@@ -42,13 +36,17 @@ def _make_player(next_track_info=None):
             track.duration_ms = meta.get("duration_ms", 0)
         return meta
 
-    queue.get_track_url = AsyncMock(side_effect=_get_track_url)
+    def _set_stream_info(track, blob, actual_quality):
+        track.blob = blob
+        track.actual_quality = actual_quality
+
     queue.get_track_metadata = AsyncMock(side_effect=_get_track_metadata)
+    queue.set_track_stream_info = MagicMock(side_effect=_set_stream_info)
 
     backend = MagicMock()
     backend.supports_gapless = True
     backend.clear_next_track = AsyncMock()
-    backend.set_next_track = AsyncMock(return_value=True)
+    backend.set_next_track = AsyncMock(return_value=PlayResult(blob="blob", format_id=6))
     backend.disconnect = AsyncMock()
 
     player = QobuzPlayer(queue=queue, metadata_service=metadata, backend=backend)
@@ -119,7 +117,7 @@ class TestPrepareNextTrackConcurrency:
 
         async def slow_arm(*args, **kwargs):
             await asyncio.sleep(0.05)
-            return True
+            return PlayResult(blob="blob", format_id=6)
 
         backend.set_next_track = AsyncMock(side_effect=slow_arm)
 
@@ -139,7 +137,7 @@ class TestPrepareNextTrackConcurrency:
 
         async def slow_arm(*args, **kwargs):
             await asyncio.sleep(0.05)
-            return True
+            return PlayResult(blob="blob", format_id=6)
 
         backend.set_next_track = AsyncMock(side_effect=slow_arm)
 
@@ -240,8 +238,6 @@ class TestContextUuidPropagation:
         reporter.note_playing = AsyncMock()
         reporter.note_stopped = AsyncMock()
         player._play_reporter = reporter
-        player.metadata.get_track_actual_quality.return_value = 6
-        player.metadata.get_track_blob.return_value = "blob"
 
         ctx = uuid.UUID("12345678-1234-5678-1234-567812345678").bytes
         await player.apply_remote_state(
@@ -357,7 +353,6 @@ class TestContextUuidPropagation:
             "metadata": {"duration_ms": 1000},
             "backend_meta": None,
         }
-        player.metadata.get_track_actual_quality.return_value = 6
 
         await player._handle_gapless_transition()
 
@@ -437,11 +432,7 @@ class TestRepeatOneNaturalEnd:
         backend.seek = AsyncMock()
         backend.stop = AsyncMock()
 
-        player._current_track = QueueTrack(
-            queue_item_id=9,
-            track_id="222",
-            streaming_url="http://proxy:7120/audio/222_9.flac",
-        )
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
         player._state = PlaybackState.PLAYING
 
         queue_state = MagicMock()
@@ -461,15 +452,18 @@ class TestRepeatOneNaturalEnd:
         # so assert the stored base rather than the timing-sensitive clock).
         assert player._position_value_ms == 0
 
-    async def test_refetches_url_so_repeat_does_not_use_expired_link(self):
+    async def test_restart_reresolves_via_backend_play(self):
+        """A long repeat loop must never play through an expired streaming
+        link — backend.play() re-resolves the URL fresh every call now (see
+        QobuzStreamResolver's own TTL), so a repeat-one restart just needs
+        to genuinely call play() again rather than replay something cached
+        by the player itself."""
         player, backend = _make_player()
         self._arm_repeat_one(player, backend)
 
         await player._handle_track_ended(player._current_track)
 
-        # Cached URL is cleared and re-fetched so a long repeat loop never
-        # plays through an expired streaming link.
-        player.metadata.get_streaming_url.assert_awaited()
+        backend.play.assert_awaited_once()
 
     async def test_does_not_advance_to_next_track(self):
         next_info = {"trackId": "999", "queueItemId": 42}

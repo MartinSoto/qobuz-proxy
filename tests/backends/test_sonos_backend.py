@@ -4,6 +4,7 @@ Sonos-specific "what's currently playing" URI lookup."""
 from unittest.mock import AsyncMock, MagicMock
 
 from qobuz_proxy.backends.types import BackendTrackMetadata
+from qobuz_proxy.backends.dlna.proxy_server import ResolvedTrack
 from qobuz_proxy.backends.dlna.sonos.backend import SonosBackend
 from qobuz_proxy.backends.dlna.sonos.client import SonosClient
 
@@ -28,6 +29,24 @@ def _make_backend():  # type: ignore[no-untyped-def]
     client.add_uri_to_queue = AsyncMock(return_value=7)
     client.remove_track_from_queue = AsyncMock(return_value=True)
     backend._client = client
+
+    # set_next_track resolves via the proxy server now — always the same
+    # proxy URL, mirroring what resolve_track would return for a fixed
+    # (track_id, queue_item_id) in real use.
+    proxy_server = MagicMock()
+    proxy_server.base_url = "http://proxy"
+    proxy_server.resolve_track = AsyncMock(
+        return_value=ResolvedTrack(
+            proxy_url="http://proxy/audio/222_9.flac",
+            content_type="audio/flac",
+            sample_rate=44100,
+            bit_depth=16,
+            format_id=6,
+            blob="",
+        )
+    )
+    backend._proxy_server = proxy_server
+
     return backend, client
 
 
@@ -38,7 +57,7 @@ class TestSonosGaplessQueue:
         backend, client = _make_backend()
         meta = _make_metadata(track_id="222")
 
-        assert await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+        assert await backend.set_next_track(meta, 9) is not None
 
         client.add_uri_to_queue.assert_awaited_once()
         assert backend._next_track_queue_nr == 7
@@ -47,15 +66,15 @@ class TestSonosGaplessQueue:
         backend, client = _make_backend()
         meta = _make_metadata(track_id="222")
 
-        assert await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
-        assert await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+        assert await backend.set_next_track(meta, 9) is not None
+        assert await backend.set_next_track(meta, 9) is not None
 
         client.add_uri_to_queue.assert_awaited_once()
 
     async def test_clear_next_track_removes_queued_entry(self):
         backend, client = _make_backend()
         meta = _make_metadata(track_id="222")
-        await backend.set_next_track("http://proxy/audio/222_9.flac", meta, 9)
+        await backend.set_next_track(meta, 9)
 
         await backend.clear_next_track()
 

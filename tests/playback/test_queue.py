@@ -51,83 +51,31 @@ class TestQueueTrack:
         assert track.queue_item_id == 1
         assert track.track_id == "12345"
         assert track.context_uuid is None
-        assert track.streaming_url is None
         assert track.metadata == {}
         assert track.start_ms == 0
         assert track.duration_ms == 0
-
-    def test_url_staleness(self) -> None:
-        """A cached URL is only trusted within its TTL."""
-        track = QueueTrack(queue_item_id=1, track_id="12345")
-        assert track.url_is_stale()  # no URL at all
-
-        track.set_streaming_url("https://example.com/track.flac")
-        assert not track.url_is_stale()
-
-        track.url_fetched_at -= 241  # age the URL past the 240s TTL
-        assert track.url_is_stale()
-
-        track.set_streaming_url(None)
-        assert track.url_is_stale()
-        assert track.url_fetched_at == 0.0
+        assert track.blob == ""
+        assert track.actual_quality == 0
 
 
 class TestTrackCaching:
-    """QobuzQueue.get_track_url/get_track_metadata — the single place
-    "is this cached, if not fetch and cache it" is implemented, shared by
-    _preload_upcoming and QobuzPlayer (which used to each have their own
-    copy of this logic)."""
+    """QobuzQueue.get_track_metadata (fetch-and-cache display metadata) and
+    set_track_stream_info (record what the backend resolved/served — see
+    AudioBackend.play's PlayResult) — the streaming URL itself is no
+    longer cached here, see queue.py's module docstring."""
 
     @pytest.fixture
     def queue(self) -> QobuzQueue:
         return QobuzQueue()
 
-    @pytest.mark.asyncio
-    async def test_get_track_url_fetches_and_caches_on_miss(self, queue: QobuzQueue) -> None:
-        track = QueueTrack(queue_item_id=1, track_id="A")
-        url_callback = AsyncMock(return_value="https://example.com/a.flac")
-        queue.set_url_callback(url_callback)
-
-        url = await queue.get_track_url(track)
-
-        assert url == "https://example.com/a.flac"
-        assert track.streaming_url == "https://example.com/a.flac"
-        url_callback.assert_awaited_once_with("A")
-
-    @pytest.mark.asyncio
-    async def test_get_track_url_returns_cached_value_without_fetching(
-        self, queue: QobuzQueue
-    ) -> None:
-        track = QueueTrack(queue_item_id=1, track_id="A")
-        track.set_streaming_url("https://cached.example.com/a.flac")
-        url_callback = AsyncMock(return_value="https://fresh.example.com/a.flac")
-        queue.set_url_callback(url_callback)
-
-        url = await queue.get_track_url(track)
-
-        assert url == "https://cached.example.com/a.flac"
-        url_callback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_get_track_url_refetches_a_stale_cached_value(self, queue: QobuzQueue) -> None:
-        track = QueueTrack(queue_item_id=1, track_id="A")
-        track.set_streaming_url("https://cached.example.com/a.flac")
-        track.url_fetched_at -= 300  # past the TTL
-        url_callback = AsyncMock(return_value="https://fresh.example.com/a.flac")
-        queue.set_url_callback(url_callback)
-
-        url = await queue.get_track_url(track)
-
-        assert url == "https://fresh.example.com/a.flac"
-        assert track.streaming_url == "https://fresh.example.com/a.flac"
-
-    @pytest.mark.asyncio
-    async def test_get_track_url_returns_none_without_a_callback(self, queue: QobuzQueue) -> None:
+    def test_set_track_stream_info_records_blob_and_quality(self, queue: QobuzQueue) -> None:
         track = QueueTrack(queue_item_id=1, track_id="A")
 
-        assert await queue.get_track_url(track) is None
+        queue.set_track_stream_info(track, blob="the-blob", actual_quality=27)
 
-    @pytest.mark.asyncio
+        assert track.blob == "the-blob"
+        assert track.actual_quality == 27
+
     async def test_get_track_metadata_fetches_and_caches_on_miss(self, queue: QobuzQueue) -> None:
         track = QueueTrack(queue_item_id=1, track_id="A")
         metadata_callback = AsyncMock(return_value={"title": "Song", "duration_ms": 123})

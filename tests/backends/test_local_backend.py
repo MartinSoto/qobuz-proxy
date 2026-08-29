@@ -9,6 +9,25 @@ import pytest
 
 from qobuz_proxy.backends.local.backend import LocalAudioBackend
 from qobuz_proxy.backends.types import BackendTrackMetadata, PlaybackState
+from qobuz_proxy.playback.stream_resolver import ResolvedStream
+
+
+def _mock_resolver() -> MagicMock:
+    """A QobuzStreamResolver stand-in — _download_and_decode is patched
+    directly in these tests, so the resolved URL itself is never used."""
+    resolver = MagicMock()
+    resolver.resolve = AsyncMock(
+        return_value=ResolvedStream(
+            url="http://example.com/track.flac",
+            blob="",
+            format_id=27,
+            sample_rate=192000,
+            bit_depth=24,
+            fetched_at=0.0,
+        )
+    )
+    return resolver
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -67,6 +86,7 @@ async def _create_connected_backend() -> LocalAudioBackend:
     backend = LocalAudioBackend(device="default", buffer_size=2048)
     with patch(_SD_PATCH, return_value=_mock_sounddevice()):
         await backend.connect()
+    backend.set_stream_resolver(_mock_resolver())
     return backend
 
 
@@ -102,7 +122,7 @@ class TestPlayStateTransitions:
             backend._stream.open = MagicMock()
             backend._stream.start = MagicMock()
 
-            await backend.play("http://example.com/track.flac", _make_metadata())
+            await backend.play(_make_metadata())
 
             # Let the feeding task start
             await asyncio.sleep(0.01)
@@ -126,7 +146,13 @@ class TestPlayStateTransitions:
 
         backend._download_and_decode = failing_download
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        # play() now re-raises after notifying (see AudioBackend.play's
+        # docstring) — a caller (Player._start_playback) must be able to
+        # tell a failed play from a successful one via the exception, not
+        # just by polling state; the notify callbacks below still fire the
+        # same as before.
+        with pytest.raises(aiohttp.ClientError):
+            await backend.play(_make_metadata())
 
         assert PlaybackState.LOADING in states
         assert PlaybackState.ERROR in states
@@ -145,7 +171,8 @@ class TestPlayStateTransitions:
 
         backend._download_and_decode = failing_decode
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        with pytest.raises(RuntimeError):
+            await backend.play(_make_metadata())
 
         assert backend._state == PlaybackState.ERROR
         assert len(errors) == 1
@@ -169,7 +196,7 @@ class TestTrackChangeSilencesOldAudio:
         backend._stream.start = MagicMock()
         backend._stream.pause = MagicMock()
 
-        await backend.play("http://example.com/a.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.05)  # let the feeder fill the buffer
         old_buffer = backend._ring_buffer
         assert old_buffer.available() > 0
@@ -182,7 +209,7 @@ class TestTrackChangeSilencesOldAudio:
             return FAKE_AUDIO_44100.copy(), 44100
 
         backend._download_and_decode = slow_download
-        play_task = asyncio.create_task(backend.play("http://example.com/b.flac", _make_metadata()))
+        play_task = asyncio.create_task(backend.play(_make_metadata()))
         await download_entered.wait()
 
         # While the new track downloads, the old audio is already silenced
@@ -214,7 +241,7 @@ class TestPauseResume:
         backend._stream.pause = MagicMock()
         backend._stream.resume = MagicMock()
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.01)
 
         await backend.pause()
@@ -243,7 +270,7 @@ class TestPauseResume:
         backend._stream.stop = MagicMock()
         backend._stream.resume = MagicMock()
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.01)
         await backend.stop()
 
@@ -273,7 +300,7 @@ class TestStop:
         backend._stream.start = MagicMock()
         backend._stream.stop = MagicMock()
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.01)
 
         assert backend._feeding_task is not None
@@ -312,7 +339,7 @@ class TestTrackEnd:
         backend._stream.open = MagicMock()
         backend._stream.start = MagicMock()
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        await backend.play(_make_metadata())
 
         # The ring buffer has 10s * 44100 = 441000 frame capacity
         # With 100 frames, feeding finishes instantly. But draining waits
@@ -357,7 +384,7 @@ class TestSampleRateChange:
             return FAKE_AUDIO_44100.copy(), 44100
 
         backend._download_and_decode = fake_download_44100
-        await backend.play("http://example.com/track1.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.01)
         await backend.stop()
 
@@ -366,7 +393,7 @@ class TestSampleRateChange:
             return FAKE_AUDIO_96000.copy(), 96000
 
         backend._download_and_decode = fake_download_96000
-        await backend.play("http://example.com/track2.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.01)
 
         assert len(open_calls) == 2
@@ -502,7 +529,7 @@ class TestConnectDisconnect:
         backend._stream.stop = MagicMock()
         backend._stream.close = MagicMock()
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.01)
 
         await backend.disconnect()
@@ -608,7 +635,7 @@ class TestFeedingLoop:
         positions: list[int] = []
         backend.on_position_update(lambda p: positions.append(p))
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.1)
 
         # All frames should be fed (ring buffer is large enough)
@@ -637,7 +664,7 @@ class TestFeedingLoop:
         backend._stream.open = MagicMock()
         backend._stream.start = MagicMock()
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.05)
 
         # Seek to 5 seconds

@@ -12,7 +12,7 @@ import functools
 from unittest.mock import AsyncMock, MagicMock
 
 from qobuz_proxy.backends.base import AudioBackend
-from qobuz_proxy.backends import BackendTrackMetadata, PlaybackState
+from qobuz_proxy.backends import BackendTrackMetadata, PlaybackState, PlayResult
 from qobuz_proxy.playback.player import QobuzPlayer
 
 
@@ -28,7 +28,7 @@ class ConcurrencyTrackingBackend(AudioBackend):
         # TestPlayerDetachAndRetarget to prove they never overlap play().
         self.events: list[str] = []
 
-    async def play(self, url: str, metadata: BackendTrackMetadata) -> None:
+    async def play(self, metadata: BackendTrackMetadata) -> PlayResult:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
@@ -37,6 +37,7 @@ class ConcurrencyTrackingBackend(AudioBackend):
             self.played.append(metadata.track_id)
         finally:
             self.active -= 1
+        return PlayResult()
 
     async def pause(self) -> bool:
         return True
@@ -67,27 +68,22 @@ class ConcurrencyTrackingBackend(AudioBackend):
         return True
 
 
+def _set_stream_info(track, blob, actual_quality):  # type: ignore[no-untyped-def]
+    """Mirrors the real QobuzQueue.set_track_stream_info."""
+    track.blob = blob
+    track.actual_quality = actual_quality
+
+
 def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:
     backend = ConcurrencyTrackingBackend()
 
     metadata = MagicMock()
-    metadata.get_streaming_url = MagicMock(
-        side_effect=lambda track_id: _coro(f"http://test/{track_id}")
-    )
     metadata.get_metadata = MagicMock(side_effect=lambda track_id: _coro(None))
-    metadata.get_track_actual_quality = MagicMock(return_value=None)
-    # (actual_quality, sample_rate, bit_depth); 0s = cache miss, fall back to max quality.
-    metadata.get_track_format = MagicMock(return_value=(0, 0, 0))
     metadata.log_now_playing_info = MagicMock()
 
     queue = MagicMock()
-    # Player routes track loading through queue.get_track_url/get_track_metadata
-    # (see QobuzQueue's own implementation) rather than fetching directly —
-    # mirror what metadata.get_streaming_url/get_metadata above provide.
-    queue.get_track_url = MagicMock(
-        side_effect=lambda track: _coro(f"http://test/{track.track_id}")
-    )
     queue.get_track_metadata = MagicMock(side_effect=lambda track: _coro(None))
+    queue.set_track_stream_info = MagicMock(side_effect=_set_stream_info)
     player = QobuzPlayer(queue=queue, metadata_service=metadata, backend=backend)
     return player, backend
 
@@ -210,10 +206,10 @@ class TestApplyRemoteStateSerialization:
         release_a = asyncio.Event()
         original_play = backend.play
 
-        async def blocking_play(url, metadata):  # type: ignore[no-untyped-def]
+        async def blocking_play(metadata):  # type: ignore[no-untyped-def]
             if metadata.track_id == "A":
                 await release_a.wait()
-            await original_play(url, metadata)
+            return await original_play(metadata)
 
         backend.play = blocking_play  # type: ignore[method-assign]
 
@@ -266,14 +262,14 @@ class TestApplyRemoteStateSerialization:
         # queued behind it by the time it resumes and checks whether it's
         # been superseded.
         release_a = asyncio.Event()
-        original_get_track_url = player.queue.get_track_url
+        original_get_track_metadata = player.queue.get_track_metadata
 
-        async def blocking_get_track_url(track):  # type: ignore[no-untyped-def]
+        async def blocking_get_track_metadata(track):  # type: ignore[no-untyped-def]
             if track.track_id == "A":
                 await release_a.wait()
-            return await original_get_track_url(track)
+            return await original_get_track_metadata(track)
 
-        player.queue.get_track_url = blocking_get_track_url  # type: ignore[method-assign]
+        player.queue.get_track_metadata = blocking_get_track_metadata  # type: ignore[method-assign]
 
         def _apply(track_id: str, queue_item_id: int):  # type: ignore[no-untyped-def]
             return functools.partial(
@@ -327,14 +323,14 @@ class TestApplyRemoteStateSerialization:
         assert backend.played == ["A"]
 
         release_b = asyncio.Event()
-        original_get_track_url = player.queue.get_track_url
+        original_get_track_metadata = player.queue.get_track_metadata
 
-        async def blocking_get_track_url(track):  # type: ignore[no-untyped-def]
+        async def blocking_get_track_metadata(track):  # type: ignore[no-untyped-def]
             if track.track_id == "B":
                 await release_b.wait()
-            return await original_get_track_url(track)
+            return await original_get_track_metadata(track)
 
-        player.queue.get_track_url = blocking_get_track_url  # type: ignore[method-assign]
+        player.queue.get_track_metadata = blocking_get_track_metadata  # type: ignore[method-assign]
 
         def _apply_load_only(track_id: str, queue_item_id: int):  # type: ignore[no-untyped-def]
             # No playingState — the ordinary case for a rapid swipe.

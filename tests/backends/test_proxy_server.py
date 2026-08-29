@@ -6,10 +6,12 @@ from unittest.mock import AsyncMock, MagicMock
 import aiohttp
 from aiohttp import web
 
-from qobuz_proxy.backends.dlna.proxy_server import AudioProxyServer
+from qobuz_proxy.backends.dlna.proxy_server import AudioProxyServer, RegisteredTrack
+from qobuz_proxy.playback.stream_resolver import ResolvedStream
 
 PAYLOAD = bytes(range(256)) * 1024  # 256 KiB deterministic payload
 ABORT_AFTER = 100_000
+FORMAT_ID = 6  # arbitrary — these tests don't exercise resolve_track's decision tree
 
 
 def _free_port() -> int:
@@ -18,6 +20,22 @@ def _free_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def _stream(url: str) -> ResolvedStream:
+    return ResolvedStream(
+        url=url, blob="", format_id=FORMAT_ID, sample_rate=44100, bit_depth=16, fetched_at=0.0
+    )
+
+
+def _register(proxy: AudioProxyServer, track_id: str) -> None:
+    """Register a track directly, bypassing resolve_track's capability-
+    driven decision tree — these tests only care about the byte-serving/
+    retry path, given a fixed format_id the mocked resolver already knows
+    how to answer for."""
+    proxy._tracks[track_id] = RegisteredTrack(
+        track_id=track_id, format_id=FORMAT_ID, content_type="audio/flac"
+    )
 
 
 class FlakyUpstream:
@@ -113,14 +131,14 @@ async def test_head_probe_does_not_download_the_track():
     upstream = MethodRecordingUpstream()
     upstream_url = await upstream.start()
 
-    provider = MagicMock()
-    provider.get_streaming_url = AsyncMock(return_value=upstream_url)
+    resolver = AsyncMock()
+    resolver.resolve = AsyncMock(return_value=_stream(upstream_url))
 
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        proxy.register_track("42", upstream_url, "audio/flac")
+        _register(proxy, "42")
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.head(f"http://127.0.0.1:{port}/audio/42.flac") as resp:
@@ -179,14 +197,17 @@ async def test_refreshes_url_and_retries_on_upstream_403():
     upstream = ExpiredUrlUpstream()
     base_url = await upstream.start()
 
-    provider = MagicMock()
-    provider.get_streaming_url = AsyncMock(return_value=f"{base_url}?token=fresh")
+    async def _resolve(track_id, format_id, force=False):
+        return _stream(f"{base_url}?token={'fresh' if force else 'stale'}")
+
+    resolver = AsyncMock()
+    resolver.resolve = AsyncMock(side_effect=_resolve)
 
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        proxy.register_track("42", f"{base_url}?token=stale", "audio/flac")
+        _register(proxy, "42")
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"http://127.0.0.1:{port}/audio/42.flac") as resp:
@@ -198,7 +219,7 @@ async def test_refreshes_url_and_retries_on_upstream_403():
 
     assert body == PAYLOAD
     assert upstream.requests == ["stale", "fresh"]
-    provider.get_streaming_url.assert_awaited_once_with("42", force=True)
+    resolver.resolve.assert_awaited_with("42", FORMAT_ID, force=True)
 
 
 async def test_returns_502_when_refresh_fails_after_403():
@@ -206,14 +227,19 @@ async def test_returns_502_when_refresh_fails_after_403():
     upstream = ExpiredUrlUpstream()
     base_url = await upstream.start()
 
-    provider = MagicMock()
-    provider.get_streaming_url = AsyncMock(side_effect=RuntimeError("no URL"))
+    async def _resolve(track_id, format_id, force=False):
+        if force:
+            return None  # refresh failed
+        return _stream(f"{base_url}?token=stale")
+
+    resolver = AsyncMock()
+    resolver.resolve = AsyncMock(side_effect=_resolve)
 
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        proxy.register_track("42", f"{base_url}?token=stale", "audio/flac")
+        _register(proxy, "42")
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"http://127.0.0.1:{port}/audio/42.flac") as resp:
@@ -230,15 +256,15 @@ async def test_resumes_upstream_after_midstream_failure():
     upstream = FlakyUpstream()
     upstream_url = await upstream.start()
 
-    provider = MagicMock()
-    provider.get_streaming_url = AsyncMock(return_value=upstream_url)
+    resolver = AsyncMock()
+    resolver.resolve = AsyncMock(return_value=_stream(upstream_url))
 
     port = _free_port()
-    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
     await proxy.start()
     body = b""
     try:
-        proxy.register_track("42", upstream_url, "audio/flac")
+        _register(proxy, "42")
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"http://127.0.0.1:{port}/audio/42.flac") as resp:
@@ -257,3 +283,112 @@ async def test_resumes_upstream_after_midstream_failure():
     resume = upstream.range_headers[1]
     assert resume is not None and resume.startswith("bytes=")
     assert int(resume.removeprefix("bytes=").split("-")[0]) > 0
+
+
+def _mock_request() -> MagicMock:
+    """A stand-in for aiohttp's web.Request — _claim_stream only ever
+    touches .transport on it."""
+    request = MagicMock()
+    request.transport = MagicMock()
+    request.transport.is_closing.return_value = False
+    return request
+
+
+class TestStreamSupersession:
+    """A renderer that fires a new request for a track it's already
+    streaming reproducibly does so on *every* seek (confirmed directly,
+    including the very first request of a session — not an occasional
+    timing fluke): a GET-before-Range probe immediately followed by the
+    real Range request, and/or the previous seek's connection still
+    draining. Measured directly, the renderer itself closes the old
+    connection first almost every time anyway — which means for however
+    long it keeps both sockets open, it's genuinely receiving two
+    different, both-valid positions of the same track at once. So
+    _claim_stream force-closes the previous request's transport
+    immediately, rather than only marking it stale for the old loop to
+    notice on its own schedule (see proxy_server.py's docstring for the
+    full rationale, including why this doesn't reintroduce the
+    "generator already executing" crash Task.cancel() caused: it never
+    touches the generator/thread doing the decode work, only the socket)."""
+
+    def test_claiming_a_key_supersedes_the_previous_claim(self) -> None:
+        resolver = AsyncMock()
+        proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=0)
+
+        first = proxy._claim_stream("42", _mock_request())
+        assert not proxy._stream_superseded("42", first)
+
+        second = proxy._claim_stream("42", _mock_request())
+
+        assert proxy._stream_superseded("42", first)
+        assert not proxy._stream_superseded("42", second)
+
+    def test_unrelated_keys_do_not_interfere(self) -> None:
+        resolver = AsyncMock()
+        proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=0)
+
+        a = proxy._claim_stream("A", _mock_request())
+        proxy._claim_stream("B", _mock_request())
+
+        assert not proxy._stream_superseded("A", a)  # B claiming doesn't touch A
+
+    def test_claiming_over_an_existing_stream_closes_its_transport(self) -> None:
+        resolver = AsyncMock()
+        proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=0)
+
+        first_request = _mock_request()
+        proxy._claim_stream("42", first_request)
+        first_request.transport.close.assert_not_called()
+
+        proxy._claim_stream("42", _mock_request())
+
+        first_request.transport.close.assert_called_once()
+
+    def test_first_claim_for_a_key_closes_nothing(self) -> None:
+        resolver = AsyncMock()
+        proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=0)
+
+        request = _mock_request()
+        proxy._claim_stream("42", request)
+
+        request.transport.close.assert_not_called()
+
+    def test_claiming_with_the_same_request_object_does_not_close_itself(self) -> None:
+        """Defensive: a request can't supersede itself."""
+        resolver = AsyncMock()
+        proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=0)
+
+        request = _mock_request()
+        proxy._claim_stream("42", request)
+        proxy._claim_stream("42", request)
+
+        request.transport.close.assert_not_called()
+
+    def test_does_not_close_a_transport_already_closing(self) -> None:
+        resolver = AsyncMock()
+        proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=0)
+
+        first_request = _mock_request()
+        first_request.transport.is_closing.return_value = True
+        proxy._claim_stream("42", first_request)
+
+        proxy._claim_stream("42", _mock_request())
+
+        first_request.transport.close.assert_not_called()
+
+    def test_unrelated_keys_do_not_close_each_others_transport(self) -> None:
+        resolver = AsyncMock()
+        proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=0)
+
+        request_a = _mock_request()
+        proxy._claim_stream("A", request_a)
+
+        proxy._claim_stream("B", _mock_request())
+
+        request_a.transport.close.assert_not_called()
+
+    def test_unclaimed_key_reports_superseded(self) -> None:
+        resolver = AsyncMock()
+        proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=0)
+
+        assert proxy._stream_superseded("never-claimed", 1)

@@ -8,7 +8,7 @@ and plays through the local audio device via PortAudio.
 import asyncio
 import io
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import aiohttp
 import numpy as np
@@ -19,10 +19,14 @@ from qobuz_proxy.backends.types import (
     BackendTrackMetadata,
     BufferStatus,
     PlaybackState,
+    PlayResult,
 )
 from .device import AudioDeviceInfo, resolve_device
 from .ring_buffer import RingBuffer
 from .stream import AudioOutputStream
+
+if TYPE_CHECKING:
+    from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,13 @@ BUFFER_HIGH_WATER = 0.8  # Pause feeding when buffer above this level
 # How long to keep waiting for the next track's download after the ring buffer
 # has fully drained before abandoning the gapless transition.
 NEXT_TRACK_GRACE_SECONDS = 10.0
+# Local output has no notion of device capabilities to detect — always ask
+# for Qobuz's best, same as today's speaker.py default for this backend.
+# Qobuz format_id for Hi-Res 24-bit/192kHz — see playback.metadata.AudioQuality
+# (not imported directly: qobuz_proxy.playback imports qobuz_proxy.backends, so
+# importing it here at module level would be circular — see proxy_server.py's
+# equivalent note against the same cycle).
+DEFAULT_QUALITY = 27
 
 
 class LocalAudioBackend(AudioBackend):
@@ -46,6 +57,8 @@ class LocalAudioBackend(AudioBackend):
         super().__init__(name)
         self._device_config = device
         self._buffer_size = buffer_size
+        self._resolver: Optional["QobuzStreamResolver"] = None
+        self._quality_override: int = DEFAULT_QUALITY
 
         # Device and audio components (initialized in connect())
         self._device_info: Optional[AudioDeviceInfo] = None
@@ -74,8 +87,23 @@ class LocalAudioBackend(AudioBackend):
         self._transition_pending: bool = False
         self._prev_total_frames: int = 0
 
-    async def play(self, url: str, metadata: BackendTrackMetadata) -> None:
-        """Download FLAC, decode, and start playback."""
+    def set_stream_resolver(self, resolver: "QobuzStreamResolver") -> None:
+        """Wire in the shared Qobuz CDN resolver — see set_quality_override
+        for how the requested tier is chosen."""
+        self._resolver = resolver
+
+    def set_quality_override(self, format_id: Optional[int]) -> None:
+        """See AudioBackend.set_quality_override. Unlike DLNA, local output
+        has no capability-detection concept to fall back to dynamically —
+        None just means "use the default" (Hi-Res ceiling), not "decide
+        per-track"."""
+        self._quality_override = format_id if format_id is not None else DEFAULT_QUALITY
+
+    async def play(self, metadata: BackendTrackMetadata) -> PlayResult:
+        """Resolve, download, decode, and start playback."""
+        if not self._resolver:
+            raise RuntimeError("No stream resolver configured")
+
         await self._cancel_feeding()
 
         # An explicit play supersedes any armed gapless transition
@@ -93,7 +121,11 @@ class LocalAudioBackend(AudioBackend):
         self._notify_state_change(PlaybackState.LOADING)
 
         try:
-            audio_data, sample_rate = await self._download_and_decode(url)
+            stream = await self._resolver.resolve(metadata.track_id, self._quality_override)
+            if stream is None:
+                raise RuntimeError(f"Failed to resolve streaming URL for track {metadata.track_id}")
+
+            audio_data, sample_rate = await self._download_and_decode(stream.url)
             self._audio_data = audio_data
             self._sample_rate = sample_rate
             self._total_frames = len(audio_data)
@@ -118,11 +150,13 @@ class LocalAudioBackend(AudioBackend):
                 f"Playing: {metadata.artist} - {metadata.title} "
                 f"({sample_rate}Hz, {self._total_frames} frames)"
             )
+            return PlayResult(blob=stream.blob, format_id=stream.format_id)
 
         except Exception as e:
             logger.error(f"Playback error: {e}")
             self._notify_state_change(PlaybackState.ERROR)
             self._notify_playback_error(str(e))
+            raise
 
     async def _download(self, url: str) -> bytes:
         """Download the audio file bytes."""
@@ -252,20 +286,28 @@ class LocalAudioBackend(AudioBackend):
         return True
 
     async def set_next_track(
-        self, url: str, metadata: BackendTrackMetadata, queue_item_id: int = 0
-    ) -> bool:
-        """Prefetch the next track so the feeding loop can transition without a gap.
+        self, metadata: BackendTrackMetadata, queue_item_id: int = 0
+    ) -> Optional[PlayResult]:
+        """Resolve and prefetch the next track so the feeding loop can
+        transition without a gap.
 
         Only the compressed bytes are downloaded up front; decoding happens at
         transition time (in a worker thread, with the buffered tail of the
         current track as cushion) to avoid holding two fully decoded tracks in
         memory for the whole duration of the current one.
         """
+        if not self._resolver:
+            return None
+        stream = await self._resolver.resolve(metadata.track_id, self._quality_override)
+        if stream is None:
+            logger.debug(f"Gapless: failed to resolve next track {metadata.track_id}")
+            return None
+
         await self.clear_next_track()
         self._next_track_meta = metadata
-        self._next_prefetch_task = asyncio.create_task(self._download(url))
+        self._next_prefetch_task = asyncio.create_task(self._download(stream.url))
         logger.debug(f"Gapless: prefetching next track {metadata.track_id}")
-        return True
+        return PlayResult(blob=stream.blob, format_id=stream.format_id)
 
     async def clear_next_track(self) -> None:
         """Cancel and discard the prefetched next track."""

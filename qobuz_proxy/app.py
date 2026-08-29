@@ -32,6 +32,7 @@ from qobuz_proxy.config import (
 )
 from qobuz_proxy.backends.dlna.sonos import SonosController
 from qobuz_proxy.backends.dlna.sonos.events import SonosEventSubscriber
+from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
 from qobuz_proxy.speaker import Speaker
 from qobuz_proxy.webui.config_writer import save_config
 from qobuz_proxy.webui.routes import register_routes
@@ -62,6 +63,10 @@ class QobuzProxy:
 
         # Auth / API
         self._api_client: Optional[QobuzAPIClient] = None
+        # Shared app-wide — see QobuzStreamResolver's own docstring for why
+        # this is one instance, not one per speaker. Rebuilt whenever
+        # _api_client is (re-)created, since it wraps that exact instance.
+        self._stream_resolver: Optional[QobuzStreamResolver] = None
         self._app_id: str = ""
         self._app_secret: str = ""
 
@@ -202,6 +207,7 @@ class QobuzProxy:
         logger.info(f"Authenticating user {user_id}...")
         if await self._api_client.login_with_token(user_id=user_id, auth_token=auth_token):
             logger.info("Authentication successful")
+            self._stream_resolver = QobuzStreamResolver(self._api_client)
             return True
 
         logger.warning("Authentication failed — invalid credentials")
@@ -232,6 +238,7 @@ class QobuzProxy:
         self._api_client = QobuzAPIClient(self._app_id, self._app_secret)
         self._api_client.user_auth_token = auth_token
         self._api_client.user_id = user_id
+        self._stream_resolver = QobuzStreamResolver(self._api_client)
 
         email = profile.get("email", "")
         name = profile.get("name", "")
@@ -262,6 +269,7 @@ class QobuzProxy:
         self._auth_state["user_id"] = ""
         self._auth_state["email"] = ""
         self._api_client = None
+        self._stream_resolver = None
 
         clear_user_token()
 
@@ -319,7 +327,13 @@ class QobuzProxy:
 
         # Create and start speaker
         assert self._api_client is not None
-        speaker = Speaker(config=sc, api_client=self._api_client, app_id=self._app_id)
+        assert self._stream_resolver is not None
+        speaker = Speaker(
+            config=sc,
+            api_client=self._api_client,
+            app_id=self._app_id,
+            stream_resolver=self._stream_resolver,
+        )
         started = await speaker.start()
         if not started:
             raise ValueError(f"Speaker '{name}' failed to start")
@@ -396,7 +410,13 @@ class QobuzProxy:
             await self._speakers[speaker_idx].stop()
 
         assert self._api_client is not None
-        new_speaker = Speaker(config=new_config, api_client=self._api_client, app_id=self._app_id)
+        assert self._stream_resolver is not None
+        new_speaker = Speaker(
+            config=new_config,
+            api_client=self._api_client,
+            app_id=self._app_id,
+            stream_resolver=self._stream_resolver,
+        )
         started = await new_speaker.start()
         if speaker_idx is not None:
             self._speakers[speaker_idx] = new_speaker
@@ -520,6 +540,7 @@ class QobuzProxy:
         being dropped until the next restart.
         """
         assert self._api_client is not None
+        assert self._stream_resolver is not None
 
         if self._config.sonos_auto_discover:
             if self._config.speakers:
@@ -542,6 +563,7 @@ class QobuzProxy:
                 config=sc,
                 api_client=self._api_client,
                 app_id=self._app_id,
+                stream_resolver=self._stream_resolver,
             )
             for sc in configs
         ]
@@ -577,12 +599,14 @@ class QobuzProxy:
             return  # already running (e.g. re-login after logout)
 
         assert self._sonos_event_subscriber is not None
+        assert self._stream_resolver is not None
         self._sonos_controller = SonosController(
             api_client=self._api_client,
             app_id=self._app_id,
             webui_http_port=self._config.server.http_port,
             event_subscriber=self._sonos_event_subscriber,
             hires_downsampling=self._config.backend.dlna.hires_downsampling,
+            stream_resolver=self._stream_resolver,
         )
         await self._sonos_controller.start()
         logger.info(f"Web UI: http://localhost:{self._config.server.http_port}")
@@ -621,10 +645,15 @@ class QobuzProxy:
                 await asyncio.sleep(retry_delay(attempt))
                 attempt += 1
 
-                if self._api_client is None:
+                if self._api_client is None or self._stream_resolver is None:
                     return  # Logged out — speakers restart on the next login
 
-                speaker = Speaker(config=config, api_client=self._api_client, app_id=self._app_id)
+                speaker = Speaker(
+                    config=config,
+                    api_client=self._api_client,
+                    app_id=self._app_id,
+                    stream_resolver=self._stream_resolver,
+                )
                 try:
                     started = await speaker.start()
                 except asyncio.CancelledError:

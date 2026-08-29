@@ -404,6 +404,7 @@ class TestSpeakerEditCallbacks:
 
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
         app._speakers = [old_speaker]
 
         new_speaker = MagicMock()
@@ -432,6 +433,7 @@ class TestSpeakerEditCallbacks:
         config = _make_config(_make_speaker_config(name="Living Room"))
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
         app._speakers = []  # speaker failed to start, so it's not running
 
         with pytest.raises(ValueError, match="already exists"):
@@ -453,6 +455,7 @@ class TestSpeakerEditCallbacks:
 
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
         app._speakers = [speaker_a, speaker_b]
 
         with pytest.raises(ValueError, match="already exists"):
@@ -471,6 +474,7 @@ class TestSpeakerEditCallbacks:
 
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
         app._speakers = [speaker_b]
 
         new_speaker = MagicMock()
@@ -506,6 +510,7 @@ class TestSpeakerEditCallbacks:
 
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
         app._speakers = [speaker_b]
 
         with patch.object(app, "_save_config"):
@@ -529,6 +534,7 @@ class TestSpeakerEditCallbacks:
 
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
         app._speakers = [speaker_b]
 
         with patch.object(app, "_save_config"):
@@ -546,6 +552,7 @@ class TestSpeakerEditCallbacks:
         config = _make_config(_make_speaker_config(name="Speaker A"))
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
         app._speakers = []
 
         with pytest.raises(KeyError):

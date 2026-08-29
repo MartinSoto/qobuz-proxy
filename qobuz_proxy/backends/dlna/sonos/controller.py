@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     # local isinstance checks), which imports this package, which would
     # otherwise import speaker.py right back before it's finished loading.
     from qobuz_proxy.auth import QobuzAPIClient
+    from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
     from qobuz_proxy.speaker import Speaker
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class SonosController:
         app_id: str,
         webui_http_port: int,
         event_subscriber: SonosEventSubscriber,
+        stream_resolver: "QobuzStreamResolver",
         hires_downsampling: bool = False,
     ) -> None:
         """
@@ -104,6 +106,8 @@ class SonosController:
                 route was already registered before the app started
                 serving — this controller claims it for as long as it's
                 running, releasing it on stop().
+            stream_resolver: Shared QobuzStreamResolver, passed through to
+                every room's Speaker unchanged.
             hires_downsampling: Forwarded uniformly to every auto-
                 discovered room's DLNAConfig — auto-discovered rooms have
                 no per-room config of their own to set this individually.
@@ -112,6 +116,7 @@ class SonosController:
         self._app_id = app_id
         self._webui_http_port = webui_http_port
         self._event_subscriber = event_subscriber
+        self._stream_resolver = stream_resolver
         self._hires_downsampling = hires_downsampling
 
         self._discovery: Optional[SonosDiscoveryManager] = None
@@ -215,7 +220,12 @@ class SonosController:
         # TYPE_CHECKING block on why this can't be a top-level import.
         from qobuz_proxy.speaker import Speaker
 
-        speaker = Speaker(config=sc, api_client=self._api_client, app_id=self._app_id)
+        speaker = Speaker(
+            config=sc,
+            api_client=self._api_client,
+            app_id=self._app_id,
+            stream_resolver=self._stream_resolver,
+        )
 
         # Register (tracking key) before the slow part (speaker.start(): DLNA
         # connect, mDNS registration, ...) rather than after. Multiple newly

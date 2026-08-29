@@ -15,6 +15,7 @@ from qobuz_proxy.backends.types import (
     BackendTrackMetadata,
     BufferStatus,
     PlaybackState,
+    PlayResult,
 )
 from .client import DLNAClient, DLNAClientError, SoapResult
 from .capabilities import (
@@ -150,14 +151,13 @@ class DLNABackend(AudioBackend):
             fixed_volume: If True, ignore volume commands
             name: Display name (auto-detected if not provided)
             description_url: Full URL to UPnP device description XML
-            hires_downsampling: Experimental, opt-in. When True, a device
-                with real 24-bit support (see DLNACapabilities.max_quality)
-                gets Hi-Res requested from Qobuz even below its own 96k
-                tier, and any track exceeding its actual sample-rate cap is
-                downsampled on the fly instead of failing or getting stuck
-                at CD quality (see _transcode_sample_rate_for). False (the
-                default) keeps the old, conservative behavior: nothing is
-                ever transcoded.
+            hires_downsampling: Experimental, opt-in. When True, a 24-bit
+                capable device always gets its track's true native format
+                (Qobuz's ceiling, not a capability-clamped tier), and any
+                track exceeding its actual sample-rate cap is downsampled
+                on the fly instead of falling back to CD quality — see
+                AudioProxyServer.resolve_track. False (the default) keeps
+                the old, conservative behavior: nothing is ever transcoded.
         """
         super().__init__(name or f"DLNA ({ip})")
         self._ip = ip
@@ -178,6 +178,13 @@ class DLNABackend(AudioBackend):
 
         # Device capabilities
         self._capabilities: Optional[DLNACapabilities] = None
+
+        # Manual quality override — None means let resolve_track decide
+        # dynamically per-track from device capabilities; a concrete Qobuz
+        # format_id (5/6/7/27) forces that tier's request instead (config's
+        # max_quality when not "auto", or a live app quality-change request
+        # — see AudioBackend.set_quality_override).
+        self._quality_override: Optional[int] = None
 
         # Start of the current grace period (see PLAYBACK_START_GRACE_PERIOD_SECONDS)
         # — reset both when playback starts and on a successful retarget().
@@ -511,10 +518,18 @@ class DLNABackend(AudioBackend):
                 return True
         return False
 
-    async def play(self, url: str, metadata: BackendTrackMetadata) -> None:
-        """Start playback of track."""
+    async def play(self, metadata: BackendTrackMetadata) -> PlayResult:
+        """Start playback of track.
+
+        Resolves the actual streaming URL/format itself (see
+        resolve_track) — requires a proxy server; there's no fallback
+        path that talks to Qobuz directly, since that's the only thing
+        holding a QobuzStreamResolver.
+        """
         if not self._client and not await self._wait_for_reconnect():
             raise RuntimeError("Not connected")
+        if not self._proxy_server:
+            raise RuntimeError("No proxy server configured")
 
         # Clear gapless state — explicit play invalidates armed next track
         # (no queue removal needed: Sonos play clears the whole queue)
@@ -525,32 +540,42 @@ class DLNABackend(AudioBackend):
         self._current_metadata = metadata
         self._duration_ms = metadata.duration_ms
 
-        content_type, transcode_rate = self._resolve_content_type_and_transcode(url, metadata)
+        resolved = await self._proxy_server.resolve_track(
+            metadata.track_id,
+            self._capabilities,
+            self._hires_downsampling,
+            forced_format_id=self._quality_override,
+        )
+        if resolved is None:
+            raise RuntimeError(f"Failed to resolve streaming URL for track {metadata.track_id}")
+        logger.debug(f"Using proxy URL: {resolved.proxy_url}")
 
-        # Register with proxy server if available
-        actual_url = url
-        if self._proxy_server:
-            actual_url = self._proxy_server.register_track(
-                track_id=metadata.track_id,
-                qobuz_url=url,
-                content_type=content_type,
-                transcode_to_sample_rate=transcode_rate,
-            )
-            logger.debug(f"Using proxy URL: {actual_url}")
+        # Build DIDL-Lite metadata — reads sampleFrequency/bitsPerSample
+        # straight off what resolve_track actually decided to serve.
+        didl = self._build_didl(
+            resolved.proxy_url,
+            metadata,
+            resolved.content_type,
+            resolved.sample_rate,
+            resolved.bit_depth,
+        )
 
-        # Build DIDL-Lite metadata
-        didl = self._build_didl(actual_url, metadata, content_type)
-
-        success = await self._start_transport(actual_url, didl)
+        success = await self._start_transport(resolved.proxy_url, didl)
 
         if success:
             self._position_ms = 0
-            self._current_proxy_url = actual_url
+            self._current_proxy_url = resolved.proxy_url
             self._playback_started_at = time.monotonic()
             # Not yet observed on the device — see _current_track_confirmed.
             self._current_track_confirmed = False
             self._notify_state_change(PlaybackState.PLAYING)
             logger.info(f"Playing: {metadata.artist} - {metadata.title}")
+
+        return PlayResult(blob=resolved.blob, format_id=resolved.format_id)
+
+    def set_quality_override(self, format_id: Optional[int]) -> None:
+        """See AudioBackend.set_quality_override."""
+        self._quality_override = format_id
 
     async def _start_transport(self, url: str, didl: str) -> bool:
         """Actually start playback of an already-registered/DIDL-built URL.
@@ -880,66 +905,6 @@ class DLNABackend(AudioBackend):
         """
         return self._capabilities is not None and self._capabilities.format_info_confirmed
 
-    def _resolve_content_type_and_transcode(
-        self, url: str, metadata: BackendTrackMetadata
-    ) -> tuple[str, Optional[int]]:
-        """The MIME type to advertise for this track, and — when its native
-        format exceeds what this device can actually handle — the sample
-        rate to downsample it to on the fly (see _transcode_sample_rate_for
-        and TranscodingFlacReader).
-
-        Also logs which path was taken at INFO, for every track — so it's
-        always visible in the logs whether a given track streamed at
-        Qobuz's own sample rate or got downsampled, not just the latter.
-        """
-        content_type = "audio/flac"
-        if ".mp3" in url.lower() or "format=5" in url.lower():
-            content_type = "audio/mpeg"
-
-        transcode_rate = self._transcode_sample_rate_for(metadata)
-        if transcode_rate is not None:
-            content_type = "audio/wav"
-            logger.info(
-                f"Track {metadata.track_id}: downsampling {metadata.sample_rate}Hz "
-                f"({metadata.bit_depth}-bit, as served by Qobuz) -> {transcode_rate}Hz "
-                f"— exceeds this device's cap"
-            )
-        elif metadata.sample_rate:
-            logger.info(
-                f"Track {metadata.track_id}: keeping Qobuz's "
-                f"{metadata.sample_rate}Hz/{metadata.bit_depth}-bit stream as-is"
-            )
-        else:
-            logger.info(f"Track {metadata.track_id}: streaming as-is (quality info unavailable)")
-        return content_type, transcode_rate
-
-    def _transcode_sample_rate_for(self, metadata: BackendTrackMetadata) -> Optional[int]:
-        """Target sample rate to downsample this track to, or None if it
-        already fits the device's real capability.
-
-        Only ever fires for a device with confirmed 24-bit support at a
-        sample rate below what we deliberately still request Hi-Res for
-        (see DLNACapabilities.max_quality) — e.g. a 24-bit device capped at
-        48kHz by a device-specific override. A device without real 24-bit
-        support never receives a track that could exceed its cap in the
-        first place, since max_quality falls back to CD for it.
-
-        Gated on self._hires_downsampling directly too (not just relying on
-        capability overrides never producing max_bit_depth >= 24 when it's
-        off) — keeps the experimental feature's on/off boundary obvious and
-        self-contained at the one place that actually decides to transcode,
-        rather than an indirect consequence of capability detection
-        elsewhere.
-        """
-        if not self._hires_downsampling:
-            return None
-        caps = self._capabilities
-        if caps is None or caps.max_bit_depth < 24:
-            return None
-        if metadata.sample_rate and metadata.sample_rate > caps.max_sample_rate:
-            return caps.max_sample_rate
-        return None
-
     # =========================================================================
     # Gapless Playback
     # =========================================================================
@@ -950,31 +915,37 @@ class DLNABackend(AudioBackend):
         return self._gapless_supported
 
     async def set_next_track(
-        self, url: str, metadata: BackendTrackMetadata, queue_item_id: int = 0
-    ) -> bool:
+        self, metadata: BackendTrackMetadata, queue_item_id: int = 0
+    ) -> Optional[PlayResult]:
         """Prepare the next track for gapless transition."""
-        if not self._client or not self._gapless_supported:
-            return False
+        if not self._client or not self._gapless_supported or not self._proxy_server:
+            return None
 
-        content_type, transcode_rate = self._resolve_content_type_and_transcode(url, metadata)
-
-        # Register with proxy server using unique key
-        actual_url = url
-        if self._proxy_server:
-            proxy_key = f"{metadata.track_id}_{queue_item_id}"
-            actual_url = self._proxy_server.register_track(
-                track_id=metadata.track_id,
-                qobuz_url=url,
-                content_type=content_type,
-                proxy_key=proxy_key,
-                transcode_to_sample_rate=transcode_rate,
-            )
-            logger.debug(f"Gapless: registered next track proxy URL: {actual_url}")
+        proxy_key = f"{metadata.track_id}_{queue_item_id}"
+        resolved = await self._proxy_server.resolve_track(
+            metadata.track_id,
+            self._capabilities,
+            self._hires_downsampling,
+            proxy_key=proxy_key,
+            forced_format_id=self._quality_override,
+        )
+        if resolved is None:
+            return None
+        logger.debug(f"Gapless: registered next track proxy URL: {resolved.proxy_url}")
 
         # Build DIDL-Lite metadata
-        didl = self._build_didl(actual_url, metadata, content_type)
+        didl = self._build_didl(
+            resolved.proxy_url,
+            metadata,
+            resolved.content_type,
+            resolved.sample_rate,
+            resolved.bit_depth,
+        )
 
-        return await self._arm_next_track(actual_url, didl, metadata)
+        armed = await self._arm_next_track(resolved.proxy_url, didl, metadata)
+        if not armed:
+            return None
+        return PlayResult(blob=resolved.blob, format_id=resolved.format_id)
 
     async def _arm_next_track(
         self, actual_url: str, didl: str, metadata: BackendTrackMetadata
@@ -1316,9 +1287,23 @@ class DLNABackend(AudioBackend):
         self,
         url: str,
         metadata: BackendTrackMetadata,
-        content_type: str = "audio/flac",
+        content_type: str,
+        sample_rate: int,
+        bit_depth: int,
     ) -> str:
-        """Build DIDL-Lite metadata XML."""
+        """Build DIDL-Lite metadata XML.
+
+        Args:
+            sample_rate, bit_depth: What ``url`` actually serves — straight
+                from resolve_track's ResolvedTrack, never re-derived here.
+                The <res> element's sampleFrequency/bitsPerSample must
+                describe what's really on the wire, not Qobuz's native
+                format: a renderer that trusts these declared attributes
+                (rather than re-parsing the WAV header) to compute a
+                REL_TIME seek's byte offset would otherwise land
+                mid-sample-frame and decode noise — audible only on seek,
+                since playback from byte 0 never needs that math.
+        """
 
         def escape(s: str) -> str:
             return (
@@ -1330,7 +1315,9 @@ class DLNABackend(AudioBackend):
 
         # Build protocol info string based on capabilities
         if self._capabilities:
-            protocol_info = build_protocol_info(self._capabilities, content_type)
+            protocol_info = build_protocol_info(
+                self._capabilities, content_type, sample_rate, bit_depth
+            )
         else:
             protocol_info = f"http-get:*:{content_type}:*"
 
@@ -1357,10 +1344,10 @@ class DLNABackend(AudioBackend):
             didl += f"\n        <upnp:albumArtURI>{escape(metadata.artwork_url)}</upnp:albumArtURI>"
 
         audio_attrs = ""
-        if metadata.sample_rate:
-            audio_attrs += f' sampleFrequency="{metadata.sample_rate}"'
-        if metadata.bit_depth:
-            audio_attrs += f' bitsPerSample="{metadata.bit_depth}"'
+        if sample_rate:
+            audio_attrs += f' sampleFrequency="{sample_rate}"'
+        if bit_depth:
+            audio_attrs += f' bitsPerSample="{bit_depth}"'
 
         didl += f"""
         <res protocolInfo="{escape(protocol_info)}"{duration_attr}{audio_attrs}>{escape(url)}</res>

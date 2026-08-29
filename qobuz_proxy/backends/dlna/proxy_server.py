@@ -1,27 +1,43 @@
 """
 Audio Proxy Server.
 
-HTTP server that proxies audio streams from Qobuz CDN to DLNA devices,
-handling URL expiration transparently.
+HTTP server that proxies audio streams from Qobuz CDN to DLNA devices. Owns
+the format/transcoding decision transparently: given a track and a device's
+capabilities, resolve_track() decides whether Qobuz's native format passes
+straight through, gets downsampled on the fly, or falls back to a safe CD-
+tier request — and hands back one proxy URL either way. The renderer never
+knows or cares which; it just GETs a URL.
+
+All actual Qobuz CDN URL fetching/caching lives one layer down, in
+QobuzStreamResolver (see playback/stream_resolver.py) — this class never
+talks to the Qobuz API directly, only to that shared resolver.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
 import socket
 import time
 import traceback
-from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, TYPE_CHECKING
 
 from aiohttp import web, ClientError, ClientSession, ClientTimeout
 
-from .transcoding_reader import TranscodingFlacReader
-from .url_provider import StreamingURLProvider
+from .capabilities import (
+    DLNACapabilities,
+    QOBUZ_QUALITY_MP3,
+    QOBUZ_QUALITY_CD,
+    QOBUZ_QUALITY_192K,
+)
+from .transcoding_reader import BYTES_PER_SAMPLE_24BIT, WAV_HEADER_SIZE, TranscodingFlacReader
+
+if TYPE_CHECKING:
+    from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver, ResolvedStream
 
 logger = logging.getLogger(__name__)
 
-# URL refresh settings
-DEFAULT_URL_MAX_AGE_SECONDS = 240  # Refresh before 5-minute TTL
 STREAM_CHUNK_SIZE = 64 * 1024  # 64KB chunks
 REQUEST_TIMEOUT_SECONDS = 30
 # Per-read timeout: fail fast when the CDN stalls mid-stream instead of hanging
@@ -43,23 +59,33 @@ def _parse_range_start(range_header: str) -> int:
 
 @dataclass
 class RegisteredTrack:
-    """A track registered with the proxy server."""
+    """A track registered with the proxy server — just enough to serve
+    requests for it. The actual CDN URL is never stored here: it's re-
+    resolved (via QobuzStreamResolver, which does its own caching/TTL) on
+    every request that needs one, so this dataclass never goes stale."""
 
     track_id: str
-    qobuz_url: str
+    format_id: int
     content_type: str
-    url_fetched_at: float = field(default_factory=time.time)
     # Set when this track's native format exceeds what the device can
-    # actually handle (see DLNABackend._transcode_sample_rate_for) — served
-    # via TranscodingFlacReader as downsampled PCM/WAV instead of a plain
-    # pass-through of the source FLAC. None is the common case: pass through
-    # unchanged.
+    # actually handle (see resolve_track) — served via TranscodingFlacReader
+    # as downsampled PCM/WAV instead of a plain pass-through of the source
+    # FLAC. None is the common case: pass through unchanged.
     transcode_to_sample_rate: Optional[int] = None
 
-    def is_url_expired(self, max_age: float = DEFAULT_URL_MAX_AGE_SECONDS) -> bool:
-        """Check if the URL has expired or is about to expire."""
-        age = time.time() - self.url_fetched_at
-        return age >= max_age
+
+@dataclass
+class ResolvedTrack:
+    """What resolve_track() decided to serve for one track — everything a
+    caller (DLNABackend) needs to point a device at it and describe it
+    correctly in DIDL-Lite metadata."""
+
+    proxy_url: str
+    content_type: str
+    sample_rate: int
+    bit_depth: int
+    format_id: int
+    blob: str
 
 
 class AudioProxyServer:
@@ -67,51 +93,47 @@ class AudioProxyServer:
     Local HTTP proxy server for DLNA audio streaming.
 
     Provides stable local URLs to DLNA devices while handling:
-    - Qobuz URL expiration (5-minute TTL)
+    - Format/quality decisions (resolve_track) and on-the-fly downsampling
+    - Qobuz URL expiration (via the shared QobuzStreamResolver's own cache)
     - HTTP range requests for seeking
     - Streaming without full buffering
 
     Usage:
-        url_provider = MetadataServiceURLProvider(metadata_service)
-        proxy = AudioProxyServer(
-            url_provider=url_provider,
-            host="0.0.0.0",
-            port=7120,
-        )
+        proxy = AudioProxyServer(resolver=stream_resolver, host="0.0.0.0", port=7120)
         await proxy.start()
 
-        # Register a track before playback
-        proxy_url = proxy.register_track("12345", qobuz_url, "audio/flac")
-        # proxy_url = "http://192.168.1.100:7120/audio/12345.flac"
+        resolved = await proxy.resolve_track(track_id, capabilities, hires_downsampling=True)
+        # resolved.proxy_url = "http://192.168.1.100:7120/audio/12345.flac" (or .wav)
 
-        # Pass proxy_url to DLNA device
+        # Pass resolved.proxy_url to the DLNA device
     """
 
     def __init__(
         self,
-        url_provider: StreamingURLProvider,
+        resolver: "QobuzStreamResolver",
         host: str = "0.0.0.0",
         port: int = 7120,
-        url_max_age: float = DEFAULT_URL_MAX_AGE_SECONDS,
     ):
         """
         Initialize audio proxy server.
 
         Args:
-            url_provider: Provider for fetching fresh streaming URLs
+            resolver: Shared QobuzStreamResolver for fetching/caching CDN URLs
             host: Host to bind to
             port: Port to listen on
-            url_max_age: Maximum URL age before refresh (seconds)
         """
-        self._url_provider = url_provider
+        self._resolver = resolver
         self._host = host
         self._port = port
-        self._url_max_age = url_max_age
 
         self._tracks: Dict[str, RegisteredTrack] = {}
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
+
+        # Cooperative stream supersession — see _claim_stream/_stream_superseded.
+        self._active_streams: Dict[str, tuple[int, web.Request]] = {}
+        self._next_generation = 0
 
         # Will be set after start() to actual bound address
         self._actual_host: Optional[str] = None
@@ -156,65 +178,225 @@ class AudioProxyServer:
             self._runner = None
 
         self._tracks.clear()
+        self._active_streams.clear()
         logger.info("Audio proxy server stopped")
 
-    def register_track(
+    # =========================================================================
+    # Format/quality resolution
+    # =========================================================================
+
+    @staticmethod
+    def _ceiling_tier_for(capabilities: Optional[DLNACapabilities]) -> int:
+        """The initial Qobuz format tier to request for a track.
+
+        Deliberately the highest tier the device's *format* (FLAC support,
+        bit depth) could ever make use of, ignoring its sample-rate cap —
+        so the fits/downsample/fallback decision in resolve_track() is
+        based on the track's true native format (what Qobuz actually hands
+        back), not a capability-clamped guess. A device with real 24-bit
+        support always gets asked for the 192k ceiling even if its own
+        max_sample_rate is much lower: many hi-res tracks are natively
+        mastered at or below that cap anyway, and on the ones that aren't,
+        resolve_track downsamples on the fly instead of falling all the
+        way back to 16-bit.
+        """
+        if capabilities is None or not capabilities.supports_flac:
+            return QOBUZ_QUALITY_MP3
+        if capabilities.max_bit_depth >= 24:
+            return QOBUZ_QUALITY_192K
+        return QOBUZ_QUALITY_CD
+
+    @staticmethod
+    def _fits_device(stream: "ResolvedStream", capabilities: Optional[DLNACapabilities]) -> bool:
+        """Whether what Qobuz actually handed back for this request can be
+        played by the device as-is, with no transcoding."""
+        if capabilities is None or not capabilities.supports_flac:
+            return True  # nothing higher than MP3 was ever requested
+        if stream.format_id == QOBUZ_QUALITY_MP3:
+            return True
+        return (
+            stream.sample_rate <= capabilities.max_sample_rate
+            and stream.bit_depth <= capabilities.max_bit_depth
+        )
+
+    async def resolve_track(
         self,
         track_id: str,
-        qobuz_url: str,
-        content_type: str = "audio/flac",
+        capabilities: Optional[DLNACapabilities],
+        hires_downsampling: bool,
+        *,
         proxy_key: Optional[str] = None,
-        transcode_to_sample_rate: Optional[int] = None,
-    ) -> str:
+        forced_format_id: Optional[int] = None,
+    ) -> Optional[ResolvedTrack]:
         """
-        Register a track for proxying.
+        Decide what to actually serve for this track, and register it.
+
+        Algorithm: always request the device's true format ceiling first
+        (see _ceiling_tier_for) — never a capability-clamped tier — so the
+        decision below is made against what the track *actually* is, not a
+        guess. If that native format already fits the device, pass it
+        through unmodified (this is the common case: most "Hi-Res" tracks
+        aren't actually mastered above a device's real cap). If it doesn't
+        fit and on-the-fly downsampling is enabled, transcode it down to
+        the device's own sample-rate cap. Otherwise, fall back to a plain
+        CD-quality (16/44) request — always within reach of anything that
+        speaks FLAC at all.
 
         Args:
             track_id: Qobuz track ID
-            qobuz_url: Current Qobuz streaming URL
-            content_type: MIME type of the audio
-            proxy_key: Optional key for the proxy URL path (defaults to track_id).
-                       Use a unique key like "{track_id}_{queue_item_id}" to produce
-                       distinct proxy URLs for duplicate tracks in a queue.
-            transcode_to_sample_rate: When set, serve this track downsampled
-                       to this rate (see RegisteredTrack) instead of a plain
-                       pass-through of the source.
+            capabilities: Device capabilities (None if never discovered)
+            hires_downsampling: Whether on-the-fly downsampling is enabled
+            proxy_key: Optional key for the proxy URL path (defaults to
+                track_id). Use a unique key like "{track_id}_{queue_item_id}"
+                to produce distinct proxy URLs for duplicate tracks in a
+                queue (gapless preload).
+            forced_format_id: When set, used as the initial request instead
+                of the capability-derived ceiling (a manual/app-driven
+                quality override) — the fits/transcode/fallback decision
+                still applies on top of it.
 
         Returns:
-            Local proxy URL for the track
+            ResolvedTrack, or None if Qobuz has nothing for this track at all.
         """
+        ceiling = (
+            forced_format_id
+            if forced_format_id is not None
+            else self._ceiling_tier_for(capabilities)
+        )
+        stream = await self._resolver.resolve(track_id, ceiling)
+        if stream is None:
+            return None
+
+        if self._fits_device(stream, capabilities):
+            return self._register_passthrough(track_id, stream, proxy_key)
+
+        if (
+            hires_downsampling
+            and capabilities is not None
+            and capabilities.supports_flac
+            and capabilities.max_bit_depth >= 24
+        ):
+            return self._register_transcode(
+                track_id, stream, capabilities.max_sample_rate, proxy_key
+            )
+
+        cd_stream = await self._resolver.resolve(track_id, QOBUZ_QUALITY_CD)
+        if cd_stream is None:
+            return None
+        return self._register_passthrough(track_id, cd_stream, proxy_key)
+
+    def _register_passthrough(
+        self, track_id: str, stream: "ResolvedStream", proxy_key: Optional[str]
+    ) -> ResolvedTrack:
+        content_type = "audio/mpeg" if stream.format_id == QOBUZ_QUALITY_MP3 else "audio/flac"
+        ext = "mp3" if stream.format_id == QOBUZ_QUALITY_MP3 else "flac"
+        key = proxy_key or track_id
+        self._tracks[key] = RegisteredTrack(
+            track_id=track_id, format_id=stream.format_id, content_type=content_type
+        )
+        proxy_url = f"{self.base_url}/audio/{key}.{ext}"
+        logger.debug(f"Registered track {track_id} (key={key}) -> {proxy_url} [passthrough]")
+        return ResolvedTrack(
+            proxy_url=proxy_url,
+            content_type=content_type,
+            sample_rate=stream.sample_rate,
+            bit_depth=stream.bit_depth,
+            format_id=stream.format_id,
+            blob=stream.blob,
+        )
+
+    def _register_transcode(
+        self,
+        track_id: str,
+        stream: "ResolvedStream",
+        target_sample_rate: int,
+        proxy_key: Optional[str],
+    ) -> ResolvedTrack:
         key = proxy_key or track_id
         self._tracks[key] = RegisteredTrack(
             track_id=track_id,
-            qobuz_url=qobuz_url,
-            content_type=content_type,
-            url_fetched_at=time.time(),
-            transcode_to_sample_rate=transcode_to_sample_rate,
+            format_id=stream.format_id,
+            content_type="audio/wav",
+            transcode_to_sample_rate=target_sample_rate,
+        )
+        proxy_url = f"{self.base_url}/audio/{key}.wav"
+        logger.debug(
+            f"Registered track {track_id} (key={key}) -> {proxy_url} "
+            f"[transcode {stream.sample_rate}Hz -> {target_sample_rate}Hz]"
+        )
+        return ResolvedTrack(
+            proxy_url=proxy_url,
+            content_type="audio/wav",
+            sample_rate=target_sample_rate,
+            bit_depth=BYTES_PER_SAMPLE_24BIT * 8,  # TranscodingFlacReader's fixed output depth
+            format_id=stream.format_id,
+            blob=stream.blob,
         )
 
-        # Determine extension from content type
-        if transcode_to_sample_rate is not None:
-            ext = "wav"
-        else:
-            ext = "flac" if "flac" in content_type else "mp3"
-        proxy_url = f"{self.base_url}/audio/{key}.{ext}"
+    async def _resolve_stream(
+        self, track: RegisteredTrack, force: bool = False
+    ) -> Optional["ResolvedStream"]:
+        """Fetch (or re-fetch) the CDN stream for an already-registered
+        track, via the shared resolver. force=True bypasses the resolver's
+        own cache — required whenever the current URL is known or
+        suspected dead."""
+        try:
+            return await self._resolver.resolve(track.track_id, track.format_id, force=force)
+        except Exception as e:
+            logger.warning(f"Could not resolve URL for track {track.track_id}: {e}")
+            return None
 
-        logger.debug(f"Registered track {track_id} (key={key}) -> {proxy_url}")
-        return proxy_url
+    # =========================================================================
+    # Cooperative stream supersession
+    # =========================================================================
 
-    def unregister_track(self, track_id: str) -> None:
-        """Remove a track from the registry."""
-        if track_id in self._tracks:
-            del self._tracks[track_id]
-            logger.debug(f"Unregistered track {track_id}")
+    def _claim_stream(self, proxy_key: str, request: web.Request) -> int:
+        """Claim the right to serve `proxy_key`'s stream, superseding
+        whatever request (if any) was previously claiming it.
 
-    def update_track_url(self, track_id: str, qobuz_url: str) -> None:
-        """Update the Qobuz URL for a registered track."""
-        if track_id in self._tracks:
-            track = self._tracks[track_id]
-            track.qobuz_url = qobuz_url
-            track.url_fetched_at = time.time()
-            logger.debug(f"Updated URL for track {track_id}")
+        A renderer that fires a new request for a track it's already
+        streaming reproducibly does so on *every* seek: a GET-before-Range
+        probe immediately followed by the real Range request, and/or the
+        previous seek's connection still draining. For however long it
+        keeps both sockets open, it's genuinely receiving two different,
+        both-valid positions of the same track at once — so the previous
+        request's transport is force-closed immediately here, rather than
+        only marked stale for its own loop to notice on its own schedule.
+
+        Returns a generation id the caller must check via
+        _stream_superseded() between its own loop iterations — never mid-
+        call — to stop cleanly once superseded. This never touches the
+        generator/thread doing decode work, only the socket, so it can't
+        reintroduce the "generator already executing" crash a prior
+        Task.cancel()-based approach caused.
+        """
+        self._next_generation += 1
+        generation = self._next_generation
+
+        previous = self._active_streams.get(proxy_key)
+        self._active_streams[proxy_key] = (generation, request)
+
+        if previous is not None:
+            _, previous_request = previous
+            if previous_request is not request:
+                transport = previous_request.transport
+                if transport is not None and not transport.is_closing():
+                    transport.close()
+
+        return generation
+
+    def _stream_superseded(self, proxy_key: str, generation: int) -> bool:
+        """Whether a newer request has claimed proxy_key since `generation`
+        was issued (or the key was never claimed at all)."""
+        current = self._active_streams.get(proxy_key)
+        if current is None:
+            return True
+        current_generation, _ = current
+        return current_generation != generation
+
+    # =========================================================================
+    # Request handling
+    # =========================================================================
 
     async def _handle_audio(self, request: web.Request) -> web.StreamResponse:
         """Handle audio stream requests from DLNA devices."""
@@ -223,27 +405,23 @@ class AudioProxyServer:
         # registers tracks with composite keys like "{track_id}_{queue_item_id}"
         # so duplicates in a queue get distinct proxy URLs.
         proxy_key = request.match_info["track_id"]
-        proxy_key = proxy_key.rsplit(".", 1)[0]  # Remove .flac/.mp3
+        proxy_key = proxy_key.rsplit(".", 1)[0]  # Remove .flac/.mp3/.wav
 
-        # Check if track is registered
         track = self._tracks.get(proxy_key)
         if not track:
             logger.warning(f"Unknown track requested: {proxy_key}")
             return web.Response(status=404, text="Track not found")
 
-        # Check if URL needs refresh. force=True bypasses the metadata cache:
-        # its TTL is longer than the proxy's max age, so a plain fetch inside
-        # the overlap window would hand back the same dying URL while resetting
-        # url_fetched_at — making the proxy trust it for another full cycle.
-        if track.is_url_expired(self._url_max_age):
-            logger.info(f"Refreshing expired URL for track {track.track_id}")
-            if not await self._refresh_track_url(track, force=True):
-                return web.Response(status=502, text="Failed to refresh streaming URL")
+        logger.debug(
+            f"Audio request: key={proxy_key} track={track.track_id} method={request.method} "
+            f"range={request.headers.get('Range')!r} "
+            f"transcode={track.transcode_to_sample_rate}"
+        )
 
         if track.transcode_to_sample_rate is not None:
             if request.method == "HEAD":
                 return await self._handle_transcoded_head_probe(track)
-            return await self._transcode_stream(request, track)
+            return await self._transcode_stream(request, track, proxy_key)
 
         # HEAD probes (Denon/HEOS send one before every GET) route here too via
         # add_get's implicit HEAD support. Answer them headers-only — streaming
@@ -253,7 +431,7 @@ class AudioProxyServer:
             return await self._handle_head_probe(track)
 
         # Forward request to Qobuz CDN
-        return await self._proxy_stream(request, track)
+        return await self._proxy_stream(request, track, proxy_key)
 
     async def _handle_head_probe(self, track: RegisteredTrack) -> web.Response:
         """Answer a HEAD probe from upstream headers, without a body transfer."""
@@ -261,10 +439,13 @@ class AudioProxyServer:
         # and refuses `.content_length = ...` afterwards (RuntimeError) — it
         # has to go in the headers dict at construction time instead.
         headers = {"Content-Type": track.content_type, "Accept-Ranges": "bytes"}
+        stream = await self._resolve_stream(track)
+        if stream is None:
+            return web.Response(status=200, headers=headers)
         timeout = ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
             async with ClientSession(timeout=timeout) as session:
-                async with session.head(track.qobuz_url, allow_redirects=True) as upstream:
+                async with session.head(stream.url, allow_redirects=True) as upstream:
                     cl = upstream.headers.get("Content-Length")
                     if upstream.status in (200, 206) and cl and cl.isdigit():
                         headers["Content-Length"] = cl
@@ -276,20 +457,17 @@ class AudioProxyServer:
 
     def _make_sync_url_refresher(self, track: RegisteredTrack) -> Callable[[], Optional[str]]:
         """A synchronous callable, safe to invoke from a worker thread, that
-        refreshes track.qobuz_url via the (async) url_provider and returns
+        refreshes the track's CDN URL via the (async) resolver and returns
         the new URL. Bridges LazyHttpFlacSource's synchronous retry-on-
         expired-URL path (see its module docstring) back onto the event
         loop, where the real refresh happens — long tracks can easily
-        outlive a signed URL's TTL mid-stream (see
-        DEFAULT_URL_MAX_AGE_SECONDS), same risk _proxy_stream already
-        handles for the pass-through path.
+        outlive a signed URL's TTL mid-stream, same risk _proxy_stream
+        already handles for the pass-through path.
         """
         loop = asyncio.get_event_loop()
 
         def _refresh() -> Optional[str]:
-            future = asyncio.run_coroutine_threadsafe(
-                self._refresh_track_url(track, force=True), loop
-            )
+            future = asyncio.run_coroutine_threadsafe(self._resolve_stream(track, force=True), loop)
             try:
                 refreshed = future.result(timeout=REQUEST_TIMEOUT_SECONDS)
             except Exception as e:
@@ -297,7 +475,7 @@ class AudioProxyServer:
                     f"URL refresh (from transcode thread) failed for track {track.track_id}: {e}"
                 )
                 return None
-            return track.qobuz_url if refreshed else None
+            return refreshed.url if refreshed else None
 
         return _refresh
 
@@ -307,14 +485,21 @@ class AudioProxyServer:
         STREAMINFO alone — cheap, no decoding."""
         headers = {"Content-Type": "audio/wav", "Accept-Ranges": "bytes"}
         assert track.transcode_to_sample_rate is not None
+        stream = await self._resolve_stream(track)
+        if stream is None:
+            return web.Response(status=200, headers=headers)
         try:
             reader = await asyncio.to_thread(
                 TranscodingFlacReader,
-                track.qobuz_url,
+                stream.url,
                 track.transcode_to_sample_rate,
                 refresh_url=self._make_sync_url_refresher(track),
             )
             headers["Content-Length"] = str(reader.content_length)
+            logger.debug(
+                f"Transcoded HEAD probe for track {track.track_id}: "
+                f"Content-Length={reader.content_length}"
+            )
         except Exception as e:
             logger.debug(f"Transcoded HEAD probe failed for track {track.track_id}: {e}")
         return web.Response(status=200, headers=headers)
@@ -323,6 +508,7 @@ class AudioProxyServer:
         self,
         request: web.Request,
         track: RegisteredTrack,
+        proxy_key: str,
     ) -> web.StreamResponse:
         """Serve a track downsampled to track.transcode_to_sample_rate as
         PCM/WAV — see TranscodingFlacReader. A fresh reader is opened per
@@ -332,10 +518,16 @@ class AudioProxyServer:
         long-lived GET plus at most a few seeks, not a flood of tiny reads.
         """
         assert track.transcode_to_sample_rate is not None
+        generation = self._claim_stream(proxy_key, request)
+
+        stream = await self._resolve_stream(track)
+        if stream is None:
+            return web.Response(status=502, text="Failed to resolve streaming URL")
+
         try:
             reader = await asyncio.to_thread(
                 TranscodingFlacReader,
-                track.qobuz_url,
+                stream.url,
                 track.transcode_to_sample_rate,
                 refresh_url=self._make_sync_url_refresher(track),
             )
@@ -346,6 +538,33 @@ class AudioProxyServer:
         range_header = request.headers.get("Range")
         start_byte = _parse_range_start(range_header) if range_header else 0
         start_byte = max(0, min(start_byte, reader.content_length))
+
+        # We're simulating a plain static file on disk — the same thing a
+        # dumb NAS would serve. The renderer parsed our WAV header once (it
+        # always fetches from byte 0 first) and finds its own alignment
+        # from there; a static file server never needs to "help" with
+        # that, it only ever needs to hand back the literal bytes that
+        # exist at the requested offset. So: whatever byte the renderer
+        # asks for, that's exactly what we declare *and* exactly what the
+        # response starts with — never a rounded/corrected position.
+        #
+        # The one thing we can't avoid: our decoder only ever produces
+        # whole PCM frames, so reconstructing the *true* bytes at an
+        # arbitrary offset means decoding from the containing frame and
+        # discarding the leading bytes that fall before the requested
+        # byte before writing anything out — exactly what reading an
+        # arbitrary byte offset from a real file on disk would hand back,
+        # nothing more.
+        bytes_per_frame = reader.channels * BYTES_PER_SAMPLE_24BIT
+        if start_byte < WAV_HEADER_SIZE:
+            aligned_start_byte = start_byte
+        else:
+            data_offset = start_byte - WAV_HEADER_SIZE
+            aligned_start_byte = (
+                WAV_HEADER_SIZE + (data_offset // bytes_per_frame) * bytes_per_frame
+            )
+        leading_trim = start_byte - aligned_start_byte
+
         remaining = reader.content_length - start_byte
 
         headers = {"Content-Type": "audio/wav", "Accept-Ranges": "bytes"}
@@ -356,33 +575,65 @@ class AudioProxyServer:
             )
         response = web.StreamResponse(status=206 if range_header else 200, headers=headers)
         response.content_length = remaining
-        await response.prepare(request)
 
-        # Drive the reader's (synchronous, blocking) generator one step at a
-        # time from a worker thread — each to_thread(next, ...) call runs
-        # entirely inside that call, so if the client disconnects and this
-        # loop simply stops calling next(), nothing is left running in the
-        # background (no orphaned thread, no stuck queue).
-        gen = reader.stream_from(start_byte)
+        bytes_written = 0
+        stream_start = time.monotonic()
+        outcome = "completed"
         try:
-            while True:
-                chunk = await asyncio.to_thread(next, gen, None)
-                if chunk is None:
-                    break
-                await response.write(chunk)
+            # response.prepare() can itself raise if this request's
+            # transport was already force-closed by a newer claim on the
+            # same key while we were still opening the reader above (see
+            # _claim_stream) — must be caught here, not left to escape the
+            # handler.
+            await response.prepare(request)
+
+            # Drive the reader's (synchronous, blocking) generator one step
+            # at a time from a worker thread — each to_thread(next, ...)
+            # call runs entirely inside that call, so if a newer request
+            # supersedes this one and we simply stop calling next(), nothing
+            # is left running in the background (no orphaned thread, no
+            # stuck queue), and gen.close() below never races a generator
+            # still genuinely executing.
+            gen = reader.stream_from(aligned_start_byte)
+            try:
+                while True:
+                    if self._stream_superseded(proxy_key, generation):
+                        outcome = "superseded"
+                        break
+                    chunk = await asyncio.to_thread(next, gen, None)
+                    if chunk is None:
+                        break
+                    if self._stream_superseded(proxy_key, generation):
+                        outcome = "superseded"
+                        break
+                    if leading_trim:
+                        if len(chunk) <= leading_trim:
+                            leading_trim -= len(chunk)
+                            continue
+                        chunk = chunk[leading_trim:]
+                        leading_trim = 0
+                    await response.write(chunk)
+                    bytes_written += len(chunk)
+            finally:
+                gen.close()
         except (ConnectionResetError, asyncio.CancelledError):
+            outcome = "disconnected"
             logger.debug(f"Client disconnected mid-transcode for track {track.track_id}")
         except Exception as e:
+            outcome = "error"
             logger.error(f"Transcoding stream error for track {track.track_id}: {e}")
-        finally:
-            gen.close()
 
+        logger.debug(
+            f"Transcode response for track {track.track_id} done: {outcome}, "
+            f"{bytes_written} bytes in {time.monotonic() - stream_start:.1f}s"
+        )
         return response
 
     async def _proxy_stream(
         self,
         request: web.Request,
         track: RegisteredTrack,
+        proxy_key: str,
     ) -> web.StreamResponse:
         """Proxy the audio stream from Qobuz CDN.
 
@@ -391,6 +642,12 @@ class AudioProxyServer:
         request from the last byte delivered to the client instead of dropping
         the renderer's stream mid-track.
         """
+        generation = self._claim_stream(proxy_key, request)
+
+        stream = await self._resolve_stream(track)
+        if stream is None:
+            return web.Response(status=502, text="Failed to resolve streaming URL")
+
         # Build headers for upstream request
         headers: Dict[str, str] = {}
 
@@ -421,12 +678,11 @@ class AudioProxyServer:
 
             try:
                 logger.debug(
-                    f"Connecting to upstream URL for track {track.track_id}: "
-                    f"{track.qobuz_url[:100]}..."
+                    f"Connecting to upstream URL for track {track.track_id}: {stream.url[:100]}..."
                 )
                 async with ClientSession(timeout=timeout) as session:
                     async with session.get(
-                        track.qobuz_url,
+                        stream.url,
                         headers=upstream_headers,
                     ) as upstream_response:
                         if upstream_response.status not in (200, 206):
@@ -444,7 +700,9 @@ class AudioProxyServer:
                                     f"{track.track_id} — URL likely expired; fetching "
                                     "a fresh URL and retrying"
                                 )
-                                if await self._refresh_track_url(track, force=True):
+                                refreshed = await self._resolve_stream(track, force=True)
+                                if refreshed is not None:
+                                    stream = refreshed
                                     continue
                             logger.warning(
                                 f"Upstream error for track {track.track_id}: "
@@ -497,6 +755,12 @@ class AudioProxyServer:
                         async for chunk in upstream_response.content.iter_chunked(
                             STREAM_CHUNK_SIZE
                         ):
+                            if self._stream_superseded(proxy_key, generation):
+                                logger.debug(
+                                    f"Stream for track {track.track_id} superseded by a "
+                                    "newer request; stopping"
+                                )
+                                return response
                             try:
                                 await response.write(chunk)
                                 bytes_sent += len(chunk)
@@ -550,7 +814,9 @@ class AudioProxyServer:
                     f"reconnecting ({retries}/{MAX_UPSTREAM_RETRIES})"
                 )
                 await asyncio.sleep(UPSTREAM_RETRY_DELAY_SECONDS * retries)
-                await self._refresh_track_url(track, force=True)
+                refreshed = await self._resolve_stream(track, force=True)
+                if refreshed is not None:
+                    stream = refreshed
             except (ConnectionResetError, ConnectionError) as e:
                 # Client disconnected - this is normal when Sonos probes or seeks
                 logger.debug(
@@ -561,32 +827,11 @@ class AudioProxyServer:
                 return web.Response(status=499, text="Client closed connection")
             except Exception as e:
                 logger.error(f"Proxy error for track {track.track_id}: {type(e).__name__}: {e}")
-                logger.error(f"URL was: {track.qobuz_url[:100]}...")
+                logger.error(f"URL was: {stream.url[:100]}...")
                 logger.debug(f"Full traceback: {traceback.format_exc()}")
                 if response is not None:
                     return response
                 return web.Response(status=502, text=f"Proxy error: {e}")
-
-    async def _refresh_track_url(self, track: RegisteredTrack, force: bool = False) -> bool:
-        """Fetch a fresh streaming URL before retrying (signed URLs can go stale).
-
-        force=True bypasses the URL provider's cache — required whenever the
-        current URL is known or suspected dead, since a cached "valid" URL may
-        be the very one that just failed.
-
-        Returns:
-            True if a fresh URL was applied, False if the refresh failed.
-        """
-        try:
-            fresh_url = await self._url_provider.get_streaming_url(track.track_id, force=force)
-            track.qobuz_url = fresh_url
-            track.url_fetched_at = time.time()
-            return True
-        except Exception as e:
-            logger.warning(
-                f"Could not refresh URL for track {track.track_id}: {e}; retrying with old URL"
-            )
-            return False
 
     def _log_stream_end(
         self,

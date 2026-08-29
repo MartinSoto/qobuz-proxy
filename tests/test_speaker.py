@@ -36,11 +36,20 @@ def _make_api_client() -> MagicMock:
     return MagicMock()
 
 
+def _make_stream_resolver() -> MagicMock:
+    return MagicMock()
+
+
 class TestSpeakerConstruction:
     def test_creates_with_config(self):
         config = _make_speaker_config(name="Living Room")
         api_client = _make_api_client()
-        speaker = Speaker(config=config, api_client=api_client, app_id="my-app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=api_client,
+            app_id="my-app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         assert speaker._config is config
         assert speaker._api_client is api_client
@@ -49,12 +58,22 @@ class TestSpeakerConstruction:
 
     def test_name_property(self):
         config = _make_speaker_config(name="Bedroom")
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
         assert speaker.name == "Bedroom"
 
     def test_initial_component_slots_are_none(self):
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         assert speaker._discovery is None
         assert speaker._ws_manager is None
@@ -69,7 +88,12 @@ class TestSpeakerConstruction:
 
     def test_build_component_config_maps_name_and_uuid(self):
         config = _make_speaker_config(name="Salon", uuid="abc-123")
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         comp = speaker._build_component_config()
 
@@ -84,7 +108,12 @@ class TestSpeakerConstruction:
             dlna_fixed_volume=True,
             proxy_port=7120,
         )
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         comp = speaker._build_component_config()
 
@@ -100,7 +129,12 @@ class TestSpeakerConstruction:
             audio_device="hw:1",
             audio_buffer_size=4096,
         )
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         comp = speaker._build_component_config()
 
@@ -110,7 +144,12 @@ class TestSpeakerConstruction:
 
     def test_build_component_config_maps_server(self):
         config = _make_speaker_config(http_port=9000, bind_address="192.168.1.5")
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         comp = speaker._build_component_config()
 
@@ -119,7 +158,12 @@ class TestSpeakerConstruction:
 
     def test_build_component_config_maps_quality(self):
         config = _make_speaker_config(max_quality=6)
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         comp = speaker._build_component_config()
 
@@ -127,7 +171,12 @@ class TestSpeakerConstruction:
 
     def test_build_component_config_returns_config_instance(self):
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         comp = speaker._build_component_config()
 
@@ -138,7 +187,12 @@ class TestSpeakerLifecycle:
     async def test_start_creates_backend_and_discovery(self):
         """start() should set up backend, player, queue, and discovery."""
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         mock_backend = MagicMock()
         mock_backend.name = "Mock DLNA Backend"
@@ -170,7 +224,12 @@ class TestSpeakerLifecycle:
         from qobuz_proxy.backends.dlna import DLNABackend
 
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         mock_backend = MagicMock(spec=DLNABackend)
         mock_backend.name = "Mock DLNA"
@@ -205,7 +264,12 @@ class TestSpeakerLifecycle:
         from qobuz_proxy.backends.dlna import DLNABackend
 
         config = _make_speaker_config(max_quality=AUTO_QUALITY)
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         mock_backend = MagicMock(spec=DLNABackend)
         mock_backend.name = "Mock DLNA"
@@ -234,7 +298,12 @@ class TestSpeakerLifecycle:
         from qobuz_proxy.config import AUTO_FALLBACK_QUALITY
 
         config = _make_speaker_config(max_quality=AUTO_QUALITY)
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         mock_backend = MagicMock(spec=DLNABackend)
         mock_backend.name = "Mock DLNA"
@@ -260,7 +329,12 @@ class TestSpeakerLifecycle:
     async def test_start_failure_returns_false(self):
         """If BackendFactory raises, start() should return False and not raise."""
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         with patch(
             "qobuz_proxy.speaker.BackendFactory.create_from_config",
@@ -275,7 +349,12 @@ class TestSpeakerLifecycle:
     async def test_start_failure_does_not_raise(self):
         """start() should swallow exceptions and return False, not propagate."""
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         with patch(
             "qobuz_proxy.speaker.BackendFactory.create_from_config",
@@ -290,7 +369,12 @@ class TestSpeakerLifecycle:
     async def test_stop_tears_down_components(self):
         """stop() should call stop/disconnect on all wired components."""
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         # Simulate already-started state
         speaker._is_running = True
@@ -320,14 +404,24 @@ class TestSpeakerLifecycle:
     async def test_stop_is_safe_with_no_components(self):
         """stop() on a speaker that never fully started should not raise."""
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
         # All slots are None, _is_running is False
         await speaker.stop()  # Should not raise
 
     async def test_stop_continues_if_one_component_errors(self):
         """stop() should teardown all components even if some raise exceptions."""
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         speaker._is_running = True
         speaker._state_reporter = MagicMock()
@@ -345,7 +439,12 @@ class TestSpeakerWebSocket:
     async def test_setup_websocket_wires_gapless_rearm_callback(self):
         """Queue edits mid-track must re-arm gapless via the command handler callback."""
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
         speaker._queue = MagicMock()
         player = MagicMock()
         player.start = AsyncMock()
@@ -379,7 +478,12 @@ class TestSpeakerWebSocket:
     async def test_setup_websocket_refreshes_existing_manager(self):
         """If ws_manager already exists, _setup_websocket should only refresh tokens."""
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
         speaker._queue = MagicMock()
         speaker._player = MagicMock()
         speaker._ws_manager = MagicMock()
@@ -406,7 +510,12 @@ class TestSpeakerWebSocket:
         import asyncio
 
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         tokens = ConnectTokens(
             session_id=str(uuid.uuid4()),
@@ -435,20 +544,30 @@ class TestSpeakerWebSocket:
 class TestSpeakerQualityChange:
     async def test_quality_change_updates_effective_quality(self):
         config = _make_speaker_config(max_quality=27)
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
-        speaker._metadata_service = MagicMock()
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
+        speaker._backend = MagicMock()
         speaker._player = MagicMock()
         speaker._player.reload_current_track = AsyncMock()
 
         await speaker._on_quality_change(6)
 
         assert speaker._effective_quality == 6
-        speaker._metadata_service.set_max_quality.assert_called_once_with(6)
+        speaker._backend.set_quality_override.assert_called_once_with(6)
         speaker._player.reload_current_track.assert_called_once()
 
     async def test_quality_change_noop_if_same(self):
         config = _make_speaker_config(max_quality=27)
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
         speaker._effective_quality = 27
         speaker._metadata_service = MagicMock()
         speaker._player = MagicMock()
@@ -465,7 +584,12 @@ class TestSpeakerStateReport:
         from qobuz_proxy.backends import PlaybackState
 
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
         speaker._ws_manager = MagicMock()
         speaker._ws_manager.send_state_update = AsyncMock()
 
@@ -487,7 +611,12 @@ class TestSpeakerStateReport:
         from qobuz_proxy.backends import PlaybackState
 
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
         speaker._ws_manager = MagicMock()
         speaker._ws_manager.send_state_update = AsyncMock()
 
@@ -507,7 +636,12 @@ class TestSpeakerStateReport:
 
     async def test_send_state_report_noop_without_ws_manager(self):
         config = _make_speaker_config()
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
         speaker._ws_manager = None
 
         report = MagicMock()
@@ -523,7 +657,12 @@ class TestQualitySourceStatus:
         from qobuz_proxy.backends.dlna import DLNABackend
 
         config = _make_speaker_config(max_quality=AUTO_QUALITY)
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
 
         mock_backend = MagicMock(spec=DLNABackend)
         mock_backend.name = "Mock DLNA"
@@ -571,7 +710,12 @@ class TestQualitySourceStatus:
 
     def test_manual_quality(self):
         config = _make_speaker_config(max_quality=27)
-        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="id",
+            stream_resolver=_make_stream_resolver(),
+        )
         cfg = speaker.get_status()["config"]
 
         assert cfg["max_quality"] == 27
@@ -585,6 +729,7 @@ class TestSpeakerRename:
             config=_make_speaker_config(name="Kitchen"),
             api_client=_make_api_client(),
             app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
         )
 
     async def test_noop_when_name_unchanged(self):
@@ -679,6 +824,7 @@ class TestSpeakerRetarget:
             config=_make_speaker_config(name="Kitchen", dlna_ip="10.0.1.30"),
             api_client=_make_api_client(),
             app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
         )
 
     async def test_delegates_to_player_and_updates_config_on_success(self):
@@ -723,6 +869,7 @@ class TestSpeakerDetach:
             config=_make_speaker_config(name="Kitchen", dlna_ip="10.0.1.30"),
             api_client=_make_api_client(),
             app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
         )
 
     async def test_delegates_to_player(self):
@@ -747,6 +894,7 @@ class TestSpeakerIsActive:
             config=_make_speaker_config(name="Kitchen", dlna_ip="10.0.1.30"),
             api_client=_make_api_client(),
             app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
         )
 
     def test_false_before_player_exists(self):

@@ -38,6 +38,7 @@ class TestStartSpeakersBranching:
         config = _make_config(sonos_auto_discover=True, speakers=[SpeakerConfig(name="Manual")])
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
         app._sonos_event_subscriber = MagicMock()
 
         mock_controller = MagicMock()
@@ -59,6 +60,7 @@ class TestStartSpeakersBranching:
         config = _make_config(sonos_auto_discover=False, speakers=[SpeakerConfig(name="Manual")])
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
 
         speaker = _mock_speaker("Manual")
         with (
@@ -77,6 +79,7 @@ class TestStartSpeakersBranching:
         config = _make_config(sonos_auto_discover=True)
         app = QobuzProxy(config)
         app._api_client = MagicMock()
+        app._stream_resolver = MagicMock()
         app._sonos_event_subscriber = MagicMock()
         existing = MagicMock()
         app._sonos_controller = existing
