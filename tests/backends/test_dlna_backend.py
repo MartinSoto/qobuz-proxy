@@ -771,6 +771,9 @@ class TestPollStateLoop:
         backend._external_takeover_notified = False
         backend._awaiting_retarget_confirmation = False
         backend._retarget_confirmation_deadline = 0.0
+        backend._awaiting_seek_confirmation = False
+        backend._seek_target_ms = 0
+        backend._seek_confirmation_deadline = 0.0
         backend._active = True
         backend._proxy_server = None
         backend._on_state_change = None
@@ -1355,3 +1358,136 @@ class TestPollStateLoop:
 
         callback.assert_not_called()
         assert backend._unconfirmed_stop_polls == 0
+
+
+class TestSeekConfirmation:
+    """seek() has to notify the app optimistically for instant UI feedback,
+    but GetPositionInfo has real, measurable latency afterward — the device
+    keeps reporting wherever it was playing *before* the seek, still
+    advancing normally, for up to a couple of seconds (see
+    SEEK_CONFIRMATION_TIMEOUT_SECONDS). _poll_state_loop must not relay one
+    of those stale readings to the app: it would visibly snap the progress
+    bar backward, then forward again once a later poll actually confirms
+    the seek — exactly the "position jumps back" symptom this guards
+    against."""
+
+    def _make_backend(self) -> DLNABackend:
+        return TestPollStateLoop()._make_backend()
+
+    async def _run_poll_cycles(self, backend: DLNABackend, cycles: int = 1) -> None:
+        await TestPollStateLoop()._run_poll_cycles(backend, cycles=cycles)
+
+    async def test_seek_sets_awaiting_confirmation(self) -> None:
+        import time
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._client.seek = AsyncMock(return_value=True)
+
+        await backend.seek(120_000)
+
+        assert backend._awaiting_seek_confirmation is True
+        assert backend._seek_target_ms == 120_000
+        assert backend._seek_confirmation_deadline > time.monotonic()
+
+    async def test_seek_notifies_the_optimistic_target_immediately(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._client.seek = AsyncMock(return_value=True)
+        callback = MagicMock()
+        backend.on_position_update(callback)
+
+        await backend.seek(120_000)
+
+        callback.assert_called_once_with(120_000)
+
+    async def test_stale_poll_behind_target_is_not_relayed(self) -> None:
+        """The exact scenario observed live: a seek to 262622ms, and the
+        very next poll still reads 129000ms — the real, pre-seek position,
+        just continuing to advance normally. That must not reach the app."""
+        import time
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._awaiting_seek_confirmation = True
+        backend._seek_target_ms = 262_622
+        backend._seek_confirmation_deadline = time.monotonic() + 3600
+        backend.get_position = AsyncMock(return_value=129_000)
+        callback = MagicMock()
+        backend.on_position_update(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_not_called()
+        assert backend._awaiting_seek_confirmation is True  # still waiting
+
+    async def test_poll_at_or_past_target_confirms_and_relays(self) -> None:
+        import time
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._awaiting_seek_confirmation = True
+        backend._seek_target_ms = 262_622
+        backend._seek_confirmation_deadline = time.monotonic() + 3600
+        backend.get_position = AsyncMock(return_value=263_000)
+        callback = MagicMock()
+        backend.on_position_update(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_called_once_with(263_000)
+        assert backend._awaiting_seek_confirmation is False
+
+    async def test_poll_within_tolerance_below_target_still_confirms(self) -> None:
+        """GetPositionInfo rounds to the nearest second and playback keeps
+        advancing while we wait — an exact match isn't guaranteed even
+        once the device has genuinely applied the seek."""
+        import time
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._awaiting_seek_confirmation = True
+        backend._seek_target_ms = 262_622
+        backend._seek_confirmation_deadline = time.monotonic() + 3600
+        backend.get_position = AsyncMock(return_value=261_500)  # within tolerance below target
+
+        await self._run_poll_cycles(backend)
+
+        assert backend._awaiting_seek_confirmation is False
+
+    async def test_confirmation_times_out_and_relays_anyway(self) -> None:
+        import time
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._awaiting_seek_confirmation = True
+        backend._seek_target_ms = 262_622
+        backend._seek_confirmation_deadline = time.monotonic() - 1  # already passed
+        backend.get_position = AsyncMock(return_value=129_000)  # never actually confirmed
+        callback = MagicMock()
+        backend.on_position_update(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_called_once_with(129_000)
+        assert backend._awaiting_seek_confirmation is False
+
+    async def test_stop_clears_a_stale_seek_confirmation_wait(self) -> None:
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._client.stop = AsyncMock(return_value=True)
+        backend._awaiting_seek_confirmation = True
+
+        await backend.stop()
+
+        assert backend._awaiting_seek_confirmation is False
