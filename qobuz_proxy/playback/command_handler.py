@@ -85,7 +85,7 @@ class PlaybackCommandHandler:
         """Handle a playback command message."""
         # TEMP: dump the raw message as-is, no interpretation — remove once
         # the next/previous investigation is done.
-        logger.info(f"TEMP raw message (type {msg_type}): {message}")
+        logger.debug(f"Raw message (type {msg_type}): {message}")
         try:
             if msg_type == MSG_TYPE_SET_STATE:
                 await self._handle_set_state(message)
