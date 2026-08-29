@@ -367,3 +367,131 @@ class TestUrlRefreshOnExpiry:
                 )
         finally:
             await server.stop()
+
+
+class FlakyThenHealthyUpstream:
+    """Fails the first N requests with a connection reset, then serves
+    normally — a stand-in for a transient CDN blip (dropped connection,
+    a momentary 502/503) rather than a genuinely dead URL."""
+
+    def __init__(self, payload: bytes, fail_count: int):
+        self._payload = payload
+        self._fail_count = fail_count
+        self._seen = 0
+        self._runner: web.AppRunner | None = None
+
+    async def _handle(self, request: web.Request) -> web.StreamResponse:
+        self._seen += 1
+        if self._seen <= self._fail_count:
+            # Abruptly close the connection without a valid HTTP response —
+            # surfaces to urllib as a connection-level failure, not a
+            # parseable HTTP status.
+            assert request.transport is not None
+            request.transport.close()
+            return web.Response(status=499)
+
+        rng = request.headers.get("Range")
+        if request.method == "HEAD":
+            return web.Response(
+                status=200,
+                headers={"Accept-Ranges": "bytes", "Content-Length": str(len(self._payload))},
+            )
+        if not rng:
+            return web.Response(
+                status=200,
+                body=self._payload,
+                headers={"Accept-Ranges": "bytes", "Content-Length": str(len(self._payload))},
+            )
+        start_s, end_s = rng.removeprefix("bytes=").split("-")
+        start = int(start_s)
+        end = int(end_s) if end_s else len(self._payload) - 1
+        end = min(end, len(self._payload) - 1)
+        body = self._payload[start : end + 1]
+        return web.Response(
+            status=206,
+            body=body,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(len(body)),
+                "Content-Range": f"bytes {start}-{end}/{len(self._payload)}",
+            },
+        )
+
+    async def start(self) -> str:
+        app = web.Application()
+        app.router.add_get("/file.flac", self._handle)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        port = _free_port()
+        site = web.TCPSite(self._runner, "127.0.0.1", port)
+        await site.start()
+        return f"http://127.0.0.1:{port}/file.flac"
+
+    async def stop(self) -> None:
+        if self._runner:
+            await self._runner.cleanup()
+
+
+class AlwaysFailingUpstream:
+    """Rejects every single request with a connection reset — a genuinely
+    persistent failure, never recovers."""
+
+    def __init__(self) -> None:
+        self._runner: web.AppRunner | None = None
+        self.request_count = 0
+
+    async def _handle(self, request: web.Request) -> web.StreamResponse:
+        self.request_count += 1
+        assert request.transport is not None
+        request.transport.close()
+        return web.Response(status=499)
+
+    async def start(self) -> str:
+        app = web.Application()
+        app.router.add_get("/file.flac", self._handle)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        port = _free_port()
+        site = web.TCPSite(self._runner, "127.0.0.1", port)
+        await site.start()
+        return f"http://127.0.0.1:{port}/file.flac"
+
+    async def stop(self) -> None:
+        if self._runner:
+            await self._runner.cleanup()
+
+
+class TestTransientConnectionRetry:
+    """A dropped connection, a stalled socket, a momentary CDN 5xx — none
+    of these mean the URL is dead, unlike an expired-signature status. A
+    brief, bounded retry should recover from these instead of aborting
+    the whole transcode request over one blip — see MAX_CONNECTION_RETRIES."""
+
+    async def test_recovers_from_a_transient_failure_within_the_retry_budget(self) -> None:
+        flac_bytes, _original = _make_test_flac()
+        # Fails twice, succeeds on the third try — within MAX_CONNECTION_RETRIES.
+        server = FlakyThenHealthyUpstream(flac_bytes, fail_count=2)
+        url = await server.start()
+        try:
+            source = await asyncio.to_thread(LazyHttpFlacSource, url)
+            assert source._total_size == len(flac_bytes)
+        finally:
+            await server.stop()
+
+    async def test_gives_up_after_exhausting_the_retry_budget_with_a_clear_error(self) -> None:
+        server = AlwaysFailingUpstream()
+        url = await server.start()
+        try:
+            with pytest.raises(OSError) as exc_info:
+                await asyncio.to_thread(LazyHttpFlacSource, url)
+            # The whole point: a clear, specific message — not just
+            # whatever terse text the underlying connection error carried
+            # ("Connection lost" and similar tell an operator nothing on
+            # their own).
+            message = str(exc_info.value)
+            assert "Qobuz CDN" in message
+            assert "retries" in message
+            # Retried the full budget, not given up after the first failure.
+            assert server.request_count == 4  # 1 initial + MAX_CONNECTION_RETRIES
+        finally:
+            await server.stop()
