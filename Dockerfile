@@ -25,8 +25,9 @@ COPY pyproject.toml README.md ./
 COPY qobuz_proxy/ ./qobuz_proxy/
 COPY protos/ ./protos/
 
-# Install package
-RUN pip install --no-cache-dir .
+# Install package, including the `hires` extra (numpy/soundfile/soxr) needed
+# for on-the-fly Hi-Res downsampling on the DLNA transcoding path.
+RUN pip install --no-cache-dir ".[hires]"
 
 # Create data directory and set ownership
 RUN mkdir -p /data && chown qobuzproxy:qobuzproxy /data
