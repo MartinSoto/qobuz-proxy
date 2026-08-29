@@ -98,6 +98,25 @@ PLAYBACK_START_GRACE_PERIOD_SECONDS = 5.0
 # against a handoff that genuinely never completes.
 RETARGET_CONFIRMATION_TIMEOUT_SECONDS = 30.0
 
+# How long to suppress position-poll notifications after a seek, waiting for
+# the device's own GetPositionInfo to actually reflect it, before giving up
+# and trusting polls again regardless (seconds) — see seek()'s
+# _awaiting_seek_confirmation. A SOAP Seek has measurable device-side
+# latency: GetPositionInfo keeps reporting wherever the device was actually
+# playing *before* the seek — still advancing normally — for a real, visible
+# window afterward (observed directly: 0.5-2.5s across two seeks on the same
+# track). Relaying that stale-but-genuine reading to the app between the
+# optimistic post-seek notification and the device actually catching up
+# snaps the progress bar backward, then forward again once a later poll
+# confirms it. Generous but bounded, same "wait for the actual signal, not a
+# guessed duration" philosophy as RETARGET_CONFIRMATION_TIMEOUT_SECONDS.
+SEEK_CONFIRMATION_TIMEOUT_SECONDS = 6.0
+# A polled position within this much of the seek target still counts as
+# "caught up" — GetPositionInfo rounds to the nearest second and playback
+# keeps advancing in real time while we wait, so an exact match isn't
+# guaranteed even once the device has genuinely applied the seek.
+SEEK_CONFIRMATION_TOLERANCE_MS = 1500
+
 # How long play() waits for a detached backend to reconnect before giving
 # up (seconds). A Sonos group_id going pending (see SonosDiscoveryManager)
 # detaches this backend for what's normally a few seconds while the
@@ -246,6 +265,16 @@ class DLNABackend(AudioBackend):
         self._awaiting_retarget_confirmation: bool = False
         self._retarget_confirmation_deadline: float = 0.0
 
+        # Set by seek(), cleared once the device's own GetPositionInfo
+        # actually reflects the target (or the confirmation window times
+        # out) — see SEEK_CONFIRMATION_TIMEOUT_SECONDS. While True,
+        # _poll_state_loop suppresses position-update notifications that
+        # are still behind the target instead of relaying a stale,
+        # pre-seek reading to the app.
+        self._awaiting_seek_confirmation: bool = False
+        self._seek_target_ms: int = 0
+        self._seek_confirmation_deadline: float = 0.0
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -337,6 +366,9 @@ class DLNABackend(AudioBackend):
         self._next_track_queue_nr = None
         self._gapless_supported = True
         self._external_takeover_notified = False
+        # A seek issued to the *old* device has nothing to confirm on a
+        # different physical player.
+        self._awaiting_seek_confirmation = False
 
         self._ip = ip
         self._port = port
@@ -536,6 +568,9 @@ class DLNABackend(AudioBackend):
         self._next_track_proxy_url = None
         self._next_track_metadata = None
         self._next_track_queue_nr = None
+        # A prior seek's confirmation wait is meaningless against a
+        # freshly loaded track.
+        self._awaiting_seek_confirmation = False
 
         self._current_metadata = metadata
         self._duration_ms = metadata.duration_ms
@@ -662,6 +697,7 @@ class DLNABackend(AudioBackend):
         self._next_track_proxy_url = None
         self._next_track_metadata = None
         self._next_track_queue_nr = None
+        self._awaiting_seek_confirmation = False
 
         if self._client and await self._client.stop():
             self._position_ms = 0
@@ -676,6 +712,15 @@ class DLNABackend(AudioBackend):
         """Seek to position."""
         if self._client and await self._client.seek(position_ms):
             self._position_ms = position_ms
+            # The device won't actually reflect this in GetPositionInfo for
+            # a real, measurable moment afterward — see
+            # SEEK_CONFIRMATION_TIMEOUT_SECONDS. Notify this optimistic
+            # value now (immediate UI feedback), then have the poll loop
+            # hold off relaying anything that looks like it's still behind
+            # this target until the device actually catches up.
+            self._awaiting_seek_confirmation = True
+            self._seek_target_ms = position_ms
+            self._seek_confirmation_deadline = time.monotonic() + SEEK_CONFIRMATION_TIMEOUT_SECONDS
             self._notify_position_update(position_ms)
 
     async def get_position(self) -> int:
@@ -1276,7 +1321,25 @@ class DLNABackend(AudioBackend):
                 # Update position while playing
                 if new_state == PlaybackState.PLAYING:
                     pos = await self.get_position()
-                    self._notify_position_update(pos)
+                    if self._awaiting_seek_confirmation:
+                        caught_up = pos + SEEK_CONFIRMATION_TOLERANCE_MS >= self._seek_target_ms
+                        timed_out = time.monotonic() >= self._seek_confirmation_deadline
+                        if caught_up or timed_out:
+                            if timed_out and not caught_up:
+                                logger.debug(
+                                    f"[{self.name}] Seek confirmation timed out after "
+                                    f"{SEEK_CONFIRMATION_TIMEOUT_SECONDS:.0f}s — trusting "
+                                    f"polled position ({pos}ms) despite never confirming "
+                                    f"the {self._seek_target_ms}ms seek target"
+                                )
+                            self._awaiting_seek_confirmation = False
+                            self._notify_position_update(pos)
+                        # else: still behind the target and within the grace
+                        # window — this is a stale, pre-seek reading (the
+                        # device hasn't applied the seek yet); don't relay
+                        # it to the app, just wait for the next poll.
+                    else:
+                        self._notify_position_update(pos)
 
             except asyncio.CancelledError:
                 break
