@@ -582,9 +582,7 @@ class WsManager:
                 except Exception as e:
                     logger.error(f"Handler error for type {msg_type}: {e}")
             else:
-                # TEMP: dump the raw message as-is — remove once the
-                # next/previous investigation is done.
-                logger.info(f"TEMP no handler for message type {msg_type}: {msg}")
+                logger.warning(f"No handler for message type {msg_type}: {msg}")
 
     async def _flush_pending_messages(self) -> None:
         """Send any messages queued during disconnect."""

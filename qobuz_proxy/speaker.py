@@ -716,17 +716,6 @@ class Speaker:
         elif playing_state == PlaybackState.ERROR:
             playing_state = PlaybackState.STOPPED
 
-        # TEMP: dump every outbound state report as-is — remove once the
-        # next/previous investigation is done.
-        logger.info(
-            f"TEMP sending state report: playing_state={playing_state!r} "
-            f"(raw={report.playing_state!r}), position={report.position_value_ms}ms "
-            f"@ts={report.position_timestamp_ms}, duration={report.duration_ms}ms, "
-            f"queue_item_id={report.current_queue_item_id}, "
-            f"queue_version={report.queue_version_major}.{report.queue_version_minor}, "
-            f"buffer={report.buffer_state!r}"
-        )
-
         await self._ws_manager.send_state_update(
             playing_state=int(playing_state),
             buffer_state=int(report.buffer_state),
