@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 from typing import Callable, Optional, TypeVar
@@ -39,6 +40,13 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 # DEFAULT_URL_MAX_AGE_SECONDS) — a track long enough to still be streaming
 # once the URL dies mid-playback hits one of these.
 EXPIRED_URL_STATUS_CODES = (401, 403, 410)
+# A transient upstream failure (connection reset, DNS hiccup, a 502/503 from
+# the CDN, a stalled socket) gets a brief, bounded retry rather than
+# immediately killing the whole transcode request — observed directly in
+# production as "Connection lost" aborting an otherwise-healthy seek.
+# Linear backoff: 0.5s, 1.0s, 1.5s — a few seconds total before giving up.
+MAX_CONNECTION_RETRIES = 3
+CONNECTION_RETRY_DELAY_SECONDS = 0.5
 
 
 class LazyHttpFlacSource:
@@ -171,10 +179,64 @@ class LazyHttpFlacSource:
         return self._with_url_refresh(_do)
 
     def _with_url_refresh(self, do_request: Callable[[], _T]) -> _T:
-        """Run do_request (a closure reading self._url); on an expired-URL
-        status, refresh self._url and retry once — do_request rebuilds its
-        Request from self._url each call, so a refresh in between takes
-        effect on the retry automatically."""
+        """Run do_request (a closure reading self._url), with two layers of
+        recovery around it:
+
+        - An expired-URL status (401/403/410) refreshes self._url and
+          retries once immediately — do_request rebuilds its Request from
+          self._url each call, so a refresh in between takes effect on the
+          retry automatically.
+        - Anything else that looks transient (a dropped connection, a DNS
+          hiccup, a 502/503 from the CDN, a stalled socket) gets a brief,
+          bounded retry with backoff — see MAX_CONNECTION_RETRIES. If it's
+          still failing after that, the failure is real: give up and raise
+          a clear, specific error instead of letting the underlying
+          exception's own (often terse — "Connection lost") message be the
+          only signal of what happened.
+        """
+        last_error: Optional[BaseException] = None
+        for attempt in range(MAX_CONNECTION_RETRIES + 1):
+            try:
+                return self._do_with_expiry_refresh(do_request)
+            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+                if isinstance(e, urllib.error.HTTPError) and e.code in EXPIRED_URL_STATUS_CODES:
+                    # _do_with_expiry_refresh already tried everything it
+                    # can for this one (refresh + immediate retry, or gave
+                    # up because there's no refresh_url at all) — this is a
+                    # diagnosed, permanent condition, not a transient blip.
+                    # Retrying would just fail the same way against the
+                    # same dead URL every time; raise immediately instead
+                    # of burning the whole retry budget on nothing.
+                    raise
+                # Anything else — a CDN 5xx, a connection reset, a DNS
+                # hiccup, a stalled socket — is worth the brief retry.
+                last_error = e
+                if attempt >= MAX_CONNECTION_RETRIES:
+                    break
+                delay = CONNECTION_RETRY_DELAY_SECONDS * (attempt + 1)
+                logger.warning(
+                    f"LazyHttpFlacSource: upstream request failed "
+                    f"({type(e).__name__}: {e}); retrying "
+                    f"({attempt + 1}/{MAX_CONNECTION_RETRIES}) in {delay:.1f}s"
+                )
+                time.sleep(delay)
+
+        assert last_error is not None  # the loop always sets it before falling through
+        logger.error(
+            f"LazyHttpFlacSource: upstream failed after {MAX_CONNECTION_RETRIES} retries "
+            f"({type(last_error).__name__}: {last_error})"
+        )
+        raise OSError(
+            f"Qobuz CDN connection failed after {MAX_CONNECTION_RETRIES} retries "
+            f"({type(last_error).__name__}: {last_error})"
+        ) from last_error
+
+    def _do_with_expiry_refresh(self, do_request: Callable[[], _T]) -> _T:
+        """One attempt at do_request, with a single immediate retry if it
+        fails on an expired-URL status — split out from _with_url_refresh
+        so that inner recovery (refresh the URL, try again right away)
+        stays distinct from the outer one (retry transient failures with
+        backoff, bounded)."""
         try:
             return do_request()
         except urllib.error.HTTPError as e:
