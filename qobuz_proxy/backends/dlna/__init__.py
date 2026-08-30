@@ -16,7 +16,7 @@ from .capabilities import (
     QOBUZ_QUALITY_192K,
 )
 from .client import DLNAClient, DLNAClientError, DLNADeviceInfo, SoapResult
-from .proxy_server import AudioProxyServer, RegisteredTrack, ResolvedTrack
+from .proxy_server import AudioProxyServer, AudioProxyServerProtocol, RegisteredTrack, ResolvedTrack
 from .discovery import DLNADiscovery, DiscoveredDevice, discover_dlna_devices
 from .sonos.topology import (
     SonosZoneMember,
@@ -42,6 +42,7 @@ __all__ = [
     "DLNADeviceInfo",
     "SoapResult",
     "AudioProxyServer",
+    "AudioProxyServerProtocol",
     "RegisteredTrack",
     "ResolvedTrack",
     "DLNADiscovery",

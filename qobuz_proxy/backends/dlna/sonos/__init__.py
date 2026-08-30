@@ -13,7 +13,7 @@ from .discovery import discover_and_enrich
 from .controller import SonosController
 from .discovery_manager import DepartedMember, SonosDiscoveryManager, SonosRoom
 from .events import GenaSubscription, SonosEventSubscriber
-from .proxy_server import SonosAudioProxyServer, SonosRegisteredTrack
+from .proxy_server import SonosAudioProxyServer
 from .topology import (
     SonosGroup,
     SonosZoneMember,
@@ -34,7 +34,6 @@ __all__ = [
     "SonosDiscoveryManager",
     "SonosEventSubscriber",
     "SonosGroup",
-    "SonosRegisteredTrack",
     "SonosRoom",
     "SonosZoneMember",
     "discover_and_enrich",

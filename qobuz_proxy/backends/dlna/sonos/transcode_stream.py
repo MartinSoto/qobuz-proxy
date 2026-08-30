@@ -8,9 +8,8 @@ and aiohttp: answering HEAD probes with the virtual WAV's Content-Length,
 and streaming GET/Range requests as byte-exact-seekable PCM/WAV. Kept out
 of proxy_server.py (see its module docstring — generic and knows nothing
 about Sonos) so that SonosAudioProxyServer only has to know this handler
-exists and dispatch a matching track to it — everything about
-downsampling, including owning the CDNBlockCache instance every
-transcoded track's bytes are read through, stays here.
+exists and dispatch a matching request to it — everything about
+downsampling stays here.
 """
 
 from __future__ import annotations
@@ -22,13 +21,10 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
-from .cdn_block_cache import CDNBlockCache
 from .transcoding_reader import BYTES_PER_SAMPLE_24BIT, WAV_HEADER_SIZE, TranscodingFlacReader
 
 if TYPE_CHECKING:
-    from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
-
-    from .proxy_server import SonosRegisteredTrack
+    from .cdn_block_cache import CDNBlockCache
 
 logger = logging.getLogger(__name__)
 
@@ -50,47 +46,45 @@ class TranscodeStreamHandler:
     """Serves the on-the-fly downsampling path for SonosAudioProxyServer.
 
     Usage:
-        handler = TranscodeStreamHandler(resolver=stream_resolver)
+        handler = TranscodeStreamHandler(cache=shared_cdn_block_cache)
         ...
-        response = await handler.stream(request, track)  # a GET/Range request
-        response = await handler.handle_head_probe(track)  # a HEAD probe
-        ...
-        await handler.close()  # release the cache's one lingering connection
+        response = await handler.stream(request, track_id, format_id, rate)  # a GET/Range request
+        response = await handler.handle_head_probe(track_id, format_id, rate)  # a HEAD probe
     """
 
-    def __init__(self, resolver: "QobuzStreamResolver") -> None:
-        # One CDNBlockCache per handler (== one per AudioProxyServer),
-        # shared by every transcoded track this proxy serves. See
-        # cdn_block_cache.py.
-        self._cache = CDNBlockCache(resolver=resolver)
+    def __init__(self, cache: "CDNBlockCache") -> None:
+        # Shared with PassthroughStreamHandler — one CDNBlockCache per
+        # SonosAudioProxyServer, backing every track (transcoded or not)
+        # it serves. Owned (constructed/closed) by SonosAudioProxyServer,
+        # not here — see its module docstring.
+        self._cache = cache
 
-    async def close(self) -> None:
-        """Release the cache's one lingering connection, if any."""
-        await self._cache.close()
-
-    async def handle_head_probe(self, track: "SonosRegisteredTrack") -> web.Response:
+    async def handle_head_probe(
+        self, track_id: str, format_id: int, transcode_to_sample_rate: int
+    ) -> web.Response:
         """Answer a HEAD probe for a downsampled track with the *virtual*
         (post-transcode) WAV's Content-Length, computed from the source's
         STREAMINFO alone — cheap, no decoding."""
         headers = {"Content-Type": "audio/wav", "Accept-Ranges": "bytes"}
-        assert track.transcode_to_sample_rate is not None
         try:
-            reader = await self._open_reader(track)
+            reader = await self._open_reader(track_id, format_id, transcode_to_sample_rate)
             headers["Content-Length"] = str(reader.content_length)
             logger.debug(
-                f"Transcoded HEAD probe for track {track.track_id}: "
+                f"Transcoded HEAD probe for track {track_id}: "
                 f"Content-Length={reader.content_length}"
             )
         except Exception as e:
-            logger.debug(f"Transcoded HEAD probe failed for track {track.track_id}: {e}")
+            logger.debug(f"Transcoded HEAD probe failed for track {track_id}: {e}")
         return web.Response(status=200, headers=headers)
 
     async def stream(
         self,
         request: web.Request,
-        track: "SonosRegisteredTrack",
+        track_id: str,
+        format_id: int,
+        transcode_to_sample_rate: int,
     ) -> web.StreamResponse:
-        """Serve a track downsampled to track.transcode_to_sample_rate as
+        """Serve a track downsampled to transcode_to_sample_rate as
         PCM/WAV — see TranscodingFlacReader. A fresh reader (and
         LazyHttpFlacSource) is opened per request rather than cached across
         requests — simpler, and normal playback of one track is one
@@ -99,12 +93,10 @@ class TranscodeStreamHandler:
         (shared across every request this handler serves) — URL
         resolution, retry-on-expiry, and block reuse all happen there.
         """
-        assert track.transcode_to_sample_rate is not None
-
         try:
-            reader = await self._open_reader(track)
+            reader = await self._open_reader(track_id, format_id, transcode_to_sample_rate)
         except Exception as e:
-            logger.error(f"Failed to open transcoding source for track {track.track_id}: {e}")
+            logger.error(f"Failed to open transcoding source for track {track_id}: {e}")
             return web.Response(status=502, text="Failed to open source stream")
 
         range_header = request.headers.get("Range")
@@ -179,26 +171,27 @@ class TranscodeStreamHandler:
                 gen.close()
         except (ConnectionResetError, asyncio.CancelledError):
             outcome = "disconnected"
-            logger.debug(f"Client disconnected mid-transcode for track {track.track_id}")
+            logger.debug(f"Client disconnected mid-transcode for track {track_id}")
         except Exception as e:
             outcome = "error"
-            logger.error(f"Transcoding stream error for track {track.track_id}: {e}")
+            logger.error(f"Transcoding stream error for track {track_id}: {e}")
 
         logger.debug(
-            f"Transcode response for track {track.track_id} done: {outcome}, "
+            f"Transcode response for track {track_id} done: {outcome}, "
             f"{bytes_written} bytes in {time.monotonic() - stream_start:.1f}s"
         )
         return response
 
-    async def _open_reader(self, track: "SonosRegisteredTrack") -> TranscodingFlacReader:
-        assert track.transcode_to_sample_rate is not None
+    async def _open_reader(
+        self, track_id: str, format_id: int, transcode_to_sample_rate: int
+    ) -> TranscodingFlacReader:
         loop = asyncio.get_event_loop()
         return await asyncio.to_thread(
             TranscodingFlacReader,
             self._cache,
-            track.track_id,
-            track.format_id,
-            track.transcode_to_sample_rate,
+            track_id,
+            format_id,
+            transcode_to_sample_rate,
             loop,
         )
 

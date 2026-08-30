@@ -18,7 +18,7 @@ from typing import Optional, TYPE_CHECKING
 from qobuz_proxy.backends.types import BackendTrackMetadata
 
 from ..backend import DLNABackend
-from ..proxy_server import AudioProxyServer
+from ..proxy_server import AudioProxyServerProtocol
 from .client import SonosClient
 from .proxy_server import SonosAudioProxyServer
 
@@ -38,7 +38,7 @@ class SonosBackend(DLNABackend):
         resolver: "QobuzStreamResolver",
         host: str = "0.0.0.0",
         port: int = 7120,
-    ) -> AudioProxyServer:
+    ) -> AudioProxyServerProtocol:
         return SonosAudioProxyServer(
             resolver=resolver,
             hires_downsampling=self._hires_downsampling,
