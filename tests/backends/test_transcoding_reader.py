@@ -1,13 +1,23 @@
-"""Tests for TranscodingFlacReader — the on-the-fly downsample-and-WAV-wrap
-pipeline built on top of LazyHttpFlacSource (see test_lazy_flac_source.py
-for the seek-without-full-download validation this builds on) and, one
-layer further down, CDNBlockCache (see test_dlna_cdn_block_cache.py for
-its own fetch/cache/retry coverage).
+"""Tests for the FLAC decode/transcode pipeline (transcoding_reader.py):
 
-Ground truth for "is the resampled audio correct" is a plain one-shot
-soxr.resample() over the *fully* decoded source array — the streaming
-(chunked) resampler used by the reader should match it closely wherever
-it's producing the same portion of audio.
+- LazyHttpFlacSource — the CDNBlockCache-backed file-like bridge that lets
+  soundfile/libFLAC seek within a remote FLAC file, using its own
+  seeking logic, without downloading the whole file first. All of the
+  actual CDN behavior it used to own directly (retry-on-transient-failure,
+  refresh-on-expired-URL, connection reuse) lives in CDNBlockCache and is
+  covered by test_dlna_cdn_block_cache.py — this only has to prove the
+  bridge itself: correct bytes at the right positions, without a full
+  download, and that two sources sharing one cache actually share its
+  benefit.
+- TranscodingFlacReader — the on-the-fly downsample-and-WAV-wrap pipeline
+  built on top of it. Ground truth for "is the resampled audio correct" is
+  a plain one-shot soxr.resample() over the *fully* decoded source array —
+  the streaming (chunked) resampler used by the reader should match it
+  closely wherever it's producing the same portion of audio.
+
+Both spin up a real local HTTP server and do a real FLAC encode/decode
+round trip (no mocks on the decode path) — the thing being validated is
+genuinely "does this work," not "does this call the right mock."
 """
 
 import asyncio
@@ -18,13 +28,15 @@ import wave
 from unittest.mock import AsyncMock
 
 import numpy as np
+import pytest
 import soundfile as sf
 import soxr
 from aiohttp import web
 
-from qobuz_proxy.backends.dlna.cdn_block_cache import CDNBlockCache
+from qobuz_proxy.backends.dlna.cdn_block_cache import CDNBlockCache, CDNBlockFetchError
 from qobuz_proxy.backends.dlna.transcoding_reader import (
     WAV_HEADER_SIZE,
+    LazyHttpFlacSource,
     TranscodingFlacReader,
 )
 from qobuz_proxy.playback.stream_resolver import ResolvedStream
@@ -35,6 +47,9 @@ DURATION_SECONDS = 1.5
 CHANNELS = 2
 FORMAT_ID = 27  # arbitrary — these tests don't exercise quality selection
 TRACK_ID = "42"
+# Small, so the LazyHttpFlacSource partial-fetch assertions below actually
+# exercise more than one block over a file this short.
+BLOCK_SIZE = 32 * 1024
 
 
 def _free_port() -> int:
@@ -46,6 +61,9 @@ def _free_port() -> int:
 
 
 def _make_test_flac() -> tuple[bytes, np.ndarray]:
+    """A deterministic stereo FLAC — a different tone per channel so a
+    decoded slice can be checked against the exact source position, not
+    just "some" audio."""
     n = int(DURATION_SECONDS * SOURCE_SAMPLE_RATE)
     t = np.arange(n) / SOURCE_SAMPLE_RATE
     left = 0.5 * np.sin(2 * np.pi * 440.0 * t)
@@ -67,51 +85,61 @@ def _stream(url: str) -> ResolvedStream:
     )
 
 
-def _cache_for(url: str) -> CDNBlockCache:
+def _resolver_for(url: str) -> AsyncMock:
     resolver = AsyncMock()
     resolver.resolve = AsyncMock(return_value=_stream(url))
-    return CDNBlockCache(resolver=resolver)
+    return resolver
 
 
-def _new_reader(cache: CDNBlockCache, loop: asyncio.AbstractEventLoop) -> TranscodingFlacReader:
-    return TranscodingFlacReader(cache, TRACK_ID, FORMAT_ID, TARGET_SAMPLE_RATE, loop)
+def _cache_for(url: str, **kwargs: object) -> CDNBlockCache:
+    return CDNBlockCache(resolver=_resolver_for(url), **kwargs)  # type: ignore[arg-type]
+
+
+def _new_reader(
+    cache: CDNBlockCache, loop: asyncio.AbstractEventLoop, track_id: str = TRACK_ID
+) -> TranscodingFlacReader:
+    return TranscodingFlacReader(cache, track_id, FORMAT_ID, TARGET_SAMPLE_RATE, loop)
+
+
+def _new_source(
+    cache: CDNBlockCache, loop: asyncio.AbstractEventLoop, track_id: str = TRACK_ID
+) -> LazyHttpFlacSource:
+    return LazyHttpFlacSource(cache, track_id, FORMAT_ID, loop)
 
 
 class RangeServingUpstream:
+    """A real HTTP server serving one fixed payload with standard Range
+    support — a stand-in for a Qobuz-CDN-style signed streaming URL."""
+
     def __init__(self, payload: bytes):
         self._payload = payload
         self._runner: web.AppRunner | None = None
+        self.requests: list[tuple[str, str | None]] = []  # (method, Range header)
 
     async def _handle(self, request: web.Request) -> web.Response:
         rng = request.headers.get("Range")
+        self.requests.append((request.method, rng))
+
         if request.method == "HEAD":
             return web.Response(
                 status=200,
                 headers={"Accept-Ranges": "bytes", "Content-Length": str(len(self._payload))},
             )
-        if not rng:
-            return web.Response(
-                status=200,
-                body=self._payload,
-                headers={"Accept-Ranges": "bytes", "Content-Length": str(len(self._payload))},
+
+        start = int(rng.removeprefix("bytes=").split("-")[0]) if rng else 0
+        body = self._payload[start:]
+        status = 206 if rng else 200
+        headers = {"Accept-Ranges": "bytes", "Content-Length": str(len(body))}
+        if rng:
+            headers["Content-Range"] = (
+                f"bytes {start}-{len(self._payload) - 1}/{len(self._payload)}"
             )
-        start_s, end_s = rng.removeprefix("bytes=").split("-")
-        start = int(start_s)
-        end = int(end_s) if end_s else len(self._payload) - 1
-        end = min(end, len(self._payload) - 1)
-        body = self._payload[start : end + 1]
-        return web.Response(
-            status=206,
-            body=body,
-            headers={
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(len(body)),
-                "Content-Range": f"bytes {start}-{end}/{len(self._payload)}",
-            },
-        )
+        return web.Response(status=status, body=body, headers=headers)
 
     async def start(self) -> str:
         app = web.Application()
+        # add_get already registers a HEAD route (routed to the same
+        # handler) — an explicit add_route("HEAD", ...) would collide with it.
         app.router.add_get("/file.flac", self._handle)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -141,6 +169,189 @@ def _pcm24_bytes_to_float(data: bytes, channels: int) -> np.ndarray:
     as_int32 = padded.view("<i4").reshape(-1)
     floats = as_int32.astype("float64") / 8_388_607.0
     return floats.reshape(-1, channels).astype("float32")
+
+
+class TestLazyHttpFlacSource:
+    async def test_sequential_read_decodes_correctly(self) -> None:
+        flac_bytes, original = _make_test_flac()
+        server = RangeServingUpstream(flac_bytes)
+        url = await server.start()
+        cache = _cache_for(url, block_size=BLOCK_SIZE)
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _read() -> tuple[np.ndarray, int]:
+                source = _new_source(cache, loop)
+                handle = sf.SoundFile(source)
+                return handle.read(5000, dtype="float32"), handle.frames
+
+            decoded, frames = await asyncio.to_thread(_read)
+
+            assert frames == len(original)
+            np.testing.assert_allclose(decoded, original[:5000], atol=2e-4)
+        finally:
+            await cache.close()
+            await server.stop()
+
+    async def test_seek_reads_the_correct_position_without_full_download(self) -> None:
+        """The actual thing this whole feature hinges on: seeking must land
+        on the real source position, and must not have required fetching
+        the whole file to get there."""
+        flac_bytes, original = _make_test_flac()
+        server = RangeServingUpstream(flac_bytes)
+        url = await server.start()
+        cache = _cache_for(url, block_size=BLOCK_SIZE)
+        try:
+            loop = asyncio.get_event_loop()
+            target_frame = int(len(original) * 0.6)  # well past the header
+
+            def _seek_and_read() -> np.ndarray:
+                source = _new_source(cache, loop)
+                handle = sf.SoundFile(source)
+                handle.seek(target_frame)
+                return handle.read(2000, dtype="float32")
+
+            decoded = await asyncio.to_thread(_seek_and_read)
+
+            np.testing.assert_allclose(
+                decoded, original[target_frame : target_frame + 2000], atol=2e-4
+            )
+            # What actually matters: how much of the file our own request
+            # pattern chose to fetch and retain — not bytes physically over
+            # the wire, which loopback/OS buffering can make look complete
+            # even when the client stopped consuming immediately (an open
+            # connection's remaining body can fully land in the kernel
+            # socket buffer for a file this small, well before this test
+            # ever decides to abandon it).
+            assert cache.cached_bytes < len(flac_bytes) * 0.5, (
+                f"expected a partial fetch, but cached {cache.cached_bytes} of "
+                f"{len(flac_bytes)} bytes — looks like the whole file got fetched"
+            )
+        finally:
+            await cache.close()
+            await server.stop()
+
+    async def test_multiple_seeks_each_land_correctly(self) -> None:
+        flac_bytes, original = _make_test_flac()
+        server = RangeServingUpstream(flac_bytes)
+        url = await server.start()
+        cache = _cache_for(url, block_size=BLOCK_SIZE)
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _seek_around() -> list[np.ndarray]:
+                source = _new_source(cache, loop)
+                handle = sf.SoundFile(source)
+                results = []
+                for frac in (0.1, 0.75, 0.3, 0.9):
+                    target_frame = int(len(original) * frac)
+                    handle.seek(target_frame)
+                    results.append(handle.read(1000, dtype="float32"))
+                return results
+
+            decoded_chunks = await asyncio.to_thread(_seek_around)
+
+            for frac, decoded in zip((0.1, 0.75, 0.3, 0.9), decoded_chunks):
+                target_frame = int(len(original) * frac)
+                np.testing.assert_allclose(
+                    decoded, original[target_frame : target_frame + 1000], atol=2e-4
+                )
+        finally:
+            await cache.close()
+            await server.stop()
+
+    async def test_total_size_matches_content_length(self) -> None:
+        flac_bytes, _original = _make_test_flac()
+        server = RangeServingUpstream(flac_bytes)
+        url = await server.start()
+        cache = _cache_for(url, block_size=BLOCK_SIZE)
+        try:
+            loop = asyncio.get_event_loop()
+            source = await asyncio.to_thread(_new_source, cache, loop)
+            assert source._total_size == len(flac_bytes)
+            assert any(method == "HEAD" for method, _rng in server.requests)
+        finally:
+            await cache.close()
+            await server.stop()
+
+    async def test_reads_past_eof_return_empty(self) -> None:
+        flac_bytes, _original = _make_test_flac()
+        server = RangeServingUpstream(flac_bytes)
+        url = await server.start()
+        cache = _cache_for(url, block_size=BLOCK_SIZE)
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _read_past_eof() -> bytes:
+                source = _new_source(cache, loop)
+                source.seek(0, 2)  # SEEK_END
+                return source.read(100)
+
+            assert await asyncio.to_thread(_read_past_eof) == b""
+        finally:
+            await cache.close()
+            await server.stop()
+
+    async def test_missing_content_length_raises(self) -> None:
+        app = web.Application()
+
+        async def _no_length(request: web.Request) -> web.StreamResponse:
+            # Chunked transfer encoding — aiohttp omits Content-Length for
+            # this, unlike a plain Response (which always computes one).
+            resp = web.StreamResponse(status=200)
+            resp.enable_chunked_encoding()
+            await resp.prepare(request)
+            await resp.write(b"x")
+            return resp
+
+        app.router.add_get("/file.flac", _no_length)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = _free_port()
+        site = web.TCPSite(runner, "127.0.0.1", port)
+        await site.start()
+        cache = _cache_for(f"http://127.0.0.1:{port}/file.flac", block_size=BLOCK_SIZE)
+        try:
+            loop = asyncio.get_event_loop()
+            with pytest.raises(CDNBlockFetchError):
+                await asyncio.to_thread(_new_source, cache, loop)
+        finally:
+            await cache.close()
+            await runner.cleanup()
+
+
+class TestSharedCacheAcrossSources:
+    """The reason CDNBlockCache moved out from under one LazyHttpFlacSource
+    at all: two independent sources for the same (track_id, format_id)
+    should actually share fetched blocks, not each pay for their own."""
+
+    async def test_second_source_reuses_the_first_sources_cached_blocks(self) -> None:
+        flac_bytes, original = _make_test_flac()
+        server = RangeServingUpstream(flac_bytes)
+        url = await server.start()
+        cache = _cache_for(url, block_size=BLOCK_SIZE)
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _read_from_zero() -> np.ndarray:
+                source = _new_source(cache, loop)
+                handle = sf.SoundFile(source)
+                return handle.read(2000, dtype="float32")
+
+            first = await asyncio.to_thread(_read_from_zero)
+            np.testing.assert_allclose(first, original[:2000], atol=2e-4)
+
+            requests_before = len(server.requests)
+
+            second = await asyncio.to_thread(_read_from_zero)
+            np.testing.assert_allclose(second, original[:2000], atol=2e-4)
+
+            # The second source's HEAD (size discovery) and initial block
+            # read both hit the cache — no new upstream request at all.
+            assert len(server.requests) == requests_before
+        finally:
+            await cache.close()
+            await server.stop()
 
 
 class TestWavFraming:

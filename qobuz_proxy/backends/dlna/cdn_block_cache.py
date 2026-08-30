@@ -1,7 +1,7 @@
 """
 Global, block-granular LRU cache for bytes read from the Qobuz CDN.
 
-Where LazyHttpFlacSource (see lazy_flac_source.py) is a per-request,
+Where LazyHttpFlacSource (see transcoding_reader.py) is a per-request,
 per-track read-ahead buffer handed to one decode, this cache is the
 opposite scope: one instance, shared across every track/format/renderer in
 the process, keyed on (track_id, format_id, block_index) with a fixed
@@ -67,13 +67,12 @@ DEFAULT_MAX_TRACK_SIZE_ENTRIES = 64
 # connection is expected to sit idle between reads.
 REQUEST_TIMEOUT_SECONDS = 30
 
-# A signed URL rejected as expired/invalid — see lazy_flac_source.py and
-# proxy_server.py, same set.
+# A signed URL rejected as expired/invalid — see proxy_server.py's
+# passthrough path, same set.
 EXPIRED_URL_STATUS_CODES = (401, 403, 410)
 
 # Transient upstream failures (connection reset, DNS hiccup, a stalled
-# socket, a 502/503) get a brief bounded retry with linear backoff — same
-# policy as lazy_flac_source.py's _with_url_refresh.
+# socket, a 502/503) get a brief bounded retry with linear backoff.
 MAX_CONNECTION_RETRIES = 3
 CONNECTION_RETRY_DELAY_SECONDS = 0.5
 
@@ -446,9 +445,7 @@ class CDNBlockCache:
         self, track_id: str, format_id: int, attempt_fn: Callable[[str], Awaitable[_T]]
     ) -> _T:
         """Run attempt_fn(url) against a resolver-supplied URL, with two
-        layers of recovery — mirrors lazy_flac_source.py's
-        _with_url_refresh/_do_with_expiry_refresh, collapsed into one loop
-        since this is natively async (no worker-thread bridge needed):
+        layers of recovery:
 
         - _ExpiredURLError: force a fresh resolve() and retry immediately,
           once. Still expired after that is a diagnosed, permanent failure.
