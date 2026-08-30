@@ -1,6 +1,8 @@
 """Tests for TranscodingFlacReader — the on-the-fly downsample-and-WAV-wrap
 pipeline built on top of LazyHttpFlacSource (see test_lazy_flac_source.py
-for the seek-without-full-download validation this builds on).
+for the seek-without-full-download validation this builds on) and, one
+layer further down, CDNBlockCache (see test_dlna_cdn_block_cache.py for
+its own fetch/cache/retry coverage).
 
 Ground truth for "is the resampled audio correct" is a plain one-shot
 soxr.resample() over the *fully* decoded source array — the streaming
@@ -13,21 +15,26 @@ import io
 import socket
 import struct
 import wave
+from unittest.mock import AsyncMock
 
 import numpy as np
 import soundfile as sf
 import soxr
 from aiohttp import web
 
+from qobuz_proxy.backends.dlna.cdn_block_cache import CDNBlockCache
 from qobuz_proxy.backends.dlna.transcoding_reader import (
     WAV_HEADER_SIZE,
     TranscodingFlacReader,
 )
+from qobuz_proxy.playback.stream_resolver import ResolvedStream
 
 SOURCE_SAMPLE_RATE = 96000
 TARGET_SAMPLE_RATE = 48000
 DURATION_SECONDS = 1.5
 CHANNELS = 2
+FORMAT_ID = 27  # arbitrary — these tests don't exercise quality selection
+TRACK_ID = "42"
 
 
 def _free_port() -> int:
@@ -47,6 +54,27 @@ def _make_test_flac() -> tuple[bytes, np.ndarray]:
     buf = io.BytesIO()
     sf.write(buf, audio, SOURCE_SAMPLE_RATE, format="FLAC", subtype="PCM_24")
     return buf.getvalue(), audio
+
+
+def _stream(url: str) -> ResolvedStream:
+    return ResolvedStream(
+        url=url,
+        blob="",
+        format_id=FORMAT_ID,
+        sample_rate=SOURCE_SAMPLE_RATE,
+        bit_depth=24,
+        fetched_at=0.0,
+    )
+
+
+def _cache_for(url: str) -> CDNBlockCache:
+    resolver = AsyncMock()
+    resolver.resolve = AsyncMock(return_value=_stream(url))
+    return CDNBlockCache(resolver=resolver)
+
+
+def _new_reader(cache: CDNBlockCache, loop: asyncio.AbstractEventLoop) -> TranscodingFlacReader:
+    return TranscodingFlacReader(cache, TRACK_ID, FORMAT_ID, TARGET_SAMPLE_RATE, loop)
 
 
 class RangeServingUpstream:
@@ -120,8 +148,10 @@ class TestWavFraming:
         flac_bytes, original = _make_test_flac()
         server = RangeServingUpstream(flac_bytes)
         url = await server.start()
+        cache = _cache_for(url)
         try:
-            reader = await asyncio.to_thread(TranscodingFlacReader, url, TARGET_SAMPLE_RATE)
+            loop = asyncio.get_event_loop()
+            reader = await asyncio.to_thread(_new_reader, cache, loop)
 
             assert reader.source_sample_rate == SOURCE_SAMPLE_RATE
             assert reader.channels == CHANNELS
@@ -138,17 +168,21 @@ class TestWavFraming:
                 assert w.getsampwidth() == 3
                 assert w.getnframes() == reader.total_target_frames
         finally:
+            await cache.close()
             await server.stop()
 
     async def test_data_chunk_size_field_matches_data_size(self) -> None:
         flac_bytes, _original = _make_test_flac()
         server = RangeServingUpstream(flac_bytes)
         url = await server.start()
+        cache = _cache_for(url)
         try:
-            reader = await asyncio.to_thread(TranscodingFlacReader, url, TARGET_SAMPLE_RATE)
+            loop = asyncio.get_event_loop()
+            reader = await asyncio.to_thread(_new_reader, cache, loop)
             data_size_field = struct.unpack("<I", reader.wav_header[40:44])[0]
             assert data_size_field == reader.data_size
         finally:
+            await cache.close()
             await server.stop()
 
 
@@ -157,11 +191,13 @@ class TestStreamingAndSeeking:
         flac_bytes, original = _make_test_flac()
         server = RangeServingUpstream(flac_bytes)
         url = await server.start()
+        cache = _cache_for(url)
         try:
             expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
+            loop = asyncio.get_event_loop()
 
             def _run() -> bytes:
-                reader = TranscodingFlacReader(url, TARGET_SAMPLE_RATE)
+                reader = _new_reader(cache, loop)
                 return b"".join(reader.stream_from(0))
 
             all_bytes = await asyncio.to_thread(_run)
@@ -172,6 +208,7 @@ class TestStreamingAndSeeking:
             assert len(decoded) == len(expected)
             np.testing.assert_allclose(decoded, expected, atol=2e-4)
         finally:
+            await cache.close()
             await server.stop()
 
     async def test_seeking_mid_stream_matches_the_same_position_as_full_resample(self) -> None:
@@ -183,13 +220,15 @@ class TestStreamingAndSeeking:
         flac_bytes, original = _make_test_flac()
         server = RangeServingUpstream(flac_bytes)
         url = await server.start()
+        cache = _cache_for(url)
         try:
             expected_full = soxr.resample(
                 original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ"
             )
+            loop = asyncio.get_event_loop()
 
             def _run() -> tuple[bytes, int]:
-                reader = TranscodingFlacReader(url, TARGET_SAMPLE_RATE)
+                reader = _new_reader(cache, loop)
                 bytes_per_frame = reader.channels * 3
                 target_frame = int(reader.total_target_frames * 0.4)
                 start_byte = WAV_HEADER_SIZE + target_frame * bytes_per_frame
@@ -214,34 +253,41 @@ class TestStreamingAndSeeking:
             settle = 200
             np.testing.assert_allclose(decoded[settle:], expected_slice[settle:], atol=5e-4)
         finally:
+            await cache.close()
             await server.stop()
 
     async def test_stream_from_end_of_header_yields_only_data(self) -> None:
         flac_bytes, _original = _make_test_flac()
         server = RangeServingUpstream(flac_bytes)
         url = await server.start()
+        cache = _cache_for(url)
         try:
+            loop = asyncio.get_event_loop()
 
             def _run() -> bytes:
-                reader = TranscodingFlacReader(url, TARGET_SAMPLE_RATE)
+                reader = _new_reader(cache, loop)
                 first_chunk = next(reader.stream_from(0))
                 return first_chunk
 
             first_chunk = await asyncio.to_thread(_run)
             assert first_chunk[:4] == b"RIFF"
         finally:
+            await cache.close()
             await server.stop()
 
     async def test_seek_past_end_of_data_yields_nothing(self) -> None:
         flac_bytes, _original = _make_test_flac()
         server = RangeServingUpstream(flac_bytes)
         url = await server.start()
+        cache = _cache_for(url)
         try:
+            loop = asyncio.get_event_loop()
 
             def _run() -> bytes:
-                reader = TranscodingFlacReader(url, TARGET_SAMPLE_RATE)
+                reader = _new_reader(cache, loop)
                 return b"".join(reader.stream_from(reader.content_length))
 
             assert await asyncio.to_thread(_run) == b""
         finally:
+            await cache.close()
             await server.stop()

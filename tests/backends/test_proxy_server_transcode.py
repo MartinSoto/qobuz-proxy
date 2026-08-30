@@ -308,6 +308,17 @@ async def test_range_request_seeks_to_the_correct_audio():
                 # resampling all the way to EOF server-side and defeating
                 # the "no full download" point of this test.
                 body = await resp.content.readexactly(4000 * bytes_per_frame)
+
+        # The whole point: this must not have required downloading the full
+        # (~source-rate) file to serve a seek near the middle. Measured as
+        # what the cache actually chose to fetch and retain (cached_bytes),
+        # not bytes physically over the wire — CDNBlockCache deliberately
+        # sends an open-ended Range so it can keep a connection open for
+        # reuse (see its module docstring), and on a fast loopback
+        # connection the remainder of a file this small can land in the
+        # kernel socket buffer well before the client ever abandons that
+        # connection, making a wire-level byte count an unreliable signal.
+        assert proxy._cache.cached_bytes < len(flac_bytes) * 0.5
     finally:
         await proxy.stop()
         await upstream.stop()
@@ -316,15 +327,6 @@ async def test_range_request_seeks_to_the_correct_audio():
     expected_slice = expected_full[target_frame : target_frame + len(decoded)]
     settle = 200  # fresh-resample-run edge transient — see transcoding_reader.py
     np.testing.assert_allclose(decoded[settle:], expected_slice[settle:], atol=5e-4)
-
-    # The whole point: this must not have required downloading the full
-    # (~source-rate) file to serve a seek near the middle.
-    total_fetched = sum(
-        len(flac_bytes) if rng is None else _range_len(rng, len(flac_bytes))
-        for method, rng in upstream.requests
-        if method == "GET"
-    )
-    assert total_fetched < len(flac_bytes) * 0.5
 
 
 async def test_misaligned_range_request_serves_exact_bytes_like_a_static_file():
@@ -411,13 +413,6 @@ async def test_misaligned_range_request_serves_exact_bytes_like_a_static_file():
 
     total_content_length = WAV_HEADER_SIZE + len(expected_full) * bytes_per_frame
     assert declared_length == total_content_length - requested_start_byte
-
-
-def _range_len(range_header: str, total: int) -> int:
-    start_s, end_s = range_header.removeprefix("bytes=").split("-")
-    start = int(start_s)
-    end = int(end_s) if end_s else total - 1
-    return min(end, total - 1) - start + 1
 
 
 async def test_content_type_wav_route_registered_without_extension_too():

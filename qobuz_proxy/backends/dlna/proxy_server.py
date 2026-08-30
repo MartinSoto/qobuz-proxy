@@ -11,6 +11,13 @@ knows or cares which; it just GETs a URL.
 All actual Qobuz CDN URL fetching/caching lives one layer down, in
 QobuzStreamResolver (see playback/stream_resolver.py) — this class never
 talks to the Qobuz API directly, only to that shared resolver.
+
+The on-the-fly downsampling path (resolve_track's transcode branch) goes
+through a second layer this class owns and constructs: CDNBlockCache (see
+cdn_block_cache.py), a block-granular LRU cache/connection-reuse layer in
+front of the same resolver. One CDNBlockCache per AudioProxyServer — same
+scope as the proxy server itself — shared by every transcoded track this
+proxy serves.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import socket
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, TYPE_CHECKING
+from typing import Dict, Optional, TYPE_CHECKING
 
 from aiohttp import web, ClientError, ClientSession, ClientTimeout
 
@@ -31,6 +38,7 @@ from .capabilities import (
     QOBUZ_QUALITY_CD,
     QOBUZ_QUALITY_192K,
 )
+from .cdn_block_cache import CDNBlockCache
 from .transcoding_reader import BYTES_PER_SAMPLE_24BIT, WAV_HEADER_SIZE, TranscodingFlacReader
 
 if TYPE_CHECKING:
@@ -126,6 +134,11 @@ class AudioProxyServer:
         self._host = host
         self._port = port
 
+        # Backs the on-the-fly downsampling path (see _transcode_stream) —
+        # one instance per proxy server, shared by every transcoded track
+        # it serves. See cdn_block_cache.py.
+        self._cache = CDNBlockCache(resolver=resolver)
+
         self._tracks: Dict[str, RegisteredTrack] = {}
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
@@ -177,6 +190,7 @@ class AudioProxyServer:
             await self._runner.cleanup()
             self._runner = None
 
+        await self._cache.close()
         self._tracks.clear()
         self._active_streams.clear()
         logger.info("Audio proxy server stopped")
@@ -417,6 +431,11 @@ class AudioProxyServer:
             f"range={request.headers.get('Range')!r} "
             f"transcode={track.transcode_to_sample_rate}"
         )
+        # TEMP DEBUG LOGGING
+        logger.info(
+            f"AudioProxyServer: incoming {request.method} url={request.url} "
+            f"Range={request.headers.get('Range')!r}"
+        )
 
         if track.transcode_to_sample_rate is not None:
             if request.method == "HEAD":
@@ -444,40 +463,25 @@ class AudioProxyServer:
             return web.Response(status=200, headers=headers)
         timeout = ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
+            # TEMP DEBUG LOGGING
+            fetch_start = time.monotonic()
+            logger.info(f"AudioProxyServer: outbound HEAD start url={stream.url}")
             async with ClientSession(timeout=timeout) as session:
                 async with session.head(stream.url, allow_redirects=True) as upstream:
                     cl = upstream.headers.get("Content-Length")
                     if upstream.status in (200, 206) and cl and cl.isdigit():
                         headers["Content-Length"] = cl
+                    # TEMP DEBUG LOGGING
+                    logger.info(
+                        f"AudioProxyServer: outbound HEAD end url={stream.url} "
+                        f"status={upstream.status} elapsed={time.monotonic() - fetch_start:.3f}s "
+                        f"Content-Length={cl}"
+                    )
         except Exception as e:
             # A probe answer without Content-Length is still useful; renderers
             # mostly check availability and type here.
             logger.debug(f"Upstream HEAD failed for track {track.track_id}: {e}")
         return web.Response(status=200, headers=headers)
-
-    def _make_sync_url_refresher(self, track: RegisteredTrack) -> Callable[[], Optional[str]]:
-        """A synchronous callable, safe to invoke from a worker thread, that
-        refreshes the track's CDN URL via the (async) resolver and returns
-        the new URL. Bridges LazyHttpFlacSource's synchronous retry-on-
-        expired-URL path (see its module docstring) back onto the event
-        loop, where the real refresh happens — long tracks can easily
-        outlive a signed URL's TTL mid-stream, same risk _proxy_stream
-        already handles for the pass-through path.
-        """
-        loop = asyncio.get_event_loop()
-
-        def _refresh() -> Optional[str]:
-            future = asyncio.run_coroutine_threadsafe(self._resolve_stream(track, force=True), loop)
-            try:
-                refreshed = future.result(timeout=REQUEST_TIMEOUT_SECONDS)
-            except Exception as e:
-                logger.warning(
-                    f"URL refresh (from transcode thread) failed for track {track.track_id}: {e}"
-                )
-                return None
-            return refreshed.url if refreshed else None
-
-        return _refresh
 
     async def _handle_transcoded_head_probe(self, track: RegisteredTrack) -> web.Response:
         """Answer a HEAD probe for a downsampled track with the *virtual*
@@ -485,15 +489,15 @@ class AudioProxyServer:
         STREAMINFO alone — cheap, no decoding."""
         headers = {"Content-Type": "audio/wav", "Accept-Ranges": "bytes"}
         assert track.transcode_to_sample_rate is not None
-        stream = await self._resolve_stream(track)
-        if stream is None:
-            return web.Response(status=200, headers=headers)
         try:
+            loop = asyncio.get_event_loop()
             reader = await asyncio.to_thread(
                 TranscodingFlacReader,
-                stream.url,
+                self._cache,
+                track.track_id,
+                track.format_id,
                 track.transcode_to_sample_rate,
-                refresh_url=self._make_sync_url_refresher(track),
+                loop,
             )
             headers["Content-Length"] = str(reader.content_length)
             logger.debug(
@@ -511,25 +515,26 @@ class AudioProxyServer:
         proxy_key: str,
     ) -> web.StreamResponse:
         """Serve a track downsampled to track.transcode_to_sample_rate as
-        PCM/WAV — see TranscodingFlacReader. A fresh reader is opened per
-        request (a couple of small upstream requests: STREAMINFO, then a
-        seek if this is a Range request) rather than cached across
+        PCM/WAV — see TranscodingFlacReader. A fresh reader (and
+        LazyHttpFlacSource) is opened per request rather than cached across
         requests — simpler, and normal playback of one track is one
         long-lived GET plus at most a few seeks, not a flood of tiny reads.
+        The actual CDN bytes behind it, though, do go through self._cache
+        (shared across every request this proxy serves) — URL resolution,
+        retry-on-expiry, and block reuse all happen there now, not here.
         """
         assert track.transcode_to_sample_rate is not None
         generation = self._claim_stream(proxy_key, request)
 
-        stream = await self._resolve_stream(track)
-        if stream is None:
-            return web.Response(status=502, text="Failed to resolve streaming URL")
-
         try:
+            loop = asyncio.get_event_loop()
             reader = await asyncio.to_thread(
                 TranscodingFlacReader,
-                stream.url,
+                self._cache,
+                track.track_id,
+                track.format_id,
                 track.transcode_to_sample_rate,
-                refresh_url=self._make_sync_url_refresher(track),
+                loop,
             )
         except Exception as e:
             logger.error(f"Failed to open transcoding source for track {track.track_id}: {e}")
@@ -680,11 +685,24 @@ class AudioProxyServer:
                 logger.debug(
                     f"Connecting to upstream URL for track {track.track_id}: {stream.url[:100]}..."
                 )
+                # TEMP DEBUG LOGGING
+                fetch_start = time.monotonic()
+                logger.info(
+                    f"AudioProxyServer: outbound GET start url={stream.url} "
+                    f"Range={upstream_headers.get('Range')!r}"
+                )
                 async with ClientSession(timeout=timeout) as session:
                     async with session.get(
                         stream.url,
                         headers=upstream_headers,
                     ) as upstream_response:
+                        # TEMP DEBUG LOGGING
+                        logger.info(
+                            f"AudioProxyServer: outbound GET headers received "
+                            f"url={stream.url} Range={upstream_headers.get('Range')!r} "
+                            f"status={upstream_response.status} "
+                            f"elapsed={time.monotonic() - fetch_start:.3f}s"
+                        )
                         if upstream_response.status not in (200, 206):
                             # An expired signed URL surfaces as an error *status*
                             # (401/403/410), not an exception — refresh and retry
@@ -767,6 +785,7 @@ class AudioProxyServer:
                             except (ConnectionResetError, ConnectionError):
                                 self._log_stream_end(
                                     track=track,
+                                    url=stream.url,
                                     bytes_sent=bytes_sent,
                                     expected_bytes=expected_bytes,
                                     elapsed=time.monotonic() - stream_start,
@@ -778,6 +797,7 @@ class AudioProxyServer:
                 await response.write_eof()
                 self._log_stream_end(
                     track=track,
+                    url=stream.url,
                     bytes_sent=bytes_sent,
                     expected_bytes=expected_bytes,
                     elapsed=time.monotonic() - stream_start,
@@ -801,6 +821,7 @@ class AudioProxyServer:
                         return web.Response(status=502, text=f"Upstream error: {e}")
                     self._log_stream_end(
                         track=track,
+                        url=stream.url,
                         bytes_sent=bytes_sent,
                         expected_bytes=expected_bytes,
                         elapsed=time.monotonic() - stream_start,
@@ -836,6 +857,7 @@ class AudioProxyServer:
     def _log_stream_end(
         self,
         track: RegisteredTrack,
+        url: str,
         bytes_sent: int,
         expected_bytes: Optional[int],
         elapsed: float,
@@ -853,6 +875,13 @@ class AudioProxyServer:
         """
         rate_mbps = (bytes_sent * 8 / elapsed / 1_000_000) if elapsed > 0 else 0.0
         pct = f"{bytes_sent / expected_bytes * 100:.1f}%" if expected_bytes else "?"
+
+        # TEMP DEBUG LOGGING
+        logger.info(
+            f"AudioProxyServer: outbound GET end url={url} completed={completed} "
+            f"bytes_sent={bytes_sent} expected_bytes={expected_bytes} "
+            f"elapsed={elapsed:.3f}s"
+        )
 
         # A mid-transfer drop: a full-body request (not a range/seek) that ended
         # well short of the advertised length. This is the stutter/stop symptom.
