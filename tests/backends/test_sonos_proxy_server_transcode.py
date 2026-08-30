@@ -1,9 +1,10 @@
-"""End-to-end tests for AudioProxyServer's downsampling path: a real
-AudioProxyServer, a real fake-CDN upstream serving a real FLAC file, and a
-real HTTP client — proving a Sonos-style GET/HEAD/Range request against a
-track registered with transcode_to_sample_rate actually gets back correct,
-byte-exact-seekable WAV audio. See test_transcoding_reader.py for the
-underlying engine's own (lower-level) tests.
+"""End-to-end tests for SonosAudioProxyServer's on-the-fly downsampling
+path: a real SonosAudioProxyServer, a real fake-CDN upstream serving a
+real FLAC file, and a real HTTP client — proving a Sonos-style GET/HEAD/
+Range request against a track registered with transcode_to_sample_rate
+actually gets back correct, byte-exact-seekable WAV audio. See
+test_sonos_transcoding_reader.py for the underlying engine's own
+(lower-level) tests.
 """
 
 import asyncio
@@ -17,8 +18,8 @@ import soxr
 from aiohttp import web
 from unittest.mock import AsyncMock
 
-from qobuz_proxy.backends.dlna.proxy_server import AudioProxyServer, RegisteredTrack
-from qobuz_proxy.backends.dlna.transcoding_reader import WAV_HEADER_SIZE
+from qobuz_proxy.backends.dlna.sonos.proxy_server import SonosAudioProxyServer, SonosRegisteredTrack
+from qobuz_proxy.backends.dlna.sonos.transcoding_reader import WAV_HEADER_SIZE
 from qobuz_proxy.playback.stream_resolver import ResolvedStream
 
 FORMAT_ID = 27  # arbitrary — these tests register tracks directly, bypassing resolve_track
@@ -44,14 +45,14 @@ def _resolver(url: str, blob: str = "") -> AsyncMock:
 
 
 def _register_transcoded(
-    proxy: AudioProxyServer, track_id: str, proxy_key: str | None = None
+    proxy: SonosAudioProxyServer, track_id: str, proxy_key: str | None = None
 ) -> None:
     """Register a track directly for transcoding, bypassing resolve_track's
     capability-driven decision tree — these tests only care about the
     transcode-serving path, given a resolver that already knows how to
     answer for FORMAT_ID."""
     key = proxy_key or track_id
-    proxy._tracks[key] = RegisteredTrack(
+    proxy._tracks[key] = SonosRegisteredTrack(
         track_id=track_id,
         format_id=FORMAT_ID,
         content_type="audio/wav",
@@ -163,7 +164,7 @@ async def test_get_serves_correct_downsampled_wav_audio():
     expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
 
     port = _free_port()
-    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
+    proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
         _register_transcoded(proxy, "42")
@@ -192,9 +193,9 @@ async def test_concurrent_requests_for_the_same_track_both_complete_without_the_
 ):
     """Two requests for the same registered track (e.g. a renderer's
     GET-before-Range probe immediately followed by the real Range request)
-    run fully independently now — there's no cooperative supersession
-    cutting either one short — so both must decode/stream to completion
-    without the server raising, each getting correct audio back.
+    run fully independently — there's no cooperative supersession cutting
+    either one short — so both must decode/stream to completion without
+    the server raising, each getting correct audio back.
     """
     import logging
 
@@ -207,7 +208,7 @@ async def test_concurrent_requests_for_the_same_track_both_complete_without_the_
     expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
 
     port = _free_port()
-    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
+    proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
         _register_transcoded(proxy, "42")
@@ -249,7 +250,7 @@ async def test_head_probe_reports_correct_content_length_without_full_download()
     expected_content_length = WAV_HEADER_SIZE + expected_target_frames * CHANNELS * 3
 
     port = _free_port()
-    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
+    proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
         _register_transcoded(proxy, "42")
@@ -276,7 +277,7 @@ async def test_range_request_seeks_to_the_correct_audio():
     expected_full = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
 
     port = _free_port()
-    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
+    proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
         _register_transcoded(proxy, "42")
@@ -348,7 +349,7 @@ async def test_misaligned_range_request_serves_exact_bytes_like_a_static_file():
     expected_full = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
 
     port = _free_port()
-    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
+    proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
         _register_transcoded(proxy, "42")
@@ -416,7 +417,7 @@ async def test_content_type_wav_route_registered_without_extension_too():
     upstream_url = await upstream.start()
 
     port = _free_port()
-    proxy = AudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
+    proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
         _register_transcoded(proxy, "42")
@@ -433,8 +434,8 @@ async def test_content_type_wav_route_registered_without_extension_too():
 class ExpiringFlacUpstream:
     """A Qobuz-style signed URL that has gone stale: rejects the original
     token with 403 but serves the same FLAC normally for a fresh one — the
-    scenario a long track can hit mid-stream (see
-    proxy_server.py's _make_sync_url_refresher)."""
+    scenario a long track can hit mid-stream (see CDNBlockCache's own
+    retry-on-expiry logic, which this exercises end to end)."""
 
     def __init__(self, payload: bytes):
         self._payload = payload
@@ -490,8 +491,7 @@ class ExpiringFlacUpstream:
 
 async def test_expired_url_is_refreshed_and_transcoding_still_succeeds():
     """A long track can outlive the signed URL's TTL mid-playback — the
-    proxy must refresh and keep serving correct downsampled audio, the
-    same protection _proxy_stream already has for the pass-through path."""
+    proxy must refresh and keep serving correct downsampled audio."""
     flac_bytes, original = _make_test_flac()
     upstream = ExpiringFlacUpstream(flac_bytes)
     base_url = await upstream.start()
@@ -506,7 +506,7 @@ async def test_expired_url_is_refreshed_and_transcoding_still_succeeds():
     resolver.resolve = AsyncMock(side_effect=_resolve)
 
     port = _free_port()
-    proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
+    proxy = SonosAudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
     await proxy.start()
     try:
         _register_transcoded(proxy, "42")
@@ -530,14 +530,14 @@ async def test_expired_url_is_refreshed_and_transcoding_still_succeeds():
 async def test_gapless_preloaded_track_gets_the_same_url_refresh_protection():
     """A gapless-armed track (DLNABackend.set_next_track) is registered
     under a composite proxy_key="{track_id}_{queue_item_id}" like any
-    other track, and served through the same _handle_audio ->
-    _transcode_stream dispatch — there's no separate code path for it, so
-    it gets no less (and no more) URL-refresh protection. Worth proving
-    directly rather than just asserting it: a gapless-armed track is often
-    the *likelier* one to actually hit an expired URL, since it can sit
-    registered for however long the current track has left to play,
-    unlike a track just started with play() (registered right as it's
-    first requested)."""
+    other track, and served through the same _handle_audio -> _serve ->
+    TranscodeStreamHandler.stream dispatch — there's no separate code path
+    for it, so it gets no less (and no more) URL-refresh protection. Worth
+    proving directly rather than just asserting it: a gapless-armed track
+    is often the *likelier* one to actually hit an expired URL, since it
+    can sit registered for however long the current track has left to
+    play, unlike a track just started with play() (registered right as
+    it's first requested)."""
     flac_bytes, original = _make_test_flac()
     upstream = ExpiringFlacUpstream(flac_bytes)
     base_url = await upstream.start()
@@ -552,7 +552,7 @@ async def test_gapless_preloaded_track_gets_the_same_url_refresh_protection():
     resolver.resolve = AsyncMock(side_effect=_resolve)
 
     port = _free_port()
-    proxy = AudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
+    proxy = SonosAudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
     await proxy.start()
     try:
         # Mirrors DLNABackend.set_next_track's registration exactly:

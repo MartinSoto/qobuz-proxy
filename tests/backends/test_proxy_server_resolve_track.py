@@ -1,14 +1,19 @@
 """Unit tests for AudioProxyServer.resolve_track's decision tree: native
-passthrough vs. local downsampling vs. a safe CD-tier fallback, driven by
-device capabilities and what Qobuz actually has for a track — see
-resolve_track's own docstring for the full rationale (always asking for
-the ceiling tier first, so the decision is based on the track's true
-native format rather than a capability-clamped guess).
+passthrough vs. a safe CD-tier fallback, driven by device capabilities and
+what Qobuz actually has for a track — see resolve_track's own docstring
+for the full rationale (always asking for the ceiling tier first, so the
+decision is based on the track's true native format rather than a
+capability-clamped guess).
+
+This class is manufacturer-generic and always falls back to CD quality
+when the native stream doesn't fit — on-the-fly downsampling is Sonos-
+specific (SonosAudioProxyServer overrides _resolve_unfitting_stream to
+try it first) and covered separately by
+test_sonos_proxy_server_resolve_track.py.
 
 Deliberately a fast unit test against a mocked QobuzStreamResolver rather
-than a real HTTP round trip — test_proxy_server_transcode.py already
-covers the end-to-end (real FLAC, real HTTP) case; this covers every
-branch of the decision itself, cheaply.
+than a real HTTP round trip; this covers every branch of the decision
+itself, cheaply.
 """
 
 from unittest.mock import AsyncMock
@@ -81,7 +86,7 @@ class TestResolveTrackDecision:
         )
         caps = _caps(max_sample_rate=48000, max_bit_depth=24)
 
-        resolved = await proxy.resolve_track("42", caps, hires_downsampling=False)
+        resolved = await proxy.resolve_track("42", caps)
 
         assert resolved is not None
         assert resolved.content_type == "audio/flac"
@@ -89,23 +94,11 @@ class TestResolveTrackDecision:
         assert resolved.bit_depth == 24
         assert resolved.proxy_url.endswith(".flac")
 
-    async def test_exceeding_native_format_transcodes_when_downsampling_enabled(self) -> None:
-        proxy = _make_proxy(
-            lambda track_id, format_id, force=False: _stream(QOBUZ_QUALITY_192K, 192000, 24)
-        )
-        caps = _caps(max_sample_rate=48000, max_bit_depth=24)
-
-        resolved = await proxy.resolve_track("42", caps, hires_downsampling=True)
-
-        assert resolved is not None
-        assert resolved.content_type == "audio/wav"
-        assert resolved.sample_rate == 48000  # downsampled to the device's cap
-        assert resolved.bit_depth == 24  # TranscodingFlacReader's fixed output depth
-        assert resolved.proxy_url.endswith(".wav")
-
-    async def test_exceeding_native_format_falls_back_to_cd_when_downsampling_disabled(
-        self,
-    ) -> None:
+    async def test_exceeding_native_format_always_falls_back_to_cd(self) -> None:
+        """The base class never transcodes — it always falls back to CD
+        quality for anything the native stream doesn't fit. See
+        test_sonos_proxy_server_resolve_track.py for the subclass that
+        tries downsampling first."""
         calls = []
 
         async def _resolve(track_id, format_id, force=False):
@@ -117,7 +110,7 @@ class TestResolveTrackDecision:
         proxy = _make_proxy(_resolve)
         caps = _caps(max_sample_rate=48000, max_bit_depth=24)
 
-        resolved = await proxy.resolve_track("42", caps, hires_downsampling=False)
+        resolved = await proxy.resolve_track("42", caps)
 
         assert resolved is not None
         assert resolved.content_type == "audio/flac"
@@ -131,7 +124,7 @@ class TestResolveTrackDecision:
         )
         caps = _caps(max_sample_rate=48000, max_bit_depth=16)
 
-        resolved = await proxy.resolve_track("42", caps, hires_downsampling=True)
+        resolved = await proxy.resolve_track("42", caps)
 
         assert resolved is not None
         assert resolved.content_type == "audio/flac"
@@ -143,7 +136,7 @@ class TestResolveTrackDecision:
         )
         caps = _caps(max_sample_rate=44100, max_bit_depth=16, supports_flac=False)
 
-        resolved = await proxy.resolve_track("42", caps, hires_downsampling=True)
+        resolved = await proxy.resolve_track("42", caps)
 
         assert resolved is not None
         assert resolved.content_type == "audio/mpeg"
@@ -152,30 +145,33 @@ class TestResolveTrackDecision:
     async def test_returns_none_when_qobuz_has_nothing_for_the_track(self) -> None:
         proxy = _make_proxy(lambda track_id, format_id, force=False: None)
 
-        resolved = await proxy.resolve_track("42", _caps(48000, 24), hires_downsampling=True)
+        resolved = await proxy.resolve_track("42", _caps(48000, 24))
 
         assert resolved is None
 
-    async def test_forced_format_id_skips_ceiling_selection_but_still_downsamples_if_needed(
+    async def test_forced_format_id_skips_ceiling_selection_but_fallback_still_applies(
         self,
     ) -> None:
         """A manual/app-driven quality override picks the initial request,
-        but the fits/transcode/fallback decision still applies on top —
-        matches _resolve_content_type_and_transcode's old behavior of
-        never bypassing the downsampling safety net."""
-        proxy = _make_proxy(
-            lambda track_id, format_id, force=False: _stream(QOBUZ_QUALITY_96K, 96000, 24)
-        )
+        but the fits/fallback decision still applies on top — never
+        bypasses the CD-quality safety net."""
+        calls = []
+
+        async def _resolve(track_id, format_id, force=False):
+            calls.append(format_id)
+            if format_id == QOBUZ_QUALITY_96K:
+                return _stream(QOBUZ_QUALITY_96K, 96000, 24)
+            return _stream(QOBUZ_QUALITY_CD, 44100, 16)
+
+        proxy = _make_proxy(_resolve)
         caps = _caps(max_sample_rate=48000, max_bit_depth=24)
 
-        resolved = await proxy.resolve_track(
-            "42", caps, hires_downsampling=True, forced_format_id=QOBUZ_QUALITY_96K
-        )
+        resolved = await proxy.resolve_track("42", caps, forced_format_id=QOBUZ_QUALITY_96K)
 
         assert resolved is not None
-        assert resolved.content_type == "audio/wav"
-        assert resolved.sample_rate == 48000
-        proxy._resolver.resolve.assert_awaited_once_with("42", QOBUZ_QUALITY_96K)
+        assert resolved.content_type == "audio/flac"
+        assert resolved.sample_rate == 44100
+        assert calls == [QOBUZ_QUALITY_96K, QOBUZ_QUALITY_CD]
 
     async def test_gapless_proxy_key_produces_a_distinct_url(self) -> None:
         proxy = _make_proxy(
@@ -183,7 +179,7 @@ class TestResolveTrackDecision:
         )
         caps = _caps(max_sample_rate=48000, max_bit_depth=16)
 
-        resolved = await proxy.resolve_track("42", caps, hires_downsampling=False, proxy_key="42_7")
+        resolved = await proxy.resolve_track("42", caps, proxy_key="42_7")
 
         assert resolved is not None
         assert "42_7" in resolved.proxy_url
@@ -196,7 +192,7 @@ class TestResolveTrackDecision:
         )
         caps = _caps(max_sample_rate=48000, max_bit_depth=16)
 
-        resolved = await proxy.resolve_track("42", caps, hires_downsampling=False)
+        resolved = await proxy.resolve_track("42", caps)
 
         assert resolved is not None
         assert resolved.blob == "the-blob"

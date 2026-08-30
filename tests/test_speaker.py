@@ -220,7 +220,10 @@ class TestSpeakerLifecycle:
         assert speaker._discovery is not None
 
     async def test_start_with_dlna_backend_creates_proxy(self):
-        """For a real DLNABackend, start() should create AudioProxyServer."""
+        """For a real DLNABackend, start() should create the proxy server
+        via the backend's own create_proxy_server (which picks the
+        concrete class — plain generic, or Sonos with on-the-fly
+        downsampling — see DLNABackend.create_proxy_server)."""
         from qobuz_proxy.backends.dlna import DLNABackend
 
         config = _make_speaker_config()
@@ -237,16 +240,13 @@ class TestSpeakerLifecycle:
 
         mock_proxy = MagicMock()
         mock_proxy.start = AsyncMock()
+        mock_backend.create_proxy_server.return_value = mock_proxy
 
         with (
             patch(
                 "qobuz_proxy.speaker.BackendFactory.create_from_config",
                 new_callable=AsyncMock,
                 return_value=mock_backend,
-            ),
-            patch(
-                "qobuz_proxy.speaker.AudioProxyServer",
-                return_value=mock_proxy,
             ),
             patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc_cls,
         ):
@@ -257,6 +257,7 @@ class TestSpeakerLifecycle:
         assert result is True
         assert speaker._proxy_server is mock_proxy
         mock_proxy.start.assert_called_once()
+        mock_backend.create_proxy_server.assert_called_once()
         mock_backend.set_proxy_server.assert_called_once_with(mock_proxy)
 
     async def test_start_auto_quality_dlna_uses_recommended(self):

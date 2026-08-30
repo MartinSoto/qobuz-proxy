@@ -25,9 +25,10 @@ from .capabilities import (
     apply_device_overrides,
     build_protocol_info,
 )
+from .proxy_server import AudioProxyServer
 
 if TYPE_CHECKING:
-    from .proxy_server import AudioProxyServer
+    from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
 
 logger = logging.getLogger(__name__)
 
@@ -170,13 +171,16 @@ class DLNABackend(AudioBackend):
             fixed_volume: If True, ignore volume commands
             name: Display name (auto-detected if not provided)
             description_url: Full URL to UPnP device description XML
-            hires_downsampling: Experimental, opt-in. When True, a 24-bit
-                capable device always gets its track's true native format
-                (Qobuz's ceiling, not a capability-clamped tier), and any
-                track exceeding its actual sample-rate cap is downsampled
-                on the fly instead of falling back to CD quality — see
-                AudioProxyServer.resolve_track. False (the default) keeps
-                the old, conservative behavior: nothing is ever transcoded.
+            hires_downsampling: Experimental, opt-in — forwarded to
+                apply_device_overrides() for whatever manufacturer-
+                specific capability override (if any) matches this
+                device, and to create_proxy_server() for whatever the
+                concrete backend class does with it. Generic DLNABackend
+                itself does nothing with it: today it only has an effect
+                for Sonos (see dlna/sonos/capabilities.py and
+                dlna/sonos/proxy_server.py's SonosAudioProxyServer, which
+                is what actually downsamples on the fly). False (the
+                default) keeps the old, conservative behavior everywhere.
         """
         super().__init__(name or f"DLNA ({ip})")
         self._ip = ip
@@ -290,6 +294,23 @@ class DLNABackend(AudioBackend):
             proxy: AudioProxyServer instance
         """
         self._proxy_server = proxy
+
+    def create_proxy_server(
+        self,
+        resolver: "QobuzStreamResolver",
+        host: str = "0.0.0.0",
+        port: int = 7120,
+    ) -> "AudioProxyServer":
+        """Construct the AudioProxyServer this backend should be paired
+        with (then passed to set_proxy_server — this doesn't set it
+        itself, since the caller also needs it to call .start()/.stop()).
+
+        Base: the plain, manufacturer-generic proxy. Overridden by
+        SonosBackend to return a SonosAudioProxyServer instead, wiring up
+        on-the-fly downsampling — see dlna/sonos/proxy_server.py. Nothing
+        here needs to know that exists.
+        """
+        return AudioProxyServer(resolver=resolver, host=host, port=port)
         logger.info("Audio proxy server configured for DLNA backend")
 
     async def connect(self) -> bool:
@@ -578,7 +599,6 @@ class DLNABackend(AudioBackend):
         resolved = await self._proxy_server.resolve_track(
             metadata.track_id,
             self._capabilities,
-            self._hires_downsampling,
             forced_format_id=self._quality_override,
         )
         if resolved is None:
@@ -970,7 +990,6 @@ class DLNABackend(AudioBackend):
         resolved = await self._proxy_server.resolve_track(
             metadata.track_id,
             self._capabilities,
-            self._hires_downsampling,
             proxy_key=proxy_key,
             forced_format_id=self._quality_override,
         )

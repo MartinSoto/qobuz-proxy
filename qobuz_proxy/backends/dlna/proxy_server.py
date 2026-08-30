@@ -2,23 +2,27 @@
 Audio Proxy Server.
 
 HTTP server that proxies audio streams from Qobuz CDN to DLNA devices. Owns
-the format/transcoding decision transparently: given a track and a device's
-capabilities, resolve_track() decides whether Qobuz's native format passes
-straight through, gets downsampled on the fly, or falls back to a safe CD-
-tier request — and hands back one proxy URL either way. The renderer never
-knows or cares which; it just GETs a URL.
+the format/quality decision transparently: given a track and a device's
+capabilities, resolve_track() always asks for the device's true format
+ceiling first (never a capability-clamped guess), and either passes the
+result straight through if it fits, or falls back to a safe CD-tier
+request if it doesn't — handing back one proxy URL either way. The
+renderer never knows or cares which; it just GETs a URL.
 
 All actual Qobuz CDN URL fetching/caching lives one layer down, in
 QobuzStreamResolver (see playback/stream_resolver.py) — this class never
 talks to the Qobuz API directly, only to that shared resolver.
 
-The on-the-fly downsampling path (resolve_track's transcode branch) is
-entirely delegated to TranscodeStreamHandler (see transcode_stream.py):
-this class only decides *whether* a track needs transcoding
-(resolve_track) and, if a request comes in for one that does, hands it
-straight to that handler — everything about actually serving downsampled
-audio (the CDN block cache, the FLAC decode/resample pipeline, WAV
-framing) lives there, not here.
+Deliberately generic — no manufacturer knowledge lives here. On-the-fly
+Hi-Res downsampling (for devices with a real sample-rate cap below what
+they could otherwise take, e.g. Sonos) is Sonos-specific today and lives
+entirely in dlna/sonos/proxy_server.py's SonosAudioProxyServer, layered on
+top of this class via two overridable seams rather than a hardcoded
+branch here: _resolve_unfitting_stream() (what to do when the native
+stream doesn't fit — this class always falls back to CD; the subclass
+tries downsampling first) and _serve() (how to answer a request for an
+already-registered track — the subclass recognizes its own transcode-
+marked tracks and routes them elsewhere, deferring everything else here).
 """
 
 from __future__ import annotations
@@ -39,8 +43,6 @@ from .capabilities import (
     QOBUZ_QUALITY_CD,
     QOBUZ_QUALITY_192K,
 )
-from .transcode_stream import TranscodeStreamHandler
-from .transcoding_reader import BYTES_PER_SAMPLE_24BIT
 
 if TYPE_CHECKING:
     from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver, ResolvedStream
@@ -71,16 +73,15 @@ class RegisteredTrack:
     """A track registered with the proxy server — just enough to serve
     requests for it. The actual CDN URL is never stored here: it's re-
     resolved (via QobuzStreamResolver, which does its own caching/TTL) on
-    every request that needs one, so this dataclass never goes stale."""
+    every request that needs one, so this dataclass never goes stale.
+
+    Subclassed by SonosAudioProxyServer's SonosRegisteredTrack to carry
+    its own on-the-fly-downsampling bookkeeping — nothing generic here
+    needs to know that exists."""
 
     track_id: str
     format_id: int
     content_type: str
-    # Set when this track's native format exceeds what the device can
-    # actually handle (see resolve_track) — served via TranscodingFlacReader
-    # as downsampled PCM/WAV instead of a plain pass-through of the source
-    # FLAC. None is the common case: pass through unchanged.
-    transcode_to_sample_rate: Optional[int] = None
 
 
 @dataclass
@@ -102,7 +103,7 @@ class AudioProxyServer:
     Local HTTP proxy server for DLNA audio streaming.
 
     Provides stable local URLs to DLNA devices while handling:
-    - Format/quality decisions (resolve_track) and on-the-fly downsampling
+    - Format/quality decisions (resolve_track)
     - Qobuz URL expiration (via the shared QobuzStreamResolver's own cache)
     - HTTP range requests for seeking
     - Streaming without full buffering
@@ -111,8 +112,8 @@ class AudioProxyServer:
         proxy = AudioProxyServer(resolver=stream_resolver, host="0.0.0.0", port=7120)
         await proxy.start()
 
-        resolved = await proxy.resolve_track(track_id, capabilities, hires_downsampling=True)
-        # resolved.proxy_url = "http://192.168.1.100:7120/audio/12345.flac" (or .wav)
+        resolved = await proxy.resolve_track(track_id, capabilities)
+        # resolved.proxy_url = "http://192.168.1.100:7120/audio/12345.flac"
 
         # Pass resolved.proxy_url to the DLNA device
     """
@@ -134,11 +135,6 @@ class AudioProxyServer:
         self._resolver = resolver
         self._host = host
         self._port = port
-
-        # Owns the on-the-fly downsampling path in full — see
-        # transcode_stream.py. One instance per proxy server, shared by
-        # every transcoded track it serves.
-        self._transcode = TranscodeStreamHandler(resolver)
 
         self._tracks: Dict[str, RegisteredTrack] = {}
         self._app: Optional[web.Application] = None
@@ -187,7 +183,6 @@ class AudioProxyServer:
             await self._runner.cleanup()
             self._runner = None
 
-        await self._transcode.close()
         self._tracks.clear()
         logger.info("Audio proxy server stopped")
 
@@ -201,14 +196,17 @@ class AudioProxyServer:
 
         Deliberately the highest tier the device's *format* (FLAC support,
         bit depth) could ever make use of, ignoring its sample-rate cap —
-        so the fits/downsample/fallback decision in resolve_track() is
-        based on the track's true native format (what Qobuz actually hands
-        back), not a capability-clamped guess. A device with real 24-bit
-        support always gets asked for the 192k ceiling even if its own
-        max_sample_rate is much lower: many hi-res tracks are natively
-        mastered at or below that cap anyway, and on the ones that aren't,
-        resolve_track downsamples on the fly instead of falling all the
-        way back to 16-bit.
+        so the fits/fallback decision in resolve_track() is based on the
+        track's true native format (what Qobuz actually hands back), not a
+        capability-clamped guess. A device with real 24-bit support always
+        gets asked for the 192k ceiling even if its own max_sample_rate is
+        much lower: many hi-res tracks are natively mastered at or below
+        that cap anyway, so this alone still gets them served as true
+        24-bit rather than downgraded to CD quality for the whole track.
+        On the ones that genuinely exceed the device's cap,
+        _resolve_unfitting_stream() decides what happens next — this
+        class falls all the way back to 16-bit; a subclass may do
+        something smarter first (see its own docstring).
         """
         if capabilities is None or not capabilities.supports_flac:
             return QOBUZ_QUALITY_MP3
@@ -233,7 +231,6 @@ class AudioProxyServer:
         self,
         track_id: str,
         capabilities: Optional[DLNACapabilities],
-        hires_downsampling: bool,
         *,
         proxy_key: Optional[str] = None,
         forced_format_id: Optional[int] = None,
@@ -247,23 +244,23 @@ class AudioProxyServer:
         guess. If that native format already fits the device, pass it
         through unmodified (this is the common case: most "Hi-Res" tracks
         aren't actually mastered above a device's real cap). If it doesn't
-        fit and on-the-fly downsampling is enabled, transcode it down to
-        the device's own sample-rate cap. Otherwise, fall back to a plain
-        CD-quality (16/44) request — always within reach of anything that
-        speaks FLAC at all.
+        fit, _resolve_unfitting_stream() decides what happens next — this
+        class always falls back to a plain CD-quality (16/44) request,
+        always within reach of anything that speaks FLAC at all; a
+        subclass can override that seam to try something else first (e.g.
+        SonosAudioProxyServer's on-the-fly downsampling).
 
         Args:
             track_id: Qobuz track ID
             capabilities: Device capabilities (None if never discovered)
-            hires_downsampling: Whether on-the-fly downsampling is enabled
             proxy_key: Optional key for the proxy URL path (defaults to
                 track_id). Use a unique key like "{track_id}_{queue_item_id}"
                 to produce distinct proxy URLs for duplicate tracks in a
                 queue (gapless preload).
             forced_format_id: When set, used as the initial request instead
                 of the capability-derived ceiling (a manual/app-driven
-                quality override) — the fits/transcode/fallback decision
-                still applies on top of it.
+                quality override) — the fits/fallback decision still
+                applies on top of it.
 
         Returns:
             ResolvedTrack, or None if Qobuz has nothing for this track at all.
@@ -280,16 +277,19 @@ class AudioProxyServer:
         if self._fits_device(stream, capabilities):
             return self._register_passthrough(track_id, stream, proxy_key)
 
-        if (
-            hires_downsampling
-            and capabilities is not None
-            and capabilities.supports_flac
-            and capabilities.max_bit_depth >= 24
-        ):
-            return self._register_transcode(
-                track_id, stream, capabilities.max_sample_rate, proxy_key
-            )
+        return await self._resolve_unfitting_stream(track_id, stream, capabilities, proxy_key)
 
+    async def _resolve_unfitting_stream(
+        self,
+        track_id: str,
+        stream: "ResolvedStream",
+        capabilities: Optional[DLNACapabilities],
+        proxy_key: Optional[str],
+    ) -> Optional[ResolvedTrack]:
+        """What to do when the native stream resolve_track() got back
+        doesn't fit the device. This class always falls back to a safe
+        CD-tier request; a subclass can try something else first (e.g. on-
+        the-fly downsampling) and call super() for the same fallback."""
         cd_stream = await self._resolver.resolve(track_id, QOBUZ_QUALITY_CD)
         if cd_stream is None:
             return None
@@ -311,34 +311,6 @@ class AudioProxyServer:
             content_type=content_type,
             sample_rate=stream.sample_rate,
             bit_depth=stream.bit_depth,
-            format_id=stream.format_id,
-            blob=stream.blob,
-        )
-
-    def _register_transcode(
-        self,
-        track_id: str,
-        stream: "ResolvedStream",
-        target_sample_rate: int,
-        proxy_key: Optional[str],
-    ) -> ResolvedTrack:
-        key = proxy_key or track_id
-        self._tracks[key] = RegisteredTrack(
-            track_id=track_id,
-            format_id=stream.format_id,
-            content_type="audio/wav",
-            transcode_to_sample_rate=target_sample_rate,
-        )
-        proxy_url = f"{self.base_url}/audio/{key}.wav"
-        logger.debug(
-            f"Registered track {track_id} (key={key}) -> {proxy_url} "
-            f"[transcode {stream.sample_rate}Hz -> {target_sample_rate}Hz]"
-        )
-        return ResolvedTrack(
-            proxy_url=proxy_url,
-            content_type="audio/wav",
-            sample_rate=target_sample_rate,
-            bit_depth=BYTES_PER_SAMPLE_24BIT * 8,  # TranscodingFlacReader's fixed output depth
             format_id=stream.format_id,
             blob=stream.blob,
         )
@@ -376,8 +348,7 @@ class AudioProxyServer:
 
         logger.debug(
             f"Audio request: key={proxy_key} track={track.track_id} method={request.method} "
-            f"range={request.headers.get('Range')!r} "
-            f"transcode={track.transcode_to_sample_rate}"
+            f"range={request.headers.get('Range')!r}"
         )
         # TEMP DEBUG LOGGING
         logger.info(
@@ -385,11 +356,14 @@ class AudioProxyServer:
             f"Range={request.headers.get('Range')!r}"
         )
 
-        if track.transcode_to_sample_rate is not None:
-            if request.method == "HEAD":
-                return await self._transcode.handle_head_probe(track)
-            return await self._transcode.stream(request, track)
+        return await self._serve(request, track)
 
+    async def _serve(self, request: web.Request, track: RegisteredTrack) -> web.StreamResponse:
+        """Answer a request for an already-registered track. This class
+        only ever does a plain CDN pass-through; a subclass overrides this
+        to recognize its own specially-registered tracks (e.g.
+        SonosAudioProxyServer's transcode-marked ones) and route them
+        elsewhere, deferring to super() for everything else."""
         # HEAD probes (Denon/HEOS send one before every GET) route here too via
         # add_get's implicit HEAD support. Answer them headers-only — streaming
         # the body just to have aiohttp discard it downloads the whole track

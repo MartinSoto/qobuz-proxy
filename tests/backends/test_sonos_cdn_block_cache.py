@@ -15,7 +15,7 @@ import pytest
 from aiohttp import web
 from unittest.mock import AsyncMock
 
-from qobuz_proxy.backends.dlna.cdn_block_cache import CDNBlockCache, CDNBlockFetchError
+from qobuz_proxy.backends.dlna.sonos.cdn_block_cache import CDNBlockCache, CDNBlockFetchError
 from qobuz_proxy.playback.stream_resolver import ResolvedStream
 
 FORMAT_ID = 6  # arbitrary — these tests don't exercise quality selection

@@ -1,15 +1,16 @@
 """
-HTTP serving for AudioProxyServer's on-the-fly downsampling path.
+HTTP serving for SonosAudioProxyServer's on-the-fly downsampling path.
 
 Everything specific to *serving* a transcoded (downsampled WAV) track over
 HTTP lives here — the actual downsampling engine is TranscodingFlacReader
 (see transcoding_reader.py); this module is the glue between that engine
 and aiohttp: answering HEAD probes with the virtual WAV's Content-Length,
 and streaming GET/Range requests as byte-exact-seekable PCM/WAV. Kept out
-of proxy_server.py so that file only has to know this handler exists and
-dispatch a track to it — everything about downsampling, including owning
-the CDNBlockCache instance every transcoded track's bytes are read
-through, stays here.
+of proxy_server.py (see its module docstring — generic and knows nothing
+about Sonos) so that SonosAudioProxyServer only has to know this handler
+exists and dispatch a matching track to it — everything about
+downsampling, including owning the CDNBlockCache instance every
+transcoded track's bytes are read through, stays here.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from .transcoding_reader import BYTES_PER_SAMPLE_24BIT, WAV_HEADER_SIZE, Transco
 if TYPE_CHECKING:
     from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
 
-    from .proxy_server import RegisteredTrack
+    from .proxy_server import SonosRegisteredTrack
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ def _parse_range_start(range_header: str) -> int:
 
 
 class TranscodeStreamHandler:
-    """Serves the on-the-fly downsampling path for AudioProxyServer.
+    """Serves the on-the-fly downsampling path for SonosAudioProxyServer.
 
     Usage:
         handler = TranscodeStreamHandler(resolver=stream_resolver)
@@ -67,7 +68,7 @@ class TranscodeStreamHandler:
         """Release the cache's one lingering connection, if any."""
         await self._cache.close()
 
-    async def handle_head_probe(self, track: "RegisteredTrack") -> web.Response:
+    async def handle_head_probe(self, track: "SonosRegisteredTrack") -> web.Response:
         """Answer a HEAD probe for a downsampled track with the *virtual*
         (post-transcode) WAV's Content-Length, computed from the source's
         STREAMINFO alone — cheap, no decoding."""
@@ -87,7 +88,7 @@ class TranscodeStreamHandler:
     async def stream(
         self,
         request: web.Request,
-        track: "RegisteredTrack",
+        track: "SonosRegisteredTrack",
     ) -> web.StreamResponse:
         """Serve a track downsampled to track.transcode_to_sample_rate as
         PCM/WAV — see TranscodingFlacReader. A fresh reader (and
@@ -189,7 +190,7 @@ class TranscodeStreamHandler:
         )
         return response
 
-    async def _open_reader(self, track: "RegisteredTrack") -> TranscodingFlacReader:
+    async def _open_reader(self, track: "SonosRegisteredTrack") -> TranscodingFlacReader:
         assert track.transcode_to_sample_rate is not None
         loop = asyncio.get_event_loop()
         return await asyncio.to_thread(
