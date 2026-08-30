@@ -1,5 +1,5 @@
 """
-Lazy, HTTP-Range-backed file-like source for FLAC decoding.
+Lazy, CDNBlockCache-backed file-like source for FLAC decoding.
 
 The point of this module: let a decoder (soundfile/libFLAC) seek within a
 remote FLAC file — using its *own* seeking logic (a SEEKTABLE lookup, or a
@@ -12,45 +12,40 @@ FLAC's own structure at all.
 object exactly like a local file: it calls ``seek()``/``read()`` wherever
 *it* decides it needs bytes from — including, mid-seek, several small
 probing reads while it narrows down a frame boundary. Each of those calls
-becomes a real HTTP Range request here. A small read-ahead cache keeps
-routine forward reads (the common case: sequential decode) from turning
-into one HTTP request per tiny libsndfile read.
+becomes one or more CDNBlockCache.read_block() calls here.
 
-Synchronous by design — libsndfile's I/O callbacks are synchronous, and
-this is only ever meant to be handed to soundfile from inside a worker
-thread (``asyncio.to_thread``), never called from the event loop directly.
+All of the actual CDN fetching — HTTP, retry-on-transient-failure, refresh-
+on-expired-URL, and (the part that matters most for the common case of
+sequential decode) reusing one lingering connection across consecutive
+blocks — lives one layer down, in CDNBlockCache (see cdn_block_cache.py).
+This class is now just a thin sync-to-async bridge: libsndfile's I/O
+callbacks are synchronous, so every call into this class is meant to run
+inside a worker thread (``asyncio.to_thread``), never directly on the
+event loop — but CDNBlockCache itself is native asyncio, so every read
+here is bridged back onto the event loop via
+``asyncio.run_coroutine_threadsafe`` (same bridge shape as
+proxy_server.py's now-removed ``_make_sync_url_refresher`` used to be).
 """
 
 from __future__ import annotations
 
-import logging
+import asyncio
 import os
-import time
-import urllib.error
-import urllib.request
-from typing import Callable, Optional, TypeVar
+from typing import TYPE_CHECKING, Coroutine, TypeVar
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from .cdn_block_cache import CDNBlockCache
 
 _T = TypeVar("_T")
 
-DEFAULT_CHUNK_SIZE = 256 * 1024  # read-ahead size for a single upstream fetch
-DEFAULT_TIMEOUT_SECONDS = 30.0
-# Qobuz signed URLs are time-limited (see proxy_server.py's
-# DEFAULT_URL_MAX_AGE_SECONDS) — a track long enough to still be streaming
-# once the URL dies mid-playback hits one of these.
-EXPIRED_URL_STATUS_CODES = (401, 403, 410)
-# A transient upstream failure (connection reset, DNS hiccup, a 502/503 from
-# the CDN, a stalled socket) gets a brief, bounded retry rather than
-# immediately killing the whole transcode request — observed directly in
-# production as "Connection lost" aborting an otherwise-healthy seek.
-# Linear backoff: 0.5s, 1.0s, 1.5s — a few seconds total before giving up.
-MAX_CONNECTION_RETRIES = 3
-CONNECTION_RETRY_DELAY_SECONDS = 0.5
+# Bridge-call timeout: how long a single read()/seek()-triggered fetch may
+# take before this gives up waiting on the event loop — not a network
+# timeout (CDNBlockCache has its own for the actual HTTP calls).
+DEFAULT_BRIDGE_TIMEOUT_SECONDS = 30.0
 
 
 class LazyHttpFlacSource:
-    """A read/seek/tell file-like object backed by Range requests to a URL.
+    """A read/seek/tell file-like object backed by CDNBlockCache.
 
     Nothing here understands FLAC — all seeking intelligence stays inside
     libFLAC (via soundfile), driven through this object's read()/seek()
@@ -59,36 +54,32 @@ class LazyHttpFlacSource:
 
     def __init__(
         self,
-        url: str,
-        chunk_size: int = DEFAULT_CHUNK_SIZE,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
-        refresh_url: Optional[Callable[[], Optional[str]]] = None,
+        cache: "CDNBlockCache",
+        track_id: str,
+        format_id: int,
+        loop: asyncio.AbstractEventLoop,
+        timeout: float = DEFAULT_BRIDGE_TIMEOUT_SECONDS,
     ) -> None:
         """
         Args:
-            url: Initial signed streaming URL.
-            refresh_url: Called (synchronously — see module docstring) when
-                a fetch fails with an expired-URL status, to get a
-                replacement URL to retry with. Returning None or raising
-                means give up. Optional: without it, an expired URL just
-                fails the read, same as before this existed.
+            cache: Shared CDNBlockCache every block is read through.
+            track_id: Qobuz track ID.
+            format_id: Qobuz format tier — together with track_id, this is
+                the cache's key space (see CDNBlockCache).
+            loop: The event loop `cache` lives on. Must be captured by the
+                caller *before* dispatching to a worker thread (there is no
+                running loop to discover from inside one) — see
+                proxy_server.py's transcode call sites.
+            timeout: How long a single bridged read may block waiting on
+                the event loop.
         """
-        self._url = url
-        self._chunk_size = chunk_size
+        self._cache = cache
+        self._track_id = track_id
+        self._format_id = format_id
+        self._loop = loop
         self._timeout = timeout
-        self._refresh_url = refresh_url
         self._pos = 0
-        self._total_size = self._fetch_total_size()
-
-        # Read-ahead cache: the most recent fetch, so sequential reads (the
-        # common case) don't issue a fresh HTTP request per libsndfile read.
-        self._buf = b""
-        self._buf_start = 0
-
-        # Diagnostics only — not used for correctness. Lets a caller (and
-        # tests) confirm this genuinely avoided a full download.
-        self.bytes_fetched = 0
-        self.request_count = 0
+        self._total_size = self._run(cache.get_track_size(track_id, format_id))
 
     # -- Python file-like protocol -------------------------------------
 
@@ -127,7 +118,8 @@ class LazyHttpFlacSource:
         return False
 
     def close(self) -> None:
-        # Nothing held open between calls — every fetch is a fresh request.
+        # Nothing owned here to release — CDNBlockCache owns any open
+        # connection, independent of any one decode's lifetime.
         pass
 
     @property
@@ -137,120 +129,27 @@ class LazyHttpFlacSource:
     # -- Internals --------------------------------------------------------
 
     def _read_range(self, start: int, end: int) -> bytes:
-        """Return bytes [start, end), fetching (and caching) more from
-        upstream if the current read-ahead buffer doesn't already cover it."""
-        if self._buf_start <= start and end <= self._buf_start + len(self._buf):
-            return self._buf[start - self._buf_start : end - self._buf_start]
+        """Return bytes [start, end), via one or more cache block reads."""
+        return self._run(self._read_range_async(start, end))
 
-        fetch_len = max(self._chunk_size, end - start)
-        fetch_end = min(start + fetch_len, self._total_size)
-        data = self._http_get_range(start, fetch_end - 1)
-        self._buf = data
-        self._buf_start = start
-        return data[: end - start]
+    async def _read_range_async(self, start: int, end: int) -> bytes:
+        block_size = self._cache.block_size
+        first_block = start // block_size
+        last_block = (end - 1) // block_size
+        # Fetched sequentially (not gathered) — a decode's reads are
+        # themselves sequential, and reading blocks in order is exactly
+        # what lets CDNBlockCache serve block N+1 off the connection it
+        # kept open from block N instead of opening a new one.
+        parts = [
+            await self._cache.read_block(self._track_id, self._format_id, block_index)
+            for block_index in range(first_block, last_block + 1)
+        ]
+        block_start = first_block * block_size
+        return b"".join(parts)[start - block_start : end - block_start]
 
-    def _http_get_range(self, start: int, end_inclusive: int) -> bytes:
-        def _do() -> bytes:
-            req = urllib.request.Request(
-                self._url, headers={"Range": f"bytes={start}-{end_inclusive}"}
-            )
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                data: bytes = resp.read()
-            return data
-
-        data = self._with_url_refresh(_do)
-        self.bytes_fetched += len(data)
-        self.request_count += 1
-        logger.debug(
-            f"LazyHttpFlacSource: fetched bytes {start}-{end_inclusive} "
-            f"({len(data)} bytes, request #{self.request_count})"
-        )
-        return data
-
-    def _fetch_total_size(self) -> int:
-        def _do() -> int:
-            req = urllib.request.Request(self._url, method="HEAD")
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                content_length = resp.headers.get("Content-Length")
-            if content_length is None:
-                raise OSError(f"Upstream did not report Content-Length for {self._url}")
-            return int(content_length)
-
-        return self._with_url_refresh(_do)
-
-    def _with_url_refresh(self, do_request: Callable[[], _T]) -> _T:
-        """Run do_request (a closure reading self._url), with two layers of
-        recovery around it:
-
-        - An expired-URL status (401/403/410) refreshes self._url and
-          retries once immediately — do_request rebuilds its Request from
-          self._url each call, so a refresh in between takes effect on the
-          retry automatically.
-        - Anything else that looks transient (a dropped connection, a DNS
-          hiccup, a 502/503 from the CDN, a stalled socket) gets a brief,
-          bounded retry with backoff — see MAX_CONNECTION_RETRIES. If it's
-          still failing after that, the failure is real: give up and raise
-          a clear, specific error instead of letting the underlying
-          exception's own (often terse — "Connection lost") message be the
-          only signal of what happened.
-        """
-        last_error: Optional[BaseException] = None
-        for attempt in range(MAX_CONNECTION_RETRIES + 1):
-            try:
-                return self._do_with_expiry_refresh(do_request)
-            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
-                if isinstance(e, urllib.error.HTTPError) and e.code in EXPIRED_URL_STATUS_CODES:
-                    # _do_with_expiry_refresh already tried everything it
-                    # can for this one (refresh + immediate retry, or gave
-                    # up because there's no refresh_url at all) — this is a
-                    # diagnosed, permanent condition, not a transient blip.
-                    # Retrying would just fail the same way against the
-                    # same dead URL every time; raise immediately instead
-                    # of burning the whole retry budget on nothing.
-                    raise
-                # Anything else — a CDN 5xx, a connection reset, a DNS
-                # hiccup, a stalled socket — is worth the brief retry.
-                last_error = e
-                if attempt >= MAX_CONNECTION_RETRIES:
-                    break
-                delay = CONNECTION_RETRY_DELAY_SECONDS * (attempt + 1)
-                logger.warning(
-                    f"LazyHttpFlacSource: upstream request failed "
-                    f"({type(e).__name__}: {e}); retrying "
-                    f"({attempt + 1}/{MAX_CONNECTION_RETRIES}) in {delay:.1f}s"
-                )
-                time.sleep(delay)
-
-        assert last_error is not None  # the loop always sets it before falling through
-        logger.error(
-            f"LazyHttpFlacSource: upstream failed after {MAX_CONNECTION_RETRIES} retries "
-            f"({type(last_error).__name__}: {last_error})"
-        )
-        raise OSError(
-            f"Qobuz CDN connection failed after {MAX_CONNECTION_RETRIES} retries "
-            f"({type(last_error).__name__}: {last_error})"
-        ) from last_error
-
-    def _do_with_expiry_refresh(self, do_request: Callable[[], _T]) -> _T:
-        """One attempt at do_request, with a single immediate retry if it
-        fails on an expired-URL status — split out from _with_url_refresh
-        so that inner recovery (refresh the URL, try again right away)
-        stays distinct from the outer one (retry transient failures with
-        backoff, bounded)."""
-        try:
-            return do_request()
-        except urllib.error.HTTPError as e:
-            if e.code not in EXPIRED_URL_STATUS_CODES or self._refresh_url is None:
-                raise
-            logger.info(
-                f"LazyHttpFlacSource: upstream {e.code} (URL likely expired) — "
-                "refreshing and retrying once"
-            )
-            fresh = self._refresh_url()
-            if not fresh:
-                raise
-            self._url = fresh
-            return do_request()
+    def _run(self, coro: "Coroutine[object, object, _T]") -> _T:
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=self._timeout)
 
 
 __all__ = ["LazyHttpFlacSource"]

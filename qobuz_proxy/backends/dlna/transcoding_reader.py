@@ -34,15 +34,18 @@ filter design).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import struct
-from typing import TYPE_CHECKING, Callable, Generator, Optional
+from typing import TYPE_CHECKING, Generator
 
 if TYPE_CHECKING:
     # Only for type annotations — numpy/soundfile/soxr stay genuinely
     # optional at runtime (see the class docstring); every real use below
     # imports them lazily, inside the function that needs them.
     import numpy as np
+
+    from .cdn_block_cache import CDNBlockCache
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +100,9 @@ class TranscodingFlacReader:
     WAV stream — without downloading or decoding the source in full.
 
     Usage:
-        reader = TranscodingFlacReader(url, target_sample_rate=48000)
+        reader = TranscodingFlacReader(
+            cache, track_id, format_id, target_sample_rate=48000, loop=loop
+        )
         for chunk in reader.stream_from(start_byte):
             ...write chunk to the HTTP response...
 
@@ -108,12 +113,14 @@ class TranscodingFlacReader:
 
     def __init__(
         self,
-        url: str,
+        cache: "CDNBlockCache",
+        track_id: str,
+        format_id: int,
         target_sample_rate: int,
+        loop: asyncio.AbstractEventLoop,
         *,
         source_chunk_frames: int = DEFAULT_SOURCE_CHUNK_FRAMES,
         resample_quality: str = DEFAULT_RESAMPLE_QUALITY,
-        refresh_url: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         import soundfile as sf
 
@@ -122,7 +129,7 @@ class TranscodingFlacReader:
         self._source_chunk_frames = source_chunk_frames
         self._resample_quality = resample_quality
 
-        self._lazy_source = LazyHttpFlacSource(url, refresh_url=refresh_url)
+        self._lazy_source = LazyHttpFlacSource(cache, track_id, format_id, loop)
         self._handle = sf.SoundFile(self._lazy_source)
 
         # soundfile ships no type stubs, so these read as Any straight off
