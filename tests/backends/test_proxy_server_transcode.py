@@ -187,25 +187,21 @@ async def test_get_serves_correct_downsampled_wav_audio():
         await upstream.stop()
 
 
-async def test_second_request_supersedes_the_first_without_the_server_raising(caplog):
-    """Regression: an earlier version of the same-track supersession fix
-    used Task.cancel() on the previous request and raced gen.close()
-    against a generator still genuinely executing on its worker thread —
-    asyncio.to_thread cancellation stops the *awaiting coroutine*, not the
-    underlying thread, so the generator wasn't done when close() ran,
-    raising ValueError("generator already executing") out of the aiohttp
-    request handler (observed directly, in production, immediately on
-    every seek). The cooperative fix (_claim_stream/_stream_superseded)
-    must let the first request's stream end cleanly — between its own
-    iterations, never mid-call — while the second completes normally, with
-    nothing raised on the server side either way.
+async def test_concurrent_requests_for_the_same_track_both_complete_without_the_server_raising(
+    caplog,
+):
+    """Two requests for the same registered track (e.g. a renderer's
+    GET-before-Range probe immediately followed by the real Range request)
+    run fully independently now — there's no cooperative supersession
+    cutting either one short — so both must decode/stream to completion
+    without the server raising, each getting correct audio back.
     """
     import logging
 
     flac_bytes, original = _make_test_flac()
     # A small delay before each upstream response widens the window in
     # which the first request is genuinely still inside a to_thread()
-    # decode/fetch call when the second one supersedes it.
+    # decode/fetch call when the second one starts.
     upstream = FakeCdnUpstream(flac_bytes, delay=0.02)
     upstream_url = await upstream.start()
     expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
@@ -227,16 +223,12 @@ async def test_second_request_supersedes_the_first_without_the_server_raising(ca
                     assert second_resp.status == 200
                     second_body = await second_resp.read()
 
-                # The first request was superseded — its connection may end
-                # with a short body or a client-side error, both fine; the
-                # point is awaiting it must not hang, and (checked below via
-                # caplog) the server must never have raised handling it.
-                try:
-                    first_resp = await asyncio.wait_for(first, timeout=10)
-                    await first_resp.read()
-                    first_resp.close()
-                except (aiohttp.ClientError, asyncio.TimeoutError):
-                    pass
+                # Both requests must complete cleanly; the point is
+                # awaiting the first must not hang, and (checked below via
+                # caplog) the server must never have raised handling either.
+                first_resp = await asyncio.wait_for(first, timeout=10)
+                await first_resp.read()
+                first_resp.close()
     finally:
         await proxy.stop()
         await upstream.stop()
@@ -318,7 +310,7 @@ async def test_range_request_seeks_to_the_correct_audio():
         # connection the remainder of a file this small can land in the
         # kernel socket buffer well before the client ever abandons that
         # connection, making a wire-level byte count an unreliable signal.
-        assert proxy._cache.cached_bytes < len(flac_bytes) * 0.5
+        assert proxy._transcode._cache.cached_bytes < len(flac_bytes) * 0.5
     finally:
         await proxy.stop()
         await upstream.stop()

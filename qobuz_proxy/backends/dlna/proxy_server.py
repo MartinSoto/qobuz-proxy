@@ -12,12 +12,13 @@ All actual Qobuz CDN URL fetching/caching lives one layer down, in
 QobuzStreamResolver (see playback/stream_resolver.py) — this class never
 talks to the Qobuz API directly, only to that shared resolver.
 
-The on-the-fly downsampling path (resolve_track's transcode branch) goes
-through a second layer this class owns and constructs: CDNBlockCache (see
-cdn_block_cache.py), a block-granular LRU cache/connection-reuse layer in
-front of the same resolver. One CDNBlockCache per AudioProxyServer — same
-scope as the proxy server itself — shared by every transcoded track this
-proxy serves.
+The on-the-fly downsampling path (resolve_track's transcode branch) is
+entirely delegated to TranscodeStreamHandler (see transcode_stream.py):
+this class only decides *whether* a track needs transcoding
+(resolve_track) and, if a request comes in for one that does, hands it
+straight to that handler — everything about actually serving downsampled
+audio (the CDN block cache, the FLAC decode/resample pipeline, WAV
+framing) lives there, not here.
 """
 
 from __future__ import annotations
@@ -38,8 +39,8 @@ from .capabilities import (
     QOBUZ_QUALITY_CD,
     QOBUZ_QUALITY_192K,
 )
-from .cdn_block_cache import CDNBlockCache
-from .transcoding_reader import BYTES_PER_SAMPLE_24BIT, WAV_HEADER_SIZE, TranscodingFlacReader
+from .transcode_stream import TranscodeStreamHandler
+from .transcoding_reader import BYTES_PER_SAMPLE_24BIT
 
 if TYPE_CHECKING:
     from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver, ResolvedStream
@@ -134,19 +135,15 @@ class AudioProxyServer:
         self._host = host
         self._port = port
 
-        # Backs the on-the-fly downsampling path (see _transcode_stream) —
-        # one instance per proxy server, shared by every transcoded track
-        # it serves. See cdn_block_cache.py.
-        self._cache = CDNBlockCache(resolver=resolver)
+        # Owns the on-the-fly downsampling path in full — see
+        # transcode_stream.py. One instance per proxy server, shared by
+        # every transcoded track it serves.
+        self._transcode = TranscodeStreamHandler(resolver)
 
         self._tracks: Dict[str, RegisteredTrack] = {}
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
-
-        # Cooperative stream supersession — see _claim_stream/_stream_superseded.
-        self._active_streams: Dict[str, tuple[int, web.Request]] = {}
-        self._next_generation = 0
 
         # Will be set after start() to actual bound address
         self._actual_host: Optional[str] = None
@@ -190,9 +187,8 @@ class AudioProxyServer:
             await self._runner.cleanup()
             self._runner = None
 
-        await self._cache.close()
+        await self._transcode.close()
         self._tracks.clear()
-        self._active_streams.clear()
         logger.info("Audio proxy server stopped")
 
     # =========================================================================
@@ -361,54 +357,6 @@ class AudioProxyServer:
             return None
 
     # =========================================================================
-    # Cooperative stream supersession
-    # =========================================================================
-
-    def _claim_stream(self, proxy_key: str, request: web.Request) -> int:
-        """Claim the right to serve `proxy_key`'s stream, superseding
-        whatever request (if any) was previously claiming it.
-
-        A renderer that fires a new request for a track it's already
-        streaming reproducibly does so on *every* seek: a GET-before-Range
-        probe immediately followed by the real Range request, and/or the
-        previous seek's connection still draining. For however long it
-        keeps both sockets open, it's genuinely receiving two different,
-        both-valid positions of the same track at once — so the previous
-        request's transport is force-closed immediately here, rather than
-        only marked stale for its own loop to notice on its own schedule.
-
-        Returns a generation id the caller must check via
-        _stream_superseded() between its own loop iterations — never mid-
-        call — to stop cleanly once superseded. This never touches the
-        generator/thread doing decode work, only the socket, so it can't
-        reintroduce the "generator already executing" crash a prior
-        Task.cancel()-based approach caused.
-        """
-        self._next_generation += 1
-        generation = self._next_generation
-
-        previous = self._active_streams.get(proxy_key)
-        self._active_streams[proxy_key] = (generation, request)
-
-        if previous is not None:
-            _, previous_request = previous
-            if previous_request is not request:
-                transport = previous_request.transport
-                if transport is not None and not transport.is_closing():
-                    transport.close()
-
-        return generation
-
-    def _stream_superseded(self, proxy_key: str, generation: int) -> bool:
-        """Whether a newer request has claimed proxy_key since `generation`
-        was issued (or the key was never claimed at all)."""
-        current = self._active_streams.get(proxy_key)
-        if current is None:
-            return True
-        current_generation, _ = current
-        return current_generation != generation
-
-    # =========================================================================
     # Request handling
     # =========================================================================
 
@@ -439,8 +387,8 @@ class AudioProxyServer:
 
         if track.transcode_to_sample_rate is not None:
             if request.method == "HEAD":
-                return await self._handle_transcoded_head_probe(track)
-            return await self._transcode_stream(request, track, proxy_key)
+                return await self._transcode.handle_head_probe(track)
+            return await self._transcode.stream(request, track)
 
         # HEAD probes (Denon/HEOS send one before every GET) route here too via
         # add_get's implicit HEAD support. Answer them headers-only — streaming
@@ -450,7 +398,7 @@ class AudioProxyServer:
             return await self._handle_head_probe(track)
 
         # Forward request to Qobuz CDN
-        return await self._proxy_stream(request, track, proxy_key)
+        return await self._proxy_stream(request, track)
 
     async def _handle_head_probe(self, track: RegisteredTrack) -> web.Response:
         """Answer a HEAD probe from upstream headers, without a body transfer."""
@@ -483,162 +431,10 @@ class AudioProxyServer:
             logger.debug(f"Upstream HEAD failed for track {track.track_id}: {e}")
         return web.Response(status=200, headers=headers)
 
-    async def _handle_transcoded_head_probe(self, track: RegisteredTrack) -> web.Response:
-        """Answer a HEAD probe for a downsampled track with the *virtual*
-        (post-transcode) WAV's Content-Length, computed from the source's
-        STREAMINFO alone — cheap, no decoding."""
-        headers = {"Content-Type": "audio/wav", "Accept-Ranges": "bytes"}
-        assert track.transcode_to_sample_rate is not None
-        try:
-            loop = asyncio.get_event_loop()
-            reader = await asyncio.to_thread(
-                TranscodingFlacReader,
-                self._cache,
-                track.track_id,
-                track.format_id,
-                track.transcode_to_sample_rate,
-                loop,
-            )
-            headers["Content-Length"] = str(reader.content_length)
-            logger.debug(
-                f"Transcoded HEAD probe for track {track.track_id}: "
-                f"Content-Length={reader.content_length}"
-            )
-        except Exception as e:
-            logger.debug(f"Transcoded HEAD probe failed for track {track.track_id}: {e}")
-        return web.Response(status=200, headers=headers)
-
-    async def _transcode_stream(
-        self,
-        request: web.Request,
-        track: RegisteredTrack,
-        proxy_key: str,
-    ) -> web.StreamResponse:
-        """Serve a track downsampled to track.transcode_to_sample_rate as
-        PCM/WAV — see TranscodingFlacReader. A fresh reader (and
-        LazyHttpFlacSource) is opened per request rather than cached across
-        requests — simpler, and normal playback of one track is one
-        long-lived GET plus at most a few seeks, not a flood of tiny reads.
-        The actual CDN bytes behind it, though, do go through self._cache
-        (shared across every request this proxy serves) — URL resolution,
-        retry-on-expiry, and block reuse all happen there now, not here.
-        """
-        assert track.transcode_to_sample_rate is not None
-        generation = self._claim_stream(proxy_key, request)
-
-        try:
-            loop = asyncio.get_event_loop()
-            reader = await asyncio.to_thread(
-                TranscodingFlacReader,
-                self._cache,
-                track.track_id,
-                track.format_id,
-                track.transcode_to_sample_rate,
-                loop,
-            )
-        except Exception as e:
-            logger.error(f"Failed to open transcoding source for track {track.track_id}: {e}")
-            return web.Response(status=502, text="Failed to open source stream")
-
-        range_header = request.headers.get("Range")
-        start_byte = _parse_range_start(range_header) if range_header else 0
-        start_byte = max(0, min(start_byte, reader.content_length))
-
-        # We're simulating a plain static file on disk — the same thing a
-        # dumb NAS would serve. The renderer parsed our WAV header once (it
-        # always fetches from byte 0 first) and finds its own alignment
-        # from there; a static file server never needs to "help" with
-        # that, it only ever needs to hand back the literal bytes that
-        # exist at the requested offset. So: whatever byte the renderer
-        # asks for, that's exactly what we declare *and* exactly what the
-        # response starts with — never a rounded/corrected position.
-        #
-        # The one thing we can't avoid: our decoder only ever produces
-        # whole PCM frames, so reconstructing the *true* bytes at an
-        # arbitrary offset means decoding from the containing frame and
-        # discarding the leading bytes that fall before the requested
-        # byte before writing anything out — exactly what reading an
-        # arbitrary byte offset from a real file on disk would hand back,
-        # nothing more.
-        bytes_per_frame = reader.channels * BYTES_PER_SAMPLE_24BIT
-        if start_byte < WAV_HEADER_SIZE:
-            aligned_start_byte = start_byte
-        else:
-            data_offset = start_byte - WAV_HEADER_SIZE
-            aligned_start_byte = (
-                WAV_HEADER_SIZE + (data_offset // bytes_per_frame) * bytes_per_frame
-            )
-        leading_trim = start_byte - aligned_start_byte
-
-        remaining = reader.content_length - start_byte
-
-        headers = {"Content-Type": "audio/wav", "Accept-Ranges": "bytes"}
-        if range_header:
-            headers["Content-Range"] = (
-                f"bytes {start_byte}-{max(start_byte, reader.content_length - 1)}"
-                f"/{reader.content_length}"
-            )
-        response = web.StreamResponse(status=206 if range_header else 200, headers=headers)
-        response.content_length = remaining
-
-        bytes_written = 0
-        stream_start = time.monotonic()
-        outcome = "completed"
-        try:
-            # response.prepare() can itself raise if this request's
-            # transport was already force-closed by a newer claim on the
-            # same key while we were still opening the reader above (see
-            # _claim_stream) — must be caught here, not left to escape the
-            # handler.
-            await response.prepare(request)
-
-            # Drive the reader's (synchronous, blocking) generator one step
-            # at a time from a worker thread — each to_thread(next, ...)
-            # call runs entirely inside that call, so if a newer request
-            # supersedes this one and we simply stop calling next(), nothing
-            # is left running in the background (no orphaned thread, no
-            # stuck queue), and gen.close() below never races a generator
-            # still genuinely executing.
-            gen = reader.stream_from(aligned_start_byte)
-            try:
-                while True:
-                    if self._stream_superseded(proxy_key, generation):
-                        outcome = "superseded"
-                        break
-                    chunk = await asyncio.to_thread(next, gen, None)
-                    if chunk is None:
-                        break
-                    if self._stream_superseded(proxy_key, generation):
-                        outcome = "superseded"
-                        break
-                    if leading_trim:
-                        if len(chunk) <= leading_trim:
-                            leading_trim -= len(chunk)
-                            continue
-                        chunk = chunk[leading_trim:]
-                        leading_trim = 0
-                    await response.write(chunk)
-                    bytes_written += len(chunk)
-            finally:
-                gen.close()
-        except (ConnectionResetError, asyncio.CancelledError):
-            outcome = "disconnected"
-            logger.debug(f"Client disconnected mid-transcode for track {track.track_id}")
-        except Exception as e:
-            outcome = "error"
-            logger.error(f"Transcoding stream error for track {track.track_id}: {e}")
-
-        logger.debug(
-            f"Transcode response for track {track.track_id} done: {outcome}, "
-            f"{bytes_written} bytes in {time.monotonic() - stream_start:.1f}s"
-        )
-        return response
-
     async def _proxy_stream(
         self,
         request: web.Request,
         track: RegisteredTrack,
-        proxy_key: str,
     ) -> web.StreamResponse:
         """Proxy the audio stream from Qobuz CDN.
 
@@ -647,8 +443,6 @@ class AudioProxyServer:
         request from the last byte delivered to the client instead of dropping
         the renderer's stream mid-track.
         """
-        generation = self._claim_stream(proxy_key, request)
-
         stream = await self._resolve_stream(track)
         if stream is None:
             return web.Response(status=502, text="Failed to resolve streaming URL")
@@ -773,12 +567,6 @@ class AudioProxyServer:
                         async for chunk in upstream_response.content.iter_chunked(
                             STREAM_CHUNK_SIZE
                         ):
-                            if self._stream_superseded(proxy_key, generation):
-                                logger.debug(
-                                    f"Stream for track {track.track_id} superseded by a "
-                                    "newer request; stopping"
-                                )
-                                return response
                             try:
                                 await response.write(chunk)
                                 bytes_sent += len(chunk)
