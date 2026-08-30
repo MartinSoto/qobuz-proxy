@@ -219,6 +219,12 @@ class QobuzPlayer:
         self._gapless_armed: bool = False
         self._transition_generation: int = 0
         self._gapless_arm_lock: asyncio.Lock = asyncio.Lock()
+        # Whether _prepare_next_track_locked has already warned about having
+        # no next-track info to arm with, since the last time info was
+        # actually available — see its own docstring. Cleared as soon as
+        # info reappears, so a later gap warns again instead of going quiet
+        # forever after the first one.
+        self._next_track_info_unavailable_warned: bool = False
 
         # Callback for next track info changes (from command handler)
         self._on_next_track_changed_callback: Optional[Callable[[], None]] = None
@@ -1726,7 +1732,24 @@ class QobuzPlayer:
 
         next_track_info = self._get_next_track_callback()
         if not next_track_info:
+            # Nothing to arm with. Two very different situations look
+            # identical here: genuinely at the end of the queue, or the
+            # Qobuz app's control WebSocket is down (token expired — see
+            # docs/gapless-arming-and-token-expiry.md) so no nextQueueItem
+            # has ever arrived to populate this. Warned once per gap
+            # (cleared below the moment info reappears) rather than every
+            # retry — this is reachable every _on_position_update tick
+            # (STATE_POLL_INTERVAL_SECONDS) for as long as it stays
+            # unresolved, which would otherwise spam the log.
+            if not self._next_track_info_unavailable_warned:
+                logger.warning(
+                    "Gapless: no next-track info available to arm with — either "
+                    "genuinely at the end of the queue, or the Qobuz app's "
+                    "connection is down and hasn't told us what's next"
+                )
+                self._next_track_info_unavailable_warned = True
             return
+        self._next_track_info_unavailable_warned = False
 
         track_id = next_track_info["trackId"]
         queue_item_id = next_track_info["queueItemId"]
