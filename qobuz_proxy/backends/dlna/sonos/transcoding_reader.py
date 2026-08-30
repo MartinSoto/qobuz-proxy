@@ -118,8 +118,9 @@ class LazyHttpFlacSource:
     that object exactly like a local file: it calls ``seek()``/``read()``
     wherever *it* decides it needs bytes from — including, mid-seek,
     several small probing reads while it narrows down a frame boundary.
-    Each of those calls becomes one or more CDNBlockCache.read_block()
-    calls here.
+    Each of those calls becomes one CDNBlockCache.read_range() call here —
+    this class deals only in byte ranges, never in the cache's own block
+    grid.
 
     All of the actual CDN fetching — HTTP, retry-on-transient-failure,
     refresh-on-expired-URL, and (the part that matters most for the common
@@ -210,23 +211,10 @@ class LazyHttpFlacSource:
     # -- Internals --------------------------------------------------------
 
     def _read_range(self, start: int, end: int) -> bytes:
-        """Return bytes [start, end), via one or more cache block reads."""
-        return self._run(self._read_range_async(start, end))
-
-    async def _read_range_async(self, start: int, end: int) -> bytes:
-        block_size = self._cache.block_size
-        first_block = start // block_size
-        last_block = (end - 1) // block_size
-        # Fetched sequentially (not gathered) — a decode's reads are
-        # themselves sequential, and reading blocks in order is exactly
-        # what lets CDNBlockCache serve block N+1 off the connection it
-        # kept open from block N instead of opening a new one.
-        parts = [
-            await self._cache.read_block(self._track_id, self._format_id, block_index)
-            for block_index in range(first_block, last_block + 1)
-        ]
-        block_start = first_block * block_size
-        return b"".join(parts)[start - block_start : end - block_start]
+        """Return bytes [start, end) — bridges onto CDNBlockCache.read_range,
+        which owns the block-grid arithmetic; this class doesn't need to
+        know a block grid exists at all."""
+        return self._run(self._cache.read_range(self._track_id, self._format_id, start, end))
 
     def _run(self, coro: "Coroutine[object, object, _T]") -> _T:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
