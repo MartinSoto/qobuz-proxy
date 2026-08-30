@@ -1,8 +1,8 @@
 """End-to-end tests for SonosAudioProxyServer's on-the-fly downsampling
 path: a real SonosAudioProxyServer, a real fake-CDN upstream serving a
 real FLAC file, and a real HTTP client — proving a Sonos-style GET/HEAD/
-Range request against a track registered with transcode_to_sample_rate
-actually gets back correct, byte-exact-seekable WAV audio. See
+Range request against a format=wav proxy URL (see _transcode_url) actually
+gets back correct, byte-exact-seekable WAV audio. See
 test_sonos_transcoding_reader.py for the underlying engine's own
 (lower-level) tests.
 """
@@ -18,11 +18,11 @@ import soxr
 from aiohttp import web
 from unittest.mock import AsyncMock
 
-from qobuz_proxy.backends.dlna.sonos.proxy_server import SonosAudioProxyServer, SonosRegisteredTrack
+from qobuz_proxy.backends.dlna.sonos.proxy_server import SonosAudioProxyServer
 from qobuz_proxy.backends.dlna.sonos.transcoding_reader import WAV_HEADER_SIZE
 from qobuz_proxy.playback.stream_resolver import ResolvedStream
 
-FORMAT_ID = 27  # arbitrary — these tests register tracks directly, bypassing resolve_track
+FORMAT_ID = 27  # must match _TRANSCODE_SOURCE_FORMAT_ID — the only tier a wav URL ever fetches
 
 
 def _stream(url: str, blob: str = "") -> ResolvedStream:
@@ -44,19 +44,13 @@ def _resolver(url: str, blob: str = "") -> AsyncMock:
     return resolver
 
 
-def _register_transcoded(
-    proxy: SonosAudioProxyServer, track_id: str, proxy_key: str | None = None
-) -> None:
-    """Register a track directly for transcoding, bypassing resolve_track's
-    capability-driven decision tree — these tests only care about the
-    transcode-serving path, given a resolver that already knows how to
-    answer for FORMAT_ID."""
-    key = proxy_key or track_id
-    proxy._tracks[key] = SonosRegisteredTrack(
-        track_id=track_id,
-        format_id=FORMAT_ID,
-        content_type="audio/wav",
-        transcode_to_sample_rate=TARGET_SAMPLE_RATE,
+def _transcode_url(proxy: SonosAudioProxyServer, track_id: str, item: str | None = None) -> str:
+    """The proxy is stateless — a transcode URL is fully self-describing,
+    so there's nothing left to register ahead of a request; this just
+    builds the same URL _resolved_track would have handed back."""
+    return (
+        f"{proxy.base_url}/audio/{track_id}?format=wav&depth=24"
+        f"&rate={TARGET_SAMPLE_RATE}&item={item or track_id}"
     )
 
 
@@ -167,9 +161,8 @@ async def test_get_serves_correct_downsampled_wav_audio():
     proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        _register_transcoded(proxy, "42")
-        proxy_url = f"{proxy.base_url}/audio/42.wav"
-        assert proxy_url.endswith(".wav")
+        proxy_url = _transcode_url(proxy, "42")
+        assert "format=wav" in proxy_url
 
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -211,8 +204,7 @@ async def test_concurrent_requests_for_the_same_track_both_complete_without_the_
     proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        _register_transcoded(proxy, "42")
-        proxy_url = f"{proxy.base_url}/audio/42.wav"
+        proxy_url = _transcode_url(proxy, "42")
 
         with caplog.at_level(logging.ERROR):
             timeout = aiohttp.ClientTimeout(total=20)
@@ -253,8 +245,7 @@ async def test_head_probe_reports_correct_content_length_without_full_download()
     proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        _register_transcoded(proxy, "42")
-        proxy_url = f"{proxy.base_url}/audio/42.wav"
+        proxy_url = _transcode_url(proxy, "42")
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.head(proxy_url) as resp:
@@ -280,8 +271,7 @@ async def test_range_request_seeks_to_the_correct_audio():
     proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        _register_transcoded(proxy, "42")
-        proxy_url = f"{proxy.base_url}/audio/42.wav"
+        proxy_url = _transcode_url(proxy, "42")
         total_target_frames = len(expected_full)
         target_frame = int(total_target_frames * 0.5)
         bytes_per_frame = CHANNELS * 3
@@ -352,8 +342,7 @@ async def test_misaligned_range_request_serves_exact_bytes_like_a_static_file():
     proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        _register_transcoded(proxy, "42")
-        proxy_url = f"{proxy.base_url}/audio/42.wav"
+        proxy_url = _transcode_url(proxy, "42")
         bytes_per_frame = CHANNELS * 3  # 6 — so +1..+5 are all genuinely misaligned
         target_frame = int(len(expected_full) * 0.5)
         aligned_start_byte = WAV_HEADER_SIZE + target_frame * bytes_per_frame
@@ -408,27 +397,42 @@ async def test_misaligned_range_request_serves_exact_bytes_like_a_static_file():
     assert declared_length == total_content_length - requested_start_byte
 
 
-async def test_content_type_wav_route_registered_without_extension_too():
-    """The proxy URL always carries an explicit extension, but the bare
-    (no-extension) route must still resolve a transcoded track correctly
-    if ever hit directly."""
-    flac_bytes, _original = _make_test_flac()
-    upstream = FakeCdnUpstream(flac_bytes)
-    upstream_url = await upstream.start()
-
+async def test_unsupported_format_depth_rate_combination_is_rejected():
+    """The proxy is stateless — every request is validated against the
+    closed set of servable (format, depth, rate) combinations rather than
+    trusted, so a URL nothing ever legitimately builds (e.g. flac at a
+    depth/rate pair no Qobuz tier maps to) must not fall through to
+    guessing at a format_id."""
     port = _free_port()
-    proxy = SonosAudioProxyServer(resolver=_resolver(upstream_url), host="127.0.0.1", port=port)
+    proxy = SonosAudioProxyServer(resolver=_resolver("http://unused"), host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        _register_transcoded(proxy, "42")
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.head(f"http://127.0.0.1:{port}/audio/42") as resp:
-                assert resp.status == 200
-                assert resp.headers["Content-Type"] == "audio/wav"
+            async with session.get(
+                f"{proxy.base_url}/audio/42?format=flac&depth=16&rate=192000&item=42"
+            ) as resp:
+                assert resp.status == 404
     finally:
         await proxy.stop()
-        await upstream.stop()
+
+
+async def test_malformed_query_string_is_rejected():
+    """Missing/non-numeric depth or rate must 400, not raise."""
+    port = _free_port()
+    proxy = SonosAudioProxyServer(resolver=_resolver("http://unused"), host="127.0.0.1", port=port)
+    await proxy.start()
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{proxy.base_url}/audio/42?format=flac&depth=16") as resp:
+                assert resp.status == 400
+            async with session.get(
+                f"{proxy.base_url}/audio/42?format=wav&depth=24&rate=notanumber&item=42"
+            ) as resp:
+                assert resp.status == 400
+    finally:
+        await proxy.stop()
 
 
 class ExpiringFlacUpstream:
@@ -509,8 +513,7 @@ async def test_expired_url_is_refreshed_and_transcoding_still_succeeds():
     proxy = SonosAudioProxyServer(resolver=resolver, host="127.0.0.1", port=port)
     await proxy.start()
     try:
-        _register_transcoded(proxy, "42")
-        proxy_url = f"{proxy.base_url}/audio/42.wav"
+        proxy_url = _transcode_url(proxy, "42")
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(proxy_url) as resp:
@@ -528,16 +531,16 @@ async def test_expired_url_is_refreshed_and_transcoding_still_succeeds():
 
 
 async def test_gapless_preloaded_track_gets_the_same_url_refresh_protection():
-    """A gapless-armed track (DLNABackend.set_next_track) is registered
-    under a composite proxy_key="{track_id}_{queue_item_id}" like any
-    other track, and served through the same _handle_audio -> _serve ->
+    """A gapless-armed track (DLNABackend.set_next_track) gets a proxy URL
+    carrying a composite item="{track_id}_{queue_item_id}" like any other
+    track, and is served through the exact same _handle_audio ->
     TranscodeStreamHandler.stream dispatch — there's no separate code path
     for it, so it gets no less (and no more) URL-refresh protection. Worth
     proving directly rather than just asserting it: a gapless-armed track
     is often the *likelier* one to actually hit an expired URL, since it
-    can sit registered for however long the current track has left to
-    play, unlike a track just started with play() (registered right as
-    it's first requested)."""
+    can sit around for however long the current track has left to play,
+    unlike a track just started with play() (requested right as it's
+    first resolved)."""
     flac_bytes, original = _make_test_flac()
     upstream = ExpiringFlacUpstream(flac_bytes)
     base_url = await upstream.start()
@@ -556,9 +559,8 @@ async def test_gapless_preloaded_track_gets_the_same_url_refresh_protection():
     await proxy.start()
     try:
         # Mirrors DLNABackend.set_next_track's registration exactly:
-        # proxy_key = f"{track_id}_{queue_item_id}".
-        _register_transcoded(proxy, "42", proxy_key="42_7")
-        proxy_url = f"{proxy.base_url}/audio/42_7.wav"
+        # proxy_key = f"{track_id}_{queue_item_id}", carried as `item`.
+        proxy_url = _transcode_url(proxy, "42", item="42_7")
 
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
