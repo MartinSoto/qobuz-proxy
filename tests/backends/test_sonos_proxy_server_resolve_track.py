@@ -60,7 +60,8 @@ class TestDownsamplingDecision:
         assert resolved.content_type == "audio/wav"
         assert resolved.sample_rate == 48000  # downsampled to the device's cap
         assert resolved.bit_depth == 24  # TranscodingFlacReader's fixed output depth
-        assert resolved.proxy_url.endswith(".wav")
+        assert "format=wav" in resolved.proxy_url
+        assert "rate=48000" in resolved.proxy_url
 
     async def test_exceeding_native_format_falls_back_to_cd_when_downsampling_disabled(
         self,
