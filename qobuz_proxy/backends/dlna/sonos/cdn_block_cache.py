@@ -119,7 +119,7 @@ class CDNBlockCache:
 
     Usage:
         cache = CDNBlockCache(resolver=stream_resolver)
-        data = await cache.read_block(track_id, format_id, block_index)
+        data = await cache.read_range(track_id, format_id, start, end)
         ...
         await cache.close()  # release the one lingering connection, if any
     """
@@ -207,6 +207,30 @@ class CDNBlockCache:
             future = asyncio.ensure_future(self._fetch_and_cache(key))
             self._inflight[key] = future
         return await future
+
+    async def read_range(self, track_id: str, format_id: int, start: int, end: int) -> bytes:
+        """Return bytes [start, end) of a track at a given format tier, via
+        one or more block reads — the convenience read_block() doesn't
+        offer, since it's keyed on a block index rather than a byte range.
+        Callers with an arbitrary byte range in mind (e.g.
+        LazyHttpFlacSource) shouldn't have to know the block grid exists
+        at all to use this cache.
+
+        Blocks are read in order, not gathered — a decode's own reads are
+        themselves sequential, and reading in order is exactly what lets a
+        later block reuse the connection left open by the one before it
+        (see module docstring).
+        """
+        if start >= end:
+            return b""
+        first_block = start // self._block_size
+        last_block = (end - 1) // self._block_size
+        parts = [
+            await self.read_block(track_id, format_id, block_index)
+            for block_index in range(first_block, last_block + 1)
+        ]
+        block_start = first_block * self._block_size
+        return b"".join(parts)[start - block_start : end - block_start]
 
     async def close(self) -> None:
         """Release the one lingering connection, if any. Safe to call even
