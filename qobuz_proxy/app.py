@@ -599,12 +599,14 @@ class QobuzProxy:
             return  # already running (e.g. re-login after logout)
 
         assert self._sonos_event_subscriber is not None
+        assert self._stream_resolver is not None
         self._sonos_controller = SonosController(
             api_client=self._api_client,
             app_id=self._app_id,
             webui_http_port=self._config.server.http_port,
             event_subscriber=self._sonos_event_subscriber,
             hires_downsampling=self._config.backend.dlna.hires_downsampling,
+            stream_resolver=self._stream_resolver,
         )
         await self._sonos_controller.start()
         logger.info(f"Web UI: http://localhost:{self._config.server.http_port}")

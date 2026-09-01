@@ -22,17 +22,6 @@ def _make_metadata(**kwargs) -> BackendTrackMetadata:  # type: ignore[no-untyped
     return BackendTrackMetadata(**defaults)
 
 
-def _make_resolved_track(proxy_url: str = "http://proxy/audio/222_9.flac") -> ResolvedTrack:
-    return ResolvedTrack(
-        proxy_url=proxy_url,
-        content_type="audio/flac",
-        sample_rate=44100,
-        bit_depth=16,
-        format_id=6,
-        blob="blob",
-    )
-
-
 def _make_backend():  # type: ignore[no-untyped-def]
     backend = SonosBackend("10.0.0.5")
     backend._gapless_supported = True
@@ -40,11 +29,24 @@ def _make_backend():  # type: ignore[no-untyped-def]
     client.add_uri_to_queue = AsyncMock(return_value=7)
     client.remove_track_from_queue = AsyncMock(return_value=True)
     backend._client = client
-    # set_next_track resolves the proxy URL itself now (see the shared
-    # stream-resolver refactor) — the queue-arming behavior under test
-    # only cares that it gets *a* stable URL back.
-    backend._proxy_server = MagicMock(base_url="http://proxy")
-    backend._proxy_server.resolve_track = AsyncMock(return_value=_make_resolved_track())
+
+    # set_next_track resolves via the proxy server now — always the same
+    # proxy URL, mirroring what resolve_track would return for a fixed
+    # (track_id, queue_item_id) in real use.
+    proxy_server = MagicMock()
+    proxy_server.base_url = "http://proxy"
+    proxy_server.resolve_track = AsyncMock(
+        return_value=ResolvedTrack(
+            proxy_url="http://proxy/audio/222_9.flac",
+            content_type="audio/flac",
+            sample_rate=44100,
+            bit_depth=16,
+            format_id=6,
+            blob="",
+        )
+    )
+    backend._proxy_server = proxy_server
+
     return backend, client
 
 
@@ -55,7 +57,7 @@ class TestSonosGaplessQueue:
         backend, client = _make_backend()
         meta = _make_metadata(track_id="222")
 
-        assert await backend.set_next_track(meta, 9)
+        assert await backend.set_next_track(meta, 9) is not None
 
         client.add_uri_to_queue.assert_awaited_once()
         assert backend._next_track_queue_nr == 7
@@ -64,8 +66,8 @@ class TestSonosGaplessQueue:
         backend, client = _make_backend()
         meta = _make_metadata(track_id="222")
 
-        assert await backend.set_next_track(meta, 9)
-        assert await backend.set_next_track(meta, 9)
+        assert await backend.set_next_track(meta, 9) is not None
+        assert await backend.set_next_track(meta, 9) is not None
 
         client.add_uri_to_queue.assert_awaited_once()
 
