@@ -301,7 +301,7 @@ async def test_range_request_seeks_to_the_correct_audio():
         # connection the remainder of a file this small can land in the
         # kernel socket buffer well before the client ever abandons that
         # connection, making a wire-level byte count an unreliable signal.
-        assert proxy._transcode._cache.cached_bytes < len(flac_bytes) * 0.5
+        assert proxy._cache.cached_bytes < len(flac_bytes) * 0.5
     finally:
         await proxy.stop()
         await upstream.stop()

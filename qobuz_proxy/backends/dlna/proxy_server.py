@@ -73,11 +73,7 @@ class RegisteredTrack:
     """A track registered with the proxy server — just enough to serve
     requests for it. The actual CDN URL is never stored here: it's re-
     resolved (via QobuzStreamResolver, which does its own caching/TTL) on
-    every request that needs one, so this dataclass never goes stale.
-
-    Subclassed by SonosAudioProxyServer's SonosRegisteredTrack to carry
-    its own on-the-fly-downsampling bookkeeping — nothing generic here
-    needs to know that exists."""
+    every request that needs one, so this dataclass never goes stale."""
 
     track_id: str
     format_id: int
