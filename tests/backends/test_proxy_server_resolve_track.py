@@ -6,10 +6,10 @@ decision is based on the track's true native format rather than a
 capability-clamped guess).
 
 This class is manufacturer-generic and always falls back to CD quality
-when the native stream doesn't fit — on-the-fly downsampling for a
-device with a lower real cap is a manufacturer-specific subclass's job
-(it overrides _resolve_unfitting_stream to try it first), covered by
-that subclass's own tests, not here.
+when the native stream doesn't fit — on-the-fly downsampling is Sonos-
+specific (SonosAudioProxyServer overrides _resolve_unfitting_stream to
+try it first) and covered separately by
+test_sonos_proxy_server_resolve_track.py.
 
 Deliberately a fast unit test against a mocked QobuzStreamResolver rather
 than a real HTTP round trip; this covers every branch of the decision

@@ -222,8 +222,8 @@ class TestSpeakerLifecycle:
     async def test_start_with_dlna_backend_creates_proxy(self):
         """For a real DLNABackend, start() should create the proxy server
         via the backend's own create_proxy_server (which picks the
-        concrete class — plain generic by default, or a manufacturer-
-        specific one — see DLNABackend.create_proxy_server)."""
+        concrete class — plain generic, or Sonos with on-the-fly
+        downsampling — see DLNABackend.create_proxy_server)."""
         from qobuz_proxy.backends.dlna import DLNABackend
 
         config = _make_speaker_config()

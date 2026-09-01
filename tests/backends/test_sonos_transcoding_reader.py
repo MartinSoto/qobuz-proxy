@@ -5,7 +5,7 @@
   seeking logic, without downloading the whole file first. All of the
   actual CDN behavior it used to own directly (retry-on-transient-failure,
   refresh-on-expired-URL, connection reuse) lives in CDNBlockCache and is
-  covered by test_dlna_cdn_block_cache.py — this only has to prove the
+  covered by test_sonos_cdn_block_cache.py — this only has to prove the
   bridge itself: correct bytes at the right positions, without a full
   download, and that two sources sharing one cache actually share its
   benefit.
@@ -33,8 +33,8 @@ import soundfile as sf
 import soxr
 from aiohttp import web
 
-from qobuz_proxy.backends.dlna.cdn_block_cache import CDNBlockCache, CDNBlockFetchError
-from qobuz_proxy.backends.dlna.transcoding_reader import (
+from qobuz_proxy.backends.dlna.sonos.cdn_block_cache import CDNBlockCache, CDNBlockFetchError
+from qobuz_proxy.backends.dlna.sonos.transcoding_reader import (
     WAV_HEADER_SIZE,
     LazyHttpFlacSource,
     TranscodingFlacReader,

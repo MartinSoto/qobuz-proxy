@@ -7,16 +7,23 @@ up correctly in the Sonos app, and gapless relies on the same queue
 (arming the next track means appending to it). Everything here only ever
 overrides the seams DLNABackend exposes for exactly this
 (_client_class/_start_transport/_arm_next_track/_get_current_transport_uri)
-— no Sonos knowledge leaks back into the generic class.
+— plus create_proxy_server, for on-the-fly Hi-Res downsampling (see
+proxy_server.py's SonosAudioProxyServer) — no Sonos knowledge leaks back
+into the generic class.
 """
 
 import logging
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from qobuz_proxy.backends.types import BackendTrackMetadata
 
 from ..backend import DLNABackend
+from ..proxy_server import AudioProxyServer
 from .client import SonosClient
+from .proxy_server import SonosAudioProxyServer
+
+if TYPE_CHECKING:
+    from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +32,19 @@ class SonosBackend(DLNABackend):
     """DLNABackend with Sonos's AVTransport-queue playback."""
 
     _client_class = SonosClient
+
+    def create_proxy_server(
+        self,
+        resolver: "QobuzStreamResolver",
+        host: str = "0.0.0.0",
+        port: int = 7120,
+    ) -> AudioProxyServer:
+        return SonosAudioProxyServer(
+            resolver=resolver,
+            hires_downsampling=self._hires_downsampling,
+            host=host,
+            port=port,
+        )
 
     @property
     def _sonos_client(self) -> SonosClient:

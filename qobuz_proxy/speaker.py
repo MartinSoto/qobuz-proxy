@@ -413,8 +413,8 @@ class Speaker:
         self._metadata_service = MetadataService(api_client=self._api_client)
 
         # Create and start audio proxy server (DLNA only). Which concrete
-        # class — plain generic, or a manufacturer-specific one with its
-        # own streaming behavior — is the backend's own call; see
+        # class — plain generic, or SonosAudioProxyServer with on-the-fly
+        # downsampling — is the backend's own call; see
         # DLNABackend.create_proxy_server.
         if isinstance(backend, DLNABackend):
             logger.debug(f"[{self.name}] Starting audio proxy server...")
