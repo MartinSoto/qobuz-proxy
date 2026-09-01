@@ -310,7 +310,7 @@ def build_protocol_info(
 # A callback rather than a plain data dict so a manufacturer's override can
 # encode real logic (e.g. a model-dependent decision), not just a fixed set
 # of field replacements — see register_override().
-OverrideFn = Callable[[DLNACapabilities, str, str], None]
+OverrideFn = Callable[[DLNACapabilities, str, str, bool], None]
 
 _OVERRIDE_REGISTRY: list[tuple[str, OverrideFn]] = []
 
@@ -325,12 +325,20 @@ def register_override(manufacturer_substring: str, fn: OverrideFn) -> None:
     Args:
         manufacturer_substring: Substring to match against the device's
             manufacturer/model string, e.g. "Sonos".
-        fn: Called as fn(caps, manufacturer, model) to modify caps in place.
+        fn: Called as fn(caps, manufacturer, model, hires_downsampling) to
+            modify caps in place — hires_downsampling forwards
+            DLNABackend's own opt-in flag (see its __init__) so an
+            override can offer a bolder capability when the on-the-fly
+            downsampling that makes it safe to advertise is actually
+            enabled, without every override needing to care when it has
+            nothing conditional to say about it.
     """
     _OVERRIDE_REGISTRY.append((manufacturer_substring, fn))
 
 
-def apply_device_overrides(caps: DLNACapabilities, manufacturer: str, model: str) -> None:
+def apply_device_overrides(
+    caps: DLNACapabilities, manufacturer: str, model: str, hires_downsampling: bool = False
+) -> None:
     """
     Apply the first registered device-specific override that matches this
     device, if any (see register_override()).
@@ -339,22 +347,14 @@ def apply_device_overrides(caps: DLNACapabilities, manufacturer: str, model: str
         caps: Capabilities object to modify in place
         manufacturer: Device manufacturer string
         model: Device model string
+        hires_downsampling: Forwarded to the matched override — see
+            register_override().
     """
     device_str = f"{manufacturer} {model}".lower()
     for pattern, fn in _OVERRIDE_REGISTRY:
         if pattern.lower() in device_str:
-            fn(caps, manufacturer, model)
+            fn(caps, manufacturer, model, hires_downsampling)
             break
-
-
-def _apply_sonos_overrides(caps: DLNACapabilities, manufacturer: str, model: str) -> None:
-    overrides = {"max_sample_rate": 48000, "max_bit_depth": 16}
-    logger.info(f"Applying Sonos overrides: {overrides}")
-    for k, v in overrides.items():
-        setattr(caps, k, v)
-
-
-register_override("Sonos", _apply_sonos_overrides)
 
 
 # Capability cache

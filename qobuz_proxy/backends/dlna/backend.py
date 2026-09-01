@@ -257,6 +257,7 @@ class DLNABackend(AudioBackend):
                     self._capabilities,
                     device_info.manufacturer,
                     device_info.model_name,
+                    hires_downsampling=self._hires_downsampling,
                 )
                 # Cache the result
                 _capability_cache.set(device_id, self._capabilities)
