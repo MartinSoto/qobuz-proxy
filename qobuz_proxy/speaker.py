@@ -41,7 +41,7 @@ from qobuz_proxy.backends import AudioBackend, BackendFactory, PlaybackState
 from qobuz_proxy.playback.play_reporter import PlayReporter
 from qobuz_proxy.playback.state_reporter import PlaybackStateReport
 from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
-from qobuz_proxy.backends.dlna import AudioProxyServer, DLNABackend
+from qobuz_proxy.backends.dlna import AudioProxyServerProtocol, DLNABackend
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ class Speaker:
         self._queue: Optional[QobuzQueue] = None
         self._player: Optional[QobuzPlayer] = None
         self._backend: Optional[AudioBackend] = None
-        self._proxy_server: Optional[AudioProxyServer] = None
+        self._proxy_server: Optional[AudioProxyServerProtocol] = None
         self._state_reporter: Optional[StateReporter] = None
 
         # Command handlers

@@ -25,7 +25,7 @@ from .capabilities import (
     apply_device_overrides,
     build_protocol_info,
 )
-from .proxy_server import AudioProxyServer
+from .proxy_server import AudioProxyServer, AudioProxyServerProtocol
 
 if TYPE_CHECKING:
     from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
@@ -197,7 +197,7 @@ class DLNABackend(AudioBackend):
         self._duration_ms: int = 0
 
         # Audio proxy server for URL handling
-        self._proxy_server: Optional["AudioProxyServer"] = None
+        self._proxy_server: Optional["AudioProxyServerProtocol"] = None
 
         # Device capabilities
         self._capabilities: Optional[DLNACapabilities] = None
@@ -283,7 +283,7 @@ class DLNABackend(AudioBackend):
     # Lifecycle
     # =========================================================================
 
-    def set_proxy_server(self, proxy: "AudioProxyServer") -> None:
+    def set_proxy_server(self, proxy: "AudioProxyServerProtocol") -> None:
         """
         Set the audio proxy server for URL proxying.
 
@@ -291,7 +291,7 @@ class DLNABackend(AudioBackend):
         which handles Qobuz URL expiration transparently.
 
         Args:
-            proxy: AudioProxyServer instance
+            proxy: AudioProxyServerProtocol instance
         """
         self._proxy_server = proxy
 
@@ -300,15 +300,17 @@ class DLNABackend(AudioBackend):
         resolver: "QobuzStreamResolver",
         host: str = "0.0.0.0",
         port: int = 7120,
-    ) -> "AudioProxyServer":
-        """Construct the AudioProxyServer this backend should be paired
-        with (then passed to set_proxy_server — this doesn't set it
-        itself, since the caller also needs it to call .start()/.stop()).
+    ) -> "AudioProxyServerProtocol":
+        """Construct the proxy server this backend should be paired with
+        (then passed to set_proxy_server — this doesn't set it itself,
+        since the caller also needs it to call .start()/.stop()).
 
-        Base: the plain, manufacturer-generic proxy. Overridden by
-        SonosBackend to return a SonosAudioProxyServer instead, wiring up
-        on-the-fly downsampling — see dlna/sonos/proxy_server.py. Nothing
-        here needs to know that exists.
+        Base: the plain, manufacturer-generic AudioProxyServer. Overridden
+        by SonosBackend to return a SonosAudioProxyServer instead, wiring
+        up on-the-fly downsampling — see dlna/sonos/proxy_server.py.
+        SonosAudioProxyServer shares no base class with AudioProxyServer
+        (see AudioProxyServerProtocol's own docstring) — nothing here
+        needs to know that, or that on-the-fly downsampling exists at all.
         """
         return AudioProxyServer(resolver=resolver, host=host, port=port)
         logger.info("Audio proxy server configured for DLNA backend")

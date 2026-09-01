@@ -278,6 +278,7 @@ class TestSpeakerLifecycle:
 
         mock_proxy = MagicMock()
         mock_proxy.start = AsyncMock()
+        mock_backend.create_proxy_server.return_value = mock_proxy
 
         with (
             patch(
@@ -285,7 +286,6 @@ class TestSpeakerLifecycle:
                 new_callable=AsyncMock,
                 return_value=mock_backend,
             ),
-            patch("qobuz_proxy.speaker.AudioProxyServer", return_value=mock_proxy),
             patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc_cls,
         ):
             mock_disc_cls.return_value.start = AsyncMock()
@@ -312,6 +312,7 @@ class TestSpeakerLifecycle:
 
         mock_proxy = MagicMock()
         mock_proxy.start = AsyncMock()
+        mock_backend.create_proxy_server.return_value = mock_proxy
 
         with (
             patch(
@@ -319,7 +320,6 @@ class TestSpeakerLifecycle:
                 new_callable=AsyncMock,
                 return_value=mock_backend,
             ),
-            patch("qobuz_proxy.speaker.AudioProxyServer", return_value=mock_proxy),
             patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc_cls,
         ):
             mock_disc_cls.return_value.start = AsyncMock()
@@ -672,6 +672,7 @@ class TestQualitySourceStatus:
 
         mock_proxy = MagicMock()
         mock_proxy.start = AsyncMock()
+        mock_backend.create_proxy_server.return_value = mock_proxy
 
         with (
             patch(
@@ -679,7 +680,6 @@ class TestQualitySourceStatus:
                 new_callable=AsyncMock,
                 return_value=mock_backend,
             ),
-            patch("qobuz_proxy.speaker.AudioProxyServer", return_value=mock_proxy),
             patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc_cls,
         ):
             mock_disc_cls.return_value.start = AsyncMock()

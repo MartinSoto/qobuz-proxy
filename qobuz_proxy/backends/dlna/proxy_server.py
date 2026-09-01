@@ -33,7 +33,7 @@ import socket
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Dict, Optional, Protocol, TYPE_CHECKING
 
 from aiohttp import web, ClientError, ClientSession, ClientTimeout
 
@@ -73,11 +73,7 @@ class RegisteredTrack:
     """A track registered with the proxy server — just enough to serve
     requests for it. The actual CDN URL is never stored here: it's re-
     resolved (via QobuzStreamResolver, which does its own caching/TTL) on
-    every request that needs one, so this dataclass never goes stale.
-
-    Subclassed by SonosAudioProxyServer's SonosRegisteredTrack to carry
-    its own on-the-fly-downsampling bookkeeping — nothing generic here
-    needs to know that exists."""
+    every request that needs one, so this dataclass never goes stale."""
 
     track_id: str
     format_id: int
@@ -96,6 +92,36 @@ class ResolvedTrack:
     bit_depth: int
     format_id: int
     blob: str
+
+
+class AudioProxyServerProtocol(Protocol):
+    """Structural interface DLNABackend/Speaker actually need from a proxy
+    server. AudioProxyServer satisfies it by being a normal concrete class
+    below; SonosAudioProxyServer (see dlna/sonos/proxy_server.py) satisfies
+    it independently, with no shared base class or code — the two have
+    diverged enough (a self-describing URL scheme, no self._tracks
+    registration, its own request-handling/streaming) that a common base
+    class would mean either forcing Sonos's stateless design back through
+    this class's stateful one, or this class inheriting from something
+    Sonos-shaped it doesn't need. A Protocol lets callers that only care
+    about "some proxy server" (this one) hold either without caring
+    which."""
+
+    @property
+    def base_url(self) -> str: ...
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def resolve_track(
+        self,
+        track_id: str,
+        capabilities: Optional[DLNACapabilities],
+        *,
+        proxy_key: Optional[str] = None,
+        forced_format_id: Optional[int] = None,
+    ) -> Optional[ResolvedTrack]: ...
 
 
 class AudioProxyServer:
