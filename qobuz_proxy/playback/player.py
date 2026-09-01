@@ -41,6 +41,17 @@ _HANDOFF_POSITION_THRESHOLD_MS = 5000
 # (renderer ahead of server) at which we suppress.
 _STALE_SNAPSHOT_THRESHOLD_MS = 5000
 
+# How long the command queue's consumer waits for the backend to become
+# attached again (see set_backend_attached()) before dispatching a
+# playback-directing item anyway. Mirrors DLNABackend's own
+# RECONNECT_WAIT_SECONDS value (kept independent rather than imported —
+# Player has no business knowing about a specific backend implementation)
+# — comfortably inside SonosDiscoveryManager's PENDING_GRACE_SECONDS so a
+# genuine handoff resolves well before this fires, while a truly-gone
+# device still fails in reasonable time rather than holding the queue
+# forever.
+_BACKEND_ATTACH_WAIT_SECONDS = 8.0
+
 
 class _CommandQueueItem:
     """One entry in Player._command_queue — see Player.enqueue().
@@ -119,6 +130,18 @@ class QobuzPlayer:
         # now". False until the server says otherwise — a freshly started
         # renderer has no controller attached yet.
         self._is_active_renderer: bool = False
+
+        # Whether the backend is currently reachable — see
+        # set_backend_attached(). True for the vast majority of backends,
+        # which never toggle it at all; Speaker.detach()/retarget() (see
+        # speaker.py) set it False/True around a Sonos group_id going
+        # pending — see SonosDiscoveryManager's pending state. The command
+        # queue holds a playback-directing item at the front while False
+        # (see _command_consumer_loop) instead of dispatching into
+        # backend.play()'s own reconnect wait.
+        self._backend_attached: bool = True
+        self._backend_attached_event: asyncio.Event = asyncio.Event()
+        self._backend_attached_event.set()
 
         # Command queue: the single entry point for everything that drives
         # playback — WsManager-dispatched commands (via enqueue(), wired up
@@ -286,6 +309,26 @@ class QobuzPlayer:
         """Record whether the Qobuz server currently considers this
         renderer the active playback target (see SrvrRndrSetActive)."""
         self._is_active_renderer = active
+
+    async def set_backend_attached(self, attached: bool) -> None:
+        """Record whether the backend is currently reachable — called by
+        Speaker.detach()/retarget() around a Sonos group_id going pending
+        (see SonosDiscoveryManager's pending state). Going False also
+        nudges self._state toward an honest transitional state and relays
+        it immediately, so the app sees a real signal during a handoff
+        instead of either silence or a stale, still-ticking PLAYING
+        position — the same "discrete event -> immediate send" path every
+        other real transition already uses (see StateReporter).
+        """
+        was_attached = self._backend_attached
+        self._backend_attached = attached
+        if attached:
+            self._backend_attached_event.set()
+            return
+        self._backend_attached_event.clear()
+        if was_attached and self._state == PlaybackState.PLAYING:
+            self._state = PlaybackState.LOADING
+            await self._send_state_update()
 
     def set_next_track_callbacks(
         self,
@@ -527,6 +570,22 @@ class QobuzPlayer:
                 if item.cancelled:
                     logger.debug("Command queue: skipping a coalesced-away item")
                     continue
+                if item.coalesce and not self._backend_attached:
+                    # Hold this (and everything behind it) at the front of
+                    # the queue until the backend reattaches — see
+                    # set_backend_attached() — rather than dispatching into
+                    # a per-call wait buried in the backend itself.
+                    logger.info("Command queue: backend detached, waiting to dispatch")
+                    try:
+                        await asyncio.wait_for(
+                            self._backend_attached_event.wait(),
+                            timeout=_BACKEND_ATTACH_WAIT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Command queue: backend still detached after "
+                            f"{_BACKEND_ATTACH_WAIT_SECONDS}s; dispatching anyway"
+                        )
                 self._processing_command = True
                 try:
                     await item.coro_fn()
