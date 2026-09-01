@@ -226,7 +226,6 @@ class QobuzPlayer:
         self._is_running: bool = False
 
         # Wire up queue callbacks to metadata service
-        self.queue.set_url_callback(self._get_track_url)
         self.queue.set_metadata_callback(self._get_track_metadata)
 
         # Wire up backend callbacks
@@ -1062,8 +1061,9 @@ class QobuzPlayer:
             return False
 
         if self._state not in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-            # Not actively playing — just clear cached URL so next play uses new quality
-            self._current_track.streaming_url = None
+            # Not actively playing — nothing to do; the next play() call
+            # resolves fresh (backend.set_quality_override was already
+            # updated by the caller, so the next resolve uses the new tier).
             return True
 
         was_playing = self._state == PlaybackState.PLAYING
@@ -1076,9 +1076,6 @@ class QobuzPlayer:
 
         # Stop current playback
         await self.backend.stop()
-
-        # Clear cached streaming URL so it's re-fetched at new quality
-        self._current_track.streaming_url = None
 
         if was_playing:
             # Restart playback from saved position
@@ -1277,14 +1274,12 @@ class QobuzPlayer:
         if not expect_immediate_continuation:
             await self._send_state_update()
 
-        # Pre-fetch URL and metadata via the queue's own cache — see
-        # QobuzQueue.get_track_url/get_track_metadata.
+        # Pre-fetch display metadata via the queue's own cache — see
+        # QobuzQueue.get_track_metadata. The streaming URL itself is no
+        # longer pre-fetched here: it's resolved by the backend at actual
+        # play() time (see _start_playback), since the format decision
+        # needs device capabilities this method has no reason to know.
         try:
-            url = await self.queue.get_track_url(self._current_track)
-            if not url:
-                logger.error(f"Failed to get URL for track {track_id}")
-                return False
-
             meta = await self.queue.get_track_metadata(self._current_track)
             if meta:
                 self._current_duration_ms = self._current_track.duration_ms
@@ -1435,23 +1430,13 @@ class QobuzPlayer:
         await self._send_state_update()
 
         try:
-            # Get streaming URL and metadata via the queue's own cache —
-            # a cached URL past its TTL is treated as absent (a track
-            # loaded PAUSED and played later than the URL lifetime must
-            # not start from an expired URL); see QobuzQueue.get_track_url.
-            url = await self.queue.get_track_url(track)
-            if not url:
-                logger.error(f"Failed to get URL for track {track.track_id}")
-                self._state = PlaybackState.ERROR
-                await self._send_state_update()
-                return False
-
+            # Display metadata via the queue's own cache — the streaming
+            # URL/format itself is resolved by the backend inside play()
+            # (it needs device capabilities this layer doesn't have).
             meta = await self.queue.get_track_metadata(track)
 
-            # Get actual quality and format info from cache (set during URL fetch)
-            actual_quality, sample_rate, bit_depth = self.metadata.get_track_format(track.track_id)
-
-            # Build backend metadata
+            # Build backend metadata (title/artist/album/artwork only —
+            # sample_rate/bit_depth are decided by the backend now)
             backend_meta = BackendTrackMetadata(
                 track_id=track.track_id,
                 title=(
@@ -1463,26 +1448,26 @@ class QobuzPlayer:
                 album=meta.get("album", "") if meta else "",
                 duration_ms=track.duration_ms,
                 artwork_url=meta.get("artwork_url", "") if meta else "",
-                sample_rate=sample_rate,
-                bit_depth=bit_depth,
             )
 
-            # Log now playing with actual quality (0 = cache miss, fall back to max quality)
-            self.metadata.log_now_playing_info(backend_meta, actual_quality or None)
+            # Start playback on backend — resolves the actual streaming
+            # URL/format itself and hands back what it actually served.
+            result = await self.backend.play(backend_meta)
+            self._backend_engaged = True
+            self.queue.set_track_stream_info(track, result.blob, result.format_id)
+
+            # Log now playing with actual quality (0 = unavailable)
+            self.metadata.log_now_playing_info(backend_meta, result.format_id or None)
 
             # Report file quality if callback is set
             if self._file_quality_report_callback:
-                logger.debug(f"Track {track.track_id} actual_quality={actual_quality}")
-                if actual_quality:
-                    await self._file_quality_report_callback(actual_quality)
+                logger.debug(f"Track {track.track_id} actual_quality={result.format_id}")
+                if result.format_id:
+                    await self._file_quality_report_callback(result.format_id)
                 else:
                     logger.debug(
                         f"No actual_quality for track {track.track_id}, skipping file quality report"
                     )
-
-            # Start playback on backend
-            await self.backend.play(url, backend_meta)
-            self._backend_engaged = True
 
             # Update state. Report the start position, not 0 — the caller
             # seeks the backend right after, and reporting 0 first makes the
@@ -1516,8 +1501,8 @@ class QobuzPlayer:
         if not self._play_reporter or not self._current_track:
             return
         track = self._current_track
-        format_id = self.metadata.get_track_actual_quality(track.track_id) or 0
-        blob = self.metadata.get_track_blob(track.track_id) or ""
+        format_id = track.actual_quality
+        blob = track.blob
         report_start = start_position_ms < _HANDOFF_POSITION_THRESHOLD_MS
         await self._play_reporter.note_playing(
             track_id=track.track_id,
@@ -1574,10 +1559,6 @@ class QobuzPlayer:
     # =========================================================================
     # Callbacks from Components
     # =========================================================================
-
-    async def _get_track_url(self, track_id: str) -> Optional[str]:
-        """Callback for queue to get streaming URL."""
-        return await self.metadata.get_streaming_url(track_id)
 
     async def _get_track_metadata(self, track_id: str) -> Optional[dict]:
         """Callback for queue to get track metadata."""
@@ -1658,14 +1639,13 @@ class QobuzPlayer:
         """Restart the current track from the beginning (repeat-one).
 
         On natural end the backend has already transitioned to STOPPED, so a
-        bare seek(0) leaves it silent — we must re-issue play. The cached URL
-        is cleared so a fresh, non-expired streaming link is fetched for the
-        repeat. ``_start_playback`` reports the new play; the completed one was
-        already reported by the caller.
+        bare seek(0) leaves it silent — we must re-issue play. ``_start_playback``
+        re-resolves the streaming URL itself (see backend.play/resolve_track,
+        which already applies its own freshness check) and reports the new
+        play; the completed one was already reported by the caller.
         """
         if not self._current_track:
             return
-        self._current_track.streaming_url = None
         self._set_position(0)
         await self._start_playback()
 
@@ -1753,15 +1733,8 @@ class QobuzPlayer:
         my_generation = self._transition_generation
 
         try:
-            # Fetch URL and metadata
-            url = await self._get_track_url(track_id)
-            if not url:
-                logger.debug(f"Gapless: failed to get URL for next track {track_id}")
-                return
-
             meta = await self._get_track_metadata(track_id)
 
-            _, sample_rate, bit_depth = self.metadata.get_track_format(track_id)
             backend_meta = BackendTrackMetadata(
                 track_id=track_id,
                 title=meta.get("title", f"Track {track_id}") if meta else f"Track {track_id}",
@@ -1769,28 +1742,28 @@ class QobuzPlayer:
                 album=meta.get("album", "") if meta else "",
                 duration_ms=meta.get("duration_ms", 0) if meta else 0,
                 artwork_url=meta.get("artwork_url", "") if meta else "",
-                sample_rate=sample_rate,
-                bit_depth=bit_depth,
             )
 
-            success = await self.backend.set_next_track(url, backend_meta, queue_item_id)
+            # Resolves the URL/format itself — see backend.set_next_track.
+            result = await self.backend.set_next_track(backend_meta, queue_item_id)
 
             # State changed while arming (skip, stop, queue edit) — the arm
             # is stale; undo it on the backend instead of marking it armed
             if my_generation != self._transition_generation:
                 logger.debug(f"Gapless: discarding stale arm for track {track_id}")
-                if success:
+                if result is not None:
                     await self.backend.clear_next_track()
                 return
 
-            if success:
+            if result is not None:
                 self._pending_next_track = {
                     "trackId": track_id,
                     "queueItemId": queue_item_id,
                     "contextUuid": next_track_info.get("contextUuid"),
-                    "url": url,
                     "metadata": meta,
                     "backend_meta": backend_meta,
+                    "blob": result.blob,
+                    "formatId": result.format_id,
                 }
                 self._gapless_armed = True
                 logger.info(f"Gapless: armed next track {track_id}")
@@ -1841,9 +1814,10 @@ class QobuzPlayer:
             queue_item_id=queue_item_id,
             track_id=track_id,
             context_uuid=next_info.get("contextUuid"),
-            streaming_url=next_info.get("url"),
             metadata=meta or {},
             duration_ms=meta.get("duration_ms", 0) if meta else 0,
+            blob=next_info.get("blob", ""),
+            actual_quality=next_info.get("formatId", 0),
         )
         self._current_duration_ms = self._current_track.duration_ms
 
@@ -1860,10 +1834,10 @@ class QobuzPlayer:
             self._clear_next_track_callback()
 
         # Report file quality
-        actual_quality = self.metadata.get_track_actual_quality(track_id)
+        actual_quality = self._current_track.actual_quality
         backend_meta = next_info.get("backend_meta")
         if backend_meta:
-            self.metadata.log_now_playing_info(backend_meta, actual_quality)
+            self.metadata.log_now_playing_info(backend_meta, actual_quality or None)
         if self._file_quality_report_callback and actual_quality:
             await self._file_quality_report_callback(actual_quality)
 

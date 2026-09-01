@@ -6,7 +6,7 @@ that play/pause/stop/track-end/track-switch produce the right report calls.
 
 from unittest.mock import AsyncMock, MagicMock
 
-from qobuz_proxy.backends import BackendTrackMetadata, PlaybackState
+from qobuz_proxy.backends import BackendTrackMetadata, PlaybackState, PlayResult
 from qobuz_proxy.backends.base import AudioBackend
 from qobuz_proxy.playback.play_reporter import PlayReporter
 from qobuz_proxy.playback.player import QobuzPlayer
@@ -16,7 +16,9 @@ class _Backend(AudioBackend):
     def __init__(self) -> None:
         super().__init__(name="test")
 
-    async def play(self, url: str, metadata: BackendTrackMetadata) -> None: ...
+    async def play(self, metadata: BackendTrackMetadata) -> PlayResult:
+        return PlayResult(blob="theblob", format_id=27)
+
     async def pause(self) -> bool:
         return True
 
@@ -45,15 +47,19 @@ async def _coro(value):  # type: ignore[no-untyped-def]
     return value
 
 
+def _set_stream_info(track, blob, actual_quality):  # type: ignore[no-untyped-def]
+    """Mirrors the real QobuzQueue.set_track_stream_info — the mocked
+    queue below needs this to actually mutate the track, since
+    Player._report_playing reads blob/actual_quality straight off it."""
+    track.blob = blob
+    track.actual_quality = actual_quality
+
+
 def _make_player_with_reporter():
     backend = _Backend()
 
     metadata = MagicMock()
-    metadata.get_streaming_url = MagicMock(side_effect=lambda tid: _coro(f"http://t/{tid}"))
     metadata.get_metadata = MagicMock(side_effect=lambda tid: _coro(None))
-    metadata.get_track_actual_quality = MagicMock(return_value=27)
-    metadata.get_track_blob = MagicMock(return_value="theblob")
-    metadata.get_track_format = MagicMock(return_value=(27, 96000, 24))
     metadata.log_now_playing_info = MagicMock()
 
     api = AsyncMock()
@@ -62,11 +68,8 @@ def _make_player_with_reporter():
     reporter = PlayReporter(api)
 
     queue = MagicMock()
-    # Player routes track loading through queue.get_track_url/get_track_metadata
-    # rather than fetching directly — mirror metadata.get_streaming_url/
-    # get_metadata above.
-    queue.get_track_url = MagicMock(side_effect=lambda track: _coro(f"http://t/{track.track_id}"))
     queue.get_track_metadata = MagicMock(side_effect=lambda track: _coro(None))
+    queue.set_track_stream_info = MagicMock(side_effect=_set_stream_info)
     player = QobuzPlayer(
         queue=queue, metadata_service=metadata, backend=backend, play_reporter=reporter
     )
@@ -432,12 +435,12 @@ class TestPlayerReporting:
         """A player built without a reporter must not crash on playback."""
         backend = _Backend()
         metadata = MagicMock()
-        metadata.get_streaming_url = MagicMock(side_effect=lambda tid: _coro(f"http://t/{tid}"))
         metadata.get_metadata = MagicMock(side_effect=lambda tid: _coro(None))
-        metadata.get_track_format = MagicMock(return_value=(0, 0, 0))
-        metadata.get_track_actual_quality = MagicMock(return_value=None)
         metadata.log_now_playing_info = MagicMock()
-        player = QobuzPlayer(queue=MagicMock(), metadata_service=metadata, backend=backend)
+        queue = MagicMock()
+        queue.get_track_metadata = MagicMock(side_effect=lambda track: _coro(None))
+        queue.set_track_stream_info = MagicMock(side_effect=_set_stream_info)
+        player = QobuzPlayer(queue=queue, metadata_service=metadata, backend=backend)
 
         await player.play_track(queue_item_id=1, track_id="555")
         await player.stop_playback()

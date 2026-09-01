@@ -1,12 +1,29 @@
 """Tests for buffer monitoring (QPROXY-023)."""
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 
 from qobuz_proxy.backends.local.backend import LocalAudioBackend
 from qobuz_proxy.backends.types import BackendTrackMetadata, BufferStatus
+from qobuz_proxy.playback.stream_resolver import ResolvedStream
+
+
+def _mock_resolver() -> MagicMock:
+    resolver = MagicMock()
+    resolver.resolve = AsyncMock(
+        return_value=ResolvedStream(
+            url="http://example.com/track.flac",
+            blob="",
+            format_id=27,
+            sample_rate=192000,
+            bit_depth=24,
+            fetched_at=0.0,
+        )
+    )
+    return resolver
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -44,6 +61,7 @@ async def _create_connected_backend() -> LocalAudioBackend:
     backend = LocalAudioBackend(device="default", buffer_size=2048)
     with patch(_SD_PATCH, return_value=_mock_sounddevice()):
         await backend.connect()
+    backend.set_stream_resolver(_mock_resolver())
     return backend
 
 
@@ -184,7 +202,7 @@ class TestBufferStatusNotification:
         backend._stream.open = MagicMock()
         backend._stream.start = MagicMock()
 
-        await backend.play("http://example.com/track.flac", _make_metadata())
+        await backend.play(_make_metadata())
         await asyncio.sleep(0.1)
 
         # Buffer status should have been checked at least once

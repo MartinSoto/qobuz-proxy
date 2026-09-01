@@ -13,6 +13,7 @@ from .types import (
     BackendTrackMetadata,
     BufferStatus,
     PlaybackState,
+    PlayResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,8 +69,16 @@ class AudioBackend(ABC):
     # =========================================================================
 
     @abstractmethod
-    async def play(self, url: str, metadata: BackendTrackMetadata) -> None:
-        """Start playback of a track."""
+    async def play(self, metadata: BackendTrackMetadata) -> PlayResult:
+        """Start playback of a track.
+
+        The backend resolves its own streaming URL (via a shared
+        QobuzStreamResolver) rather than being handed one — the format/
+        quality decision (native passthrough vs. local downsampling for
+        DLNA, a fixed quality for local output) is backend-specific
+        knowledge the caller shouldn't need. Returns the blob/format_id
+        Qobuz actually served, for the caller's play-reporting.
+        """
         pass
 
     @abstractmethod
@@ -174,10 +183,14 @@ class AudioBackend(ABC):
         return False
 
     async def set_next_track(
-        self, url: str, metadata: BackendTrackMetadata, queue_item_id: int = 0
-    ) -> bool:
-        """Prepare next track for gapless transition. Default: returns False."""
-        return False
+        self, metadata: BackendTrackMetadata, queue_item_id: int = 0
+    ) -> Optional[PlayResult]:
+        """Prepare next track for gapless transition. Default: returns None
+        (unsupported). A non-None result means the track was armed; its
+        blob/format_id are surfaced by the caller once the gapless
+        transition actually happens (see AudioBackend.on_next_track_started).
+        """
+        return None
 
     async def clear_next_track(self) -> None:
         """Cancel prepared next track. Default: no-op."""
@@ -234,6 +247,18 @@ class AudioBackend(ABC):
         actually wait for its poll loop to stop before this returns.
         """
         self._active = active
+
+    def set_quality_override(self, format_id: Optional[int]) -> None:
+        """Force a specific Qobuz quality tier for every subsequent play(),
+        or None to let the backend decide dynamically (DLNA: resolve the
+        actual per-track native format against device capabilities each
+        time — see DLNABackend/resolve_track). Set from config's
+        max_quality (when not "auto") and from a live quality-change
+        request from the Qobuz app (Speaker._on_quality_change). Default:
+        no-op — a backend with no such notion (none exist without
+        overriding this) simply ignores it.
+        """
+        pass
 
     async def retarget(self, ip: str, port: int, description_url: Optional[str] = None) -> bool:
         """

@@ -43,7 +43,12 @@ _SD_PATCH = "qobuz_proxy.backends.local.device._import_sounddevice"
 
 
 def _make_speaker(config: SpeakerConfig) -> Speaker:
-    return Speaker(config=config, api_client=MagicMock(), app_id="test-app-id")
+    return Speaker(
+        config=config,
+        api_client=MagicMock(),
+        app_id="test-app-id",
+        stream_resolver=MagicMock(),
+    )
 
 
 class TestSpeakerLocalBackend:

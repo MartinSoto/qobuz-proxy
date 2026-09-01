@@ -19,22 +19,20 @@ directly by SET_STATE rather than derived from a track list this app never
 has: the repeat mode (read by Player on natural track end) and the queue
 version stamp (echoed back in outbound state reports, purely for the
 server's own synchronization bookkeeping — nothing here reconciles against
-it). Plus track URL/metadata caching, which needs no track list at all —
-Player hands it the exact QueueTrack to cache onto.
+it). Plus track metadata caching (needs no track list at all — Player
+hands it the exact QueueTrack to cache onto) and the blob/actual_quality
+a backend resolved for a track (see set_track_stream_info) — streaming URL
+resolution itself lives entirely in the backend now (see
+backends.dlna.proxy_server.resolve_track), not here.
 """
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine, Optional
 
 logger = logging.getLogger(__name__)
-
-# How long a cached streaming URL may be trusted. Qobuz signed URLs live for
-# ~5 minutes; anything older than this must be re-fetched before use.
-URL_CACHE_TTL_SECONDS = 240.0
 
 
 class RepeatMode(Enum):
@@ -54,31 +52,28 @@ class QueueTrack:
         queue_item_id: Unique ID for this queue entry (from server)
         track_id: Qobuz track ID (for API calls)
         context_uuid: Optional context (album, playlist) UUID
-        streaming_url: Cached streaming URL (may expire)
         metadata: Cached track metadata dict
         start_ms: Start position for partial plays
         duration_ms: Track duration in milliseconds
+        blob: Opaque token from Qobuz's getFileUrl, needed for
+            reportStreamingEnd — set from the backend's PlayResult once
+            play()/set_next_track() actually resolves this track (see
+            QobuzQueue.set_track_stream_info). Streaming URL resolution
+            itself lives entirely in the backend now (see
+            backends.dlna.proxy_server.resolve_track /
+            playback.stream_resolver.QobuzStreamResolver) — this class
+            no longer fetches or caches one.
+        actual_quality: Qobuz format_id actually served for this track.
     """
 
     queue_item_id: int
     track_id: str
     context_uuid: Optional[bytes] = None
-    streaming_url: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
     start_ms: int = 0
     duration_ms: int = 0
-    url_fetched_at: float = 0.0  # time.time() when streaming_url was cached
-
-    def set_streaming_url(self, url: Optional[str]) -> None:
-        """Cache a streaming URL together with its fetch time."""
-        self.streaming_url = url
-        self.url_fetched_at = time.time() if url else 0.0
-
-    def url_is_stale(self, ttl_s: float = URL_CACHE_TTL_SECONDS) -> bool:
-        """Whether the cached URL must be treated as absent (missing or past TTL)."""
-        if not self.streaming_url:
-            return True
-        return (time.time() - self.url_fetched_at) >= ttl_s
+    blob: str = ""
+    actual_quality: int = 0
 
 
 @dataclass
@@ -120,7 +115,6 @@ class QueueState:
 
 
 # Type alias for callbacks
-UrlCallback = Callable[[str], Coroutine[Any, Any, Optional[str]]]
 MetadataCallback = Callable[[str], Coroutine[Any, Any, Optional[dict[str, Any]]]]
 
 
@@ -139,8 +133,7 @@ class QobuzQueue:
         # outbound state reports.
         self._version: QueueVersion = QueueVersion()
 
-        # Callbacks for fetching URLs and metadata
-        self._get_url_callback: Optional[UrlCallback] = None
+        # Callback for fetching metadata
         self._get_metadata_callback: Optional[MetadataCallback] = None
 
         self._lock = asyncio.Lock()
@@ -150,10 +143,6 @@ class QobuzQueue:
     # =========================================================================
     # Callback Registration
     # =========================================================================
-
-    def set_url_callback(self, callback: UrlCallback) -> None:
-        """Set callback for fetching streaming URLs."""
-        self._get_url_callback = callback
 
     def set_metadata_callback(self, callback: MetadataCallback) -> None:
         """Set callback for fetching track metadata."""
@@ -173,20 +162,14 @@ class QobuzQueue:
     # Track Caching
     # =========================================================================
 
-    async def get_track_url(self, track: QueueTrack) -> Optional[str]:
-        """The track's streaming URL — from cache if still fresh (see
-        QueueTrack.url_is_stale), otherwise fetched via the registered URL
-        callback and cached back onto the track.
-        """
-        if not track.url_is_stale():
-            return track.streaming_url
-        if not self._get_url_callback:
-            return None
-        url = await self._get_url_callback(track.track_id)
-        if url:
-            track.set_streaming_url(url)
-            logger.debug(f"Fetched URL for track {track.track_id}")
-        return url
+    def set_track_stream_info(self, track: QueueTrack, blob: str, actual_quality: int) -> None:
+        """Record what the backend actually resolved/served for this track
+        (see AudioBackend.play/set_next_track's PlayResult) — the one thing
+        the queue still caches about streaming, purely for play-reporting
+        (Player._report_playing) to read back later without needing to ask
+        the backend again."""
+        track.blob = blob
+        track.actual_quality = actual_quality
 
     async def get_track_metadata(self, track: QueueTrack) -> Optional[dict[str, Any]]:
         """The track's metadata — from cache if already fetched, otherwise

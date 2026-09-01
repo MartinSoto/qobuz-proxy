@@ -11,6 +11,7 @@ import pytest
 import qobuz_proxy.backends.local.backend as local_backend_module
 from qobuz_proxy.backends.local.backend import LocalAudioBackend
 from qobuz_proxy.backends.types import BackendTrackMetadata, PlaybackState
+from qobuz_proxy.playback.stream_resolver import ResolvedStream
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -49,6 +50,24 @@ def _make_metadata(track_id: str = "123") -> BackendTrackMetadata:
     )
 
 
+def _mock_resolver() -> MagicMock:
+    """A QobuzStreamResolver stand-in — the actual URL doesn't matter here
+    since _download_and_decode/_download are patched directly in these
+    tests; it just needs to resolve to *something*."""
+    resolver = MagicMock()
+    resolver.resolve = AsyncMock(
+        return_value=ResolvedStream(
+            url="http://example.com/track.flac",
+            blob="",
+            format_id=27,
+            sample_rate=192000,
+            bit_depth=24,
+            fetched_at=0.0,
+        )
+    )
+    return resolver
+
+
 async def _create_playing_backend(
     audio: np.ndarray = AUDIO_TRACK1, sample_rate: int = 44100
 ) -> LocalAudioBackend:
@@ -56,6 +75,7 @@ async def _create_playing_backend(
     backend = LocalAudioBackend(device="default", buffer_size=2048)
     with patch(_SD_PATCH, return_value=_mock_sounddevice()):
         await backend.connect()
+    backend.set_stream_resolver(_mock_resolver())
 
     async def fake_download_and_decode(url):
         return audio.copy(), sample_rate
@@ -67,7 +87,7 @@ async def _create_playing_backend(
     backend._stream.stop = MagicMock()
     backend._stream.pause = MagicMock()
 
-    await backend.play("http://example.com/track1.flac", _make_metadata("1"))
+    await backend.play(_make_metadata("1"))
     return backend
 
 
@@ -113,13 +133,12 @@ class TestGaplessContract:
 
     async def test_set_next_track_starts_prefetch(self) -> None:
         backend = LocalAudioBackend()
+        backend.set_stream_resolver(_mock_resolver())
         _arm_next_track(backend)
 
-        result = await backend.set_next_track(
-            "http://example.com/next.flac", _make_metadata("2"), queue_item_id=7
-        )
+        result = await backend.set_next_track(_make_metadata("2"), queue_item_id=7)
 
-        assert result is True
+        assert result is not None
         assert backend._next_prefetch_task is not None
         await _wait_until(lambda: backend._next_prefetch_task.done())
         assert backend._next_prefetch_task.result() == b"fake-flac-bytes"
@@ -128,6 +147,7 @@ class TestGaplessContract:
 
     async def test_clear_next_track_cancels_prefetch(self) -> None:
         backend = LocalAudioBackend()
+        backend.set_stream_resolver(_mock_resolver())
 
         async def slow_download(url):
             await asyncio.sleep(10)
@@ -135,7 +155,7 @@ class TestGaplessContract:
 
         backend._download = slow_download
 
-        await backend.set_next_track("http://example.com/next.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
         task = backend._next_prefetch_task
         assert task is not None
 
@@ -160,7 +180,7 @@ class TestSeamlessTransition:
         backend.on_next_track_started(lambda: started.append(True))
 
         _arm_next_track(backend)
-        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
 
         # Track 1 feeds fully, then the loop swaps in track 2 and keeps feeding
         # the same ring buffer.
@@ -191,7 +211,7 @@ class TestSeamlessTransition:
         backend._stream.open.reset_mock()
 
         _arm_next_track(backend)
-        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
 
         await _wait_until(lambda: backend._transition_pending)
 
@@ -205,7 +225,7 @@ class TestSeamlessTransition:
         backend = await _create_playing_backend()
 
         _arm_next_track(backend)
-        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
         await _wait_until(lambda: backend._transition_pending)
 
         # Nothing consumed: old track has not advanced past what already played
@@ -241,7 +261,7 @@ class TestFormatChangeTransition:
 
         hires_audio = np.random.rand(TRACK2_FRAMES, 2).astype(np.float32)
         _arm_next_track(backend, audio=hires_audio, sample_rate=96000)
-        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
 
         # The transition waits for the old buffer to drain before reconfiguring
         await _wait_until(lambda: backend._decode.call_count == 1)
@@ -274,7 +294,7 @@ class TestGaplessFallback:
         backend.on_track_ended(lambda: ended.append(True))
 
         backend._download = AsyncMock(side_effect=aiohttp.ClientError("network down"))
-        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
 
         # Failed prefetch: normal drain + track-ended path
         await _drain_after_feed(backend, TRACK1_FRAMES)
@@ -296,7 +316,7 @@ class TestGaplessFallback:
             return b"never"
 
         backend._download = stalled_download
-        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
 
         # Drain the buffer: download still pending, grace period expires
         await _drain_after_feed(backend, TRACK1_FRAMES)
@@ -317,7 +337,7 @@ class TestGaplessFallback:
             return b"never"
 
         backend._download = slow_download
-        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
         await backend.clear_next_track()
 
         await _drain_after_feed(backend, TRACK1_FRAMES)
@@ -341,10 +361,10 @@ class TestGaplessStateClearing:
             return b"never"
 
         backend._download = slow_download
-        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
         assert backend._next_prefetch_task is not None
 
-        await backend.play("http://example.com/track3.flac", _make_metadata("3"))
+        await backend.play(_make_metadata("3"))
         assert backend._next_prefetch_task is None
         assert backend._transition_pending is False
 
@@ -355,7 +375,7 @@ class TestGaplessStateClearing:
         backend = await _create_playing_backend()
 
         _arm_next_track(backend)
-        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await backend.set_next_track(_make_metadata("2"))
         await _wait_until(lambda: backend._transition_pending)
 
         await backend.stop()

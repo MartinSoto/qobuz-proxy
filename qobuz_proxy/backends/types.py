@@ -65,6 +65,20 @@ class BackendTrackMetadata:
 
 
 @dataclass
+class PlayResult:
+    """What a backend hands back after starting playback of a track — the
+    bits of "what actually got streamed" that the caller (the player)
+    can't know on its own, since format/quality resolution now happens
+    inside the backend (see DLNABackend.play/resolve_track). Needed for
+    Qobuz play-reporting (track/reportStreamingEndJson), not for playback
+    itself.
+    """
+
+    blob: str = ""  # Opaque token from getFileUrl, needed for reportStreamingEnd
+    format_id: int = 0  # Qobuz quality actually served
+
+
+@dataclass
 class BackendInfo:
     """
     Information about an audio backend/device.
