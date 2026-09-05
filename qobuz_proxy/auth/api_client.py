@@ -156,6 +156,74 @@ class QobuzAPIClient:
 
         return False
 
+    async def get_ws_token(self, previous_jwt: str = "") -> Optional[dict[str, Any]]:
+        """
+        Obtain (or refresh) a Qobuz Connect WebSocket auth token directly
+        from the Qobuz API, independent of the phone app.
+
+        Mirrors the reference StreamCore32 device's own getWSToken(): POST
+        {API_BASE}/qws/createToken (no previous_jwt) or /qws/refreshToken
+        (given one), authenticated the same way as every other signed call
+        here. This is what lets WsManager keep its control WebSocket alive
+        indefinitely on its own — see docs/gapless-arming-and-token-expiry.md
+        for what used to happen without it: nothing could recover once the
+        WS token expired except the app proactively reconnecting, which
+        doesn't reliably happen once its own OS suspends it in the
+        background.
+
+        Args:
+            previous_jwt: The token being refreshed, if any. Empty requests
+                a brand-new one (createToken); a real value requests a
+                refresh of that specific token instead (refreshToken).
+
+        Returns:
+            Dict with 'jwt', 'exp' (epoch seconds), and 'endpoint' (wss://
+            URL) keys, or None on failure.
+        """
+        if not await self.start_session():
+            logger.debug("Session start failed; attempting WS token request without session")
+
+        endpoint = "refreshToken" if previous_jwt else "createToken"
+        url = f"{self.API_BASE}/qws/{endpoint}"
+        headers = {
+            "Referer": "https://play.qobuz.com/",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://play.qobuz.com",
+            "X-App-Id": self.app_id,
+        }
+        if self.x_session_id:
+            headers["X-Session-Id"] = self.x_session_id
+        if self.user_auth_token:
+            headers["X-User-Auth-Token"] = self.user_auth_token
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, data="jwt=jwt_qws", headers=headers, timeout=timeout
+                ) as resp:
+                    if resp.status != 200:
+                        body_text = await resp.text()
+                        logger.warning(
+                            f"WS token {endpoint} failed: HTTP {resp.status} — {body_text[:200]}"
+                        )
+                        return None
+                    data = await resp.json()
+        except Exception as e:
+            logger.error(f"Failed to get WS token ({endpoint}): {e}")
+            return None
+
+        jwt_data = data.get("jwt_qws") if isinstance(data, dict) else None
+        if not isinstance(jwt_data, dict) or not jwt_data.get("jwt"):
+            logger.warning(f"WS token response missing jwt_qws.jwt: {data}")
+            return None
+
+        return {
+            "jwt": jwt_data.get("jwt", ""),
+            "exp": jwt_data.get("exp", 0),
+            "endpoint": jwt_data.get("endpoint", ""),
+        }
+
     async def get_track_url(self, track_id: str, quality: int = 27) -> Optional[dict[str, Any]]:
         """
         Get streaming URL and format info for a track.

@@ -7,7 +7,7 @@ Handles connection lifecycle, authentication, and message routing.
 import asyncio
 import logging
 import uuid
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
 import websockets
 from websockets import ClientConnection
@@ -17,6 +17,9 @@ from qobuz_proxy.config import Config
 
 from .protocol import DecodedMessage, MessageType, ProtocolCodec
 from .types import ConnectTokens
+
+if TYPE_CHECKING:
+    from qobuz_proxy.auth.api_client import QobuzAPIClient
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,9 @@ TOKEN_REFRESH_BUFFER = 60  # seconds before expiry
 INITIAL_RECONNECT_DELAY = 1.0  # seconds
 MAX_RECONNECT_DELAY = 60.0  # seconds
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
+# How often to retry a failed self-refresh while otherwise waiting on the
+# app — mirrors the reference device's own token-heartbeat cadence.
+SELF_REFRESH_RETRY_SECONDS = 30.0
 
 # How long force_reconnect() holds the connection closed before letting the
 # normal reconnect cycle resume — see its docstring.
@@ -52,14 +58,21 @@ class WsManager:
     - Routing incoming messages to registered handlers
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, api_client: Optional["QobuzAPIClient"] = None):
         """
         Initialize WebSocket manager.
 
         Args:
             config: Application configuration
+            api_client: Shared Qobuz API client, if available — lets this
+                manager refresh its own WS token directly (see
+                _refresh_token_from_api) instead of only ever waiting for
+                the phone app to reconnect and push a new one. None (e.g.
+                in tests) simply disables that and falls back to the old
+                app-only behavior.
         """
         self.config = config
+        self._api_client = api_client
         self._device_uuid = self._uuid_to_bytes(config.device.uuid)
         self._codec = ProtocolCodec(self._device_uuid)
 
@@ -599,7 +612,23 @@ class WsManager:
         self._pending_messages.clear()
 
     async def _wait_for_valid_token(self, buffer_s: int = 0) -> bool:
-        """Wait until a non-expired token is available or shutdown is requested."""
+        """Wait until a non-expired token is available or shutdown is requested.
+
+        Tries to refresh the token itself first, via the same Qobuz API
+        credentials used everywhere else (see _refresh_token_from_api) —
+        the control WebSocket no longer has to depend on the phone app
+        proactively reconnecting to stay alive (see
+        docs/gapless-arming-and-token-expiry.md for what used to happen
+        when it didn't: nothing here could recover on its own, and a
+        gapless transition needing a live SET_STATE to arm the next track
+        would silently fail until the app came back — sometimes minutes
+        or hours later, e.g. once its own OS stopped suspending it). Falls
+        back to waiting on the app — retrying the self-refresh
+        periodically in the meantime — when that isn't possible (no
+        api_client wired up, or we've never had a session at all yet: the
+        very first token can only ever come from the app) or keeps
+        failing.
+        """
         logged_wait = False
 
         while self._should_run:
@@ -610,6 +639,9 @@ class WsManager:
             ):
                 return True
 
+            if await self._refresh_token_from_api(buffer_s):
+                continue
+
             if not logged_wait:
                 logger.warning("Token expired, waiting for refreshed token from Qobuz app")
                 logged_wait = True
@@ -618,9 +650,48 @@ class WsManager:
             self._token_update_event.clear()
             if self._token_version != token_version:
                 continue
-            await self._token_update_event.wait()
+            try:
+                await asyncio.wait_for(
+                    self._token_update_event.wait(), timeout=SELF_REFRESH_RETRY_SECONDS
+                )
+            except asyncio.TimeoutError:
+                pass
 
         return False
+
+    async def _refresh_token_from_api(self, buffer_s: int) -> bool:
+        """Try to refresh the WS token directly from the Qobuz API instead
+        of waiting for the app to push one — see QobuzAPIClient.get_ws_token().
+
+        Only attempted once we've had at least one real session from the
+        app (self._session_uuid set): the Connect session identity itself
+        is still something only the app can hand us; this only ever
+        replaces the *token*, keeping that same session alive indefinitely
+        instead of needing the app to reconnect every time it expires.
+        """
+        if self._api_client is None or self._session_uuid is None:
+            return False
+
+        previous_jwt = self._ws_token.jwt if self._ws_token else ""
+        try:
+            result = await self._api_client.get_ws_token(previous_jwt=previous_jwt)
+        except Exception as e:
+            logger.warning(f"Self-refresh of WS token failed: {e}")
+            return False
+        if result is None:
+            return False
+
+        new_token = WSToken.from_connect_token(
+            jwt=result["jwt"], exp=result["exp"], endpoint=result["endpoint"]
+        )
+        if not new_token.is_valid() or new_token.is_expired(buffer_s):
+            logger.warning("Self-refreshed WS token came back invalid or already expiring")
+            return False
+
+        self._ws_token = new_token
+        self._token_version += 1
+        logger.info("Refreshed WebSocket token directly from Qobuz API")
+        return True
 
     async def _close_for_token_refresh(self) -> None:
         """Close the current connection so refreshed tokens are used immediately."""

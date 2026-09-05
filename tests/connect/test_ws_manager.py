@@ -146,6 +146,108 @@ class TestTokenManagement:
         ws_manager._ws.close.assert_awaited_once()
 
 
+class TestSelfRefreshWsToken:
+    """_refresh_token_from_api / _wait_for_valid_token's use of it — the
+    control WebSocket refreshing its own token directly via the Qobuz API
+    instead of only ever waiting for the phone app to reconnect and push
+    one. See docs/gapless-arming-and-token-expiry.md for the failure this
+    closes: nothing could recover here on its own once the app's own OS
+    stopped keeping it reachable in the background."""
+
+    async def test_no_api_client_falls_back_to_waiting(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """The `ws_manager` fixture wires up no api_client at all — self-
+        refresh must be a clean no-op, not an error."""
+        ws_manager.set_tokens(valid_tokens)  # establishes a session
+
+        assert await ws_manager._refresh_token_from_api(buffer_s=60) is False
+
+    async def test_no_prior_session_falls_back_to_waiting(self, config: Config) -> None:
+        """The very first token can only ever come from the app — there's
+        no session identity yet to refresh a token *for*."""
+        ws_manager = WsManager(config, api_client=AsyncMock())
+
+        assert ws_manager._session_uuid is None
+        assert await ws_manager._refresh_token_from_api(buffer_s=60) is False
+
+    async def test_successful_self_refresh_updates_the_token(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        api_client = AsyncMock()
+        api_client.get_ws_token = AsyncMock(
+            return_value={"jwt": "self-refreshed", "exp": 9999999999, "endpoint": "wss://x/ws"}
+        )
+        ws_manager = WsManager(config, api_client=api_client)
+        ws_manager.set_tokens(valid_tokens)
+        old_version = ws_manager._token_version
+
+        assert await ws_manager._refresh_token_from_api(buffer_s=60) is True
+
+        assert ws_manager._ws_token is not None
+        assert ws_manager._ws_token.jwt == "self-refreshed"
+        assert ws_manager._token_version == old_version + 1
+        api_client.get_ws_token.assert_awaited_once_with(previous_jwt="test_jwt_token")
+
+    async def test_failed_self_refresh_returns_false(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        api_client = AsyncMock()
+        api_client.get_ws_token = AsyncMock(return_value=None)
+        ws_manager = WsManager(config, api_client=api_client)
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await ws_manager._refresh_token_from_api(buffer_s=60) is False
+
+    async def test_self_refresh_exception_returns_false_instead_of_raising(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        api_client = AsyncMock()
+        api_client.get_ws_token = AsyncMock(side_effect=OSError("unreachable"))
+        ws_manager = WsManager(config, api_client=api_client)
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await ws_manager._refresh_token_from_api(buffer_s=60) is False
+
+    async def test_invalid_refreshed_token_is_rejected(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        """A response missing a real field must not be accepted as a
+        genuine refresh — falls back to waiting instead."""
+        api_client = AsyncMock()
+        api_client.get_ws_token = AsyncMock(
+            return_value={"jwt": "", "exp": 9999999999, "endpoint": "wss://x/ws"}
+        )
+        ws_manager = WsManager(config, api_client=api_client)
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await ws_manager._refresh_token_from_api(buffer_s=60) is False
+
+    async def test_wait_for_valid_token_self_refreshes_without_the_app(
+        self, config: Config
+    ) -> None:
+        """End-to-end: an expired token recovers on its own via
+        _wait_for_valid_token, with set_tokens() (the app) never called."""
+        api_client = AsyncMock()
+        api_client.get_ws_token = AsyncMock(
+            return_value={"jwt": "self-refreshed", "exp": 9999999999, "endpoint": "wss://x/ws"}
+        )
+        ws_manager = WsManager(config, api_client=api_client)
+        ws_manager.set_tokens(
+            ConnectTokens(
+                session_id=str(uuid.uuid4()),
+                ws_token=JWTConnectToken(jwt="expiring", exp=1, endpoint="wss://x/ws"),
+            )
+        )
+        ws_manager._should_run = True
+
+        result = await asyncio.wait_for(ws_manager._wait_for_valid_token(buffer_s=60), timeout=1.0)
+
+        assert result is True
+        assert ws_manager._ws_token is not None
+        assert ws_manager._ws_token.jwt == "self-refreshed"
+
+
 class TestForceReconnect:
     """force_reconnect() — used when a renderer detects an external
     takeover (see Player.is_playing_our_content()). The protocol has no
