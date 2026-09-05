@@ -1,10 +1,48 @@
 # Suspected bug: WS token expiry silently kills gapless mid-album
 
-**Status: diagnosed from two field logs, not yet confirmed live or fixed.**
+**Status: theory only partially confirmed by a ~10h production log (2026-09-05)
+— see "Field update" below. Not yet fixed.**
 Logging was added ([player.py](../qobuz_proxy/playback/player.py)'s
 `_prepare_next_track_locked`) to make the failure visible; this doc exists so
 a future occurrence can be checked against the theory below instead of
 re-deriving it.
+
+## Field update (2026-09-05, ~10h container log)
+
+The new warning does fire — 13 times in one overnight run — but it turns out
+to be **near-constant and almost always harmless**, not a rare symptom: it
+fires on nearly every single gapless transition (the brief window between a
+transition and the app's next `SET_STATE` catching up), self-healing within
+under a second via the position-tick retry, *regardless of whether the WS
+token happens to be healthy at that moment*. It fired at container startup
+and steadily all night, unrelated to either of the two real WS-token-expiry
+windows this run also produced (one 34 minutes long, one ~7 hours — both
+confirmed real: `Token expiring soon`/`Token expired, waiting for refreshed
+token` with nothing until the app reconnected). `No next track available -
+playback stopped` — the actual permanent-stop message from the two logs this
+doc was originally written from — did not occur once in this run.
+
+There was one real interruption (`Trusting STOPPED` → `Track ended
+naturally`, 23:28:01), but it does **not** match this theory: it happened 17
+minutes *after* the WS had already reconnected, wasn't preceded by the new
+warning, and instead coincided with a Sonos-side network blip a few minutes
+earlier (other rooms briefly dropped from the household topology, a
+`keepalive ping timeout` closed the WS, `SOAP GetTransportInfo failed`
+errors). The already-armed next track had been successfully queued on the
+device, but it apparently never auto-advanced to it on its own; the existing
+10-second STOPPED-confirmation timeout caught that and fell back to
+explicitly reloading/restarting the track — a real, audible (non-gapless)
+gap, but not a permanent stop, and likely a **different bug** (a missed
+on-device auto-advance, possibly triggered by the topology blip) rather than
+the WS-token chain below.
+
+So: the WS-token-expiry mechanism itself is confirmed real and can last
+hours, but the exact failure chain hypothesized below (warning fires because
+the WS is down at that exact moment → nothing gets armed → the last-armed
+track ends with nothing next → permanent stop) hasn't reproduced yet. Keep
+watching for a warning that (a) is directly preceded by a `Token expired`
+line and (b) doesn't self-heal before the currently-armed track ends — that
+would be the first direct confirmation.
 
 ## Symptom
 
