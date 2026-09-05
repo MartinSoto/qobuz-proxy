@@ -578,7 +578,27 @@ class QobuzPlayer:
         app selects it. Silencing it on selection — rather than letting
         that keep going until the app actually picks a track — claims a
         silent, ready state the same way Spotify Connect does.
+
+        But SET_ACTIVE(true) doesn't only fire on a genuinely fresh
+        selection — it fires just as much when the app's control
+        WebSocket reconnects (a token refresh, a brief network blip) while
+        *our own* content has been playing the whole time, uninterrupted,
+        underneath a control channel that happened to be down (see
+        docs/gapless-arming-and-token-expiry.md). This method's own
+        assumption ("nothing of ours to report") is only true in the
+        first case; in the second, self._current_track is already ours
+        and still legitimately playing — sending a raw stop here would
+        kill it outright (observed directly: the device went silent, and
+        Player's own state/current_track were left claiming PLAYING with
+        nothing to back it up, so a later seek/play from the app no
+        longer did anything until an unrelated track load resynced the
+        two). So: only actually silence the device when we don't already
+        have something of our own active — that's the only case this was
+        ever meant to guard.
         """
+        if self._current_track is not None and self._state != PlaybackState.STOPPED:
+            logger.debug("claim_device: already have active content of our own, not stopping it")
+            return
         try:
             await self.backend.stop()
         except Exception as e:

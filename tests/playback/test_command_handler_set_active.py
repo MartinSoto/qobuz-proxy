@@ -7,7 +7,9 @@ signal previously only observed, never actually tracked.
 
 from unittest.mock import AsyncMock
 
+from qobuz_proxy.backends import PlaybackState
 from qobuz_proxy.playback.command_handler import PlaybackCommandHandler
+from qobuz_proxy.playback.queue import QueueTrack
 from qobuz_proxy.proto import qconnect_payload_pb2 as pb
 
 from tests.playback.test_player_serialization import _make_player
@@ -48,6 +50,26 @@ class TestSetActiveHandling:
         await handler._handle_set_active(_set_active_msg(True))
 
         backend.stop.assert_awaited_once()
+
+    async def test_active_true_does_not_stop_our_own_already_playing_content(self) -> None:
+        """SET_ACTIVE(true) fires again whenever the app's control
+        WebSocket reconnects (a token refresh, a brief network blip) —
+        not only on a genuinely fresh selection — and our own content can
+        have been playing the whole time underneath a control channel
+        that happened to be down. claim_device()'s silence-a-shared-
+        device precaution must not kill playback that's already
+        legitimately ours."""
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player, queue=None)
+        player.broadcast_current_volume = AsyncMock()  # type: ignore[method-assign]
+        backend.stop = AsyncMock()  # type: ignore[method-assign]
+        player._state = PlaybackState.PLAYING
+        player._current_track = QueueTrack(queue_item_id=0, track_id="1")
+
+        await handler._handle_set_active(_set_active_msg(True))
+
+        backend.stop.assert_not_awaited()
+        assert player.is_active_renderer is True  # activation itself still applies
 
     async def test_a_failing_device_stop_does_not_block_activation(self) -> None:
         player, backend = _make_player()
