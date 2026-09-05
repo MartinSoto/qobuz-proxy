@@ -1,11 +1,10 @@
-# Suspected bug: WS token expiry silently kills gapless mid-album
+# WS token expiry silently killed gapless mid-album — fixed
 
-**Status: theory only partially confirmed by a ~10h production log (2026-09-05)
-— see "Field update" below. Not yet fixed.**
-Logging was added ([player.py](../qobuz_proxy/playback/player.py)'s
-`_prepare_next_track_locked`) to make the failure visible; this doc exists so
-a future occurrence can be checked against the theory below instead of
-re-deriving it.
+**Status: theory fully confirmed live (2026-09-05, see "Full confirmation"
+below) and fixed** — `WsManager` now refreshes its own control-WebSocket
+token directly from the Qobuz API instead of only ever waiting for the
+phone app to reconnect and push one (see "The fix" below). Watch for
+whether this actually stops recurring in practice.
 
 ## Reproduction (reported directly, 2026-09-05)
 
@@ -232,7 +231,27 @@ future log shows this warning *without* a preceding `Token expired` /
 `Token expiring soon` pair, the theory is wrong and the missing
 `nextQueueItem` has some other cause.
 
-## What a real fix would look like (not implemented)
+## Full confirmation (2026-09-05, live)
+
+A clean occurrence with nothing else going on:
+
+```
+11:35:41  Token expiring soon / Token expired, waiting for refreshed token
+11:37:19  Gapless: transitioning to track 405937069 (already-armed track becomes current)
+11:37:20  Gapless: no next-track info available to arm with  ← fires, as always...
+          ...but this time no "Gapless: armed next track" follows. No self-heal.
+11:42:33  Trusting STOPPED → Track ended naturally → No next track available - playback stopped
+```
+
+No WS reconnect anywhere in that 7-minute window. This is the first time all
+three pieces lined up: the warning fired, it didn't self-heal, and the
+currently-armed track ran out with nothing queued behind it — a real
+permanent stop. Reported cause on the phone side: the screen/app had been
+left untouched for a while, plausibly suspended by Android in the
+background — consistent with "the app doesn't proactively refresh unless
+something wakes it up."
+
+## The fix (implemented)
 
 The reference C++ implementation this protocol is modeled on
 ([StreamCore32](https://github.com/tobiasguyer/StreamCore32),
@@ -266,17 +285,24 @@ i.e. `POST {api_base}/qws/createToken` (first token) or `/qws/refreshToken`
 holds, independent of the phone app being reachable at all.
 
 `QobuzAPIClient` ([auth/api_client.py](../qobuz_proxy/auth/api_client.py))
-already has most of what this needs — `user_auth_token`, `app_id`, and an
+already had most of what this needs — `user_auth_token`, `app_id`, and an
 `x_session_id`/`start_session()` pair matching StreamCore32's `X-Session-Id`
-almost exactly. Two gaps if this gets picked up later:
+almost exactly (turns out `start_session()` was already being called, from
+`get_track_url()` — not dead code as first assumed while just reading, only
+confirmed by checking).
 
-- `start_session()` exists but is **never actually called** anywhere in the
-  codebase today — dead code.
-- There's no `get_ws_token()`/`refresh_ws_token()` method at all; `ws_manager.py`
-  would need to call it proactively (e.g. on the same kind of heartbeat,
-  or right when `_wait_for_valid_token` would otherwise block) instead of
-  only accepting tokens pushed from the app.
+Implemented: `QobuzAPIClient.get_ws_token(previous_jwt="")` — `POST
+{API_BASE}/qws/createToken` (no previous JWT) or `/qws/refreshToken` (given
+one), same headers as above. `WsManager._wait_for_valid_token` now tries
+this itself first, via a new `_refresh_token_from_api`, before ever falling
+back to waiting on the app — retried every 30s while it keeps failing.
+Self-refresh only ever applies once there's already a session from a real
+app connection (the very first token still has to come from the app); after
+that, the control WebSocket never has to depend on the app reconnecting
+again for the rest of that session's lifetime. `Speaker` now passes its
+shared `QobuzAPIClient` into `WsManager` for this.
 
-This wasn't implemented yet — it calls an unofficial Qobuz endpoint on a
-recurring basis, which is worth deciding on deliberately rather than as a
-follow-on to a logging fix.
+Calls an unofficial Qobuz endpoint on a recurring basis (every ~9 minutes at
+the observed token lifetime) — worth watching whether it holds up over a
+longer stretch, but the mechanism is a straight port of what the reference
+device itself already does continuously.
