@@ -275,8 +275,9 @@ class PlaybackCommandHandler:
             await self.player.claim_device()
             await self.player.broadcast_current_volume()
         else:
-            # We're no longer the active renderer - stop playback
-            await self.player.stop_playback()
+            # We're no longer the active renderer - stop playback (debounced;
+            # see Player.deactivate_renderer for why this isn't immediate)
+            await self.player.deactivate_renderer()
 
     async def _handle_set_max_audio_quality(self, message: Any) -> None:
         """

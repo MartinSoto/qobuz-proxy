@@ -51,6 +51,13 @@ _STALE_SNAPSHOT_THRESHOLD_MS = 5000
 # forever.
 _BACKEND_ATTACH_WAIT_SECONDS = 8.0
 
+# How long a SET_ACTIVE(false) waits before actually stopping playback — see
+# deactivate_renderer()'s own docstring for the race this absorbs. Same
+# order of magnitude as DLNABackend's own PLAYBACK_START_GRACE_PERIOD_SECONDS
+# for the same underlying reason: a signal that's meaningful once it settles
+# can still be transiently wrong right after a transition.
+_DEACTIVATION_GRACE_SECONDS = 5.0
+
 
 class _CommandQueueItem:
     """One entry in Player._command_queue — see Player.enqueue().
@@ -148,6 +155,9 @@ class QobuzPlayer:
         # now". False until the server says otherwise — a freshly started
         # renderer has no controller attached yet.
         self._is_active_renderer: bool = False
+        # A pending, debounced stop from deactivate_renderer() — see its
+        # own docstring. None whenever nothing is currently scheduled.
+        self._pending_deactivation_task: Optional[asyncio.Task] = None
 
         # Whether the backend is currently reachable — see
         # set_backend_attached(). True for the vast majority of backends,
@@ -289,6 +299,7 @@ class QobuzPlayer:
                 AudioBackend.disconnect()).
         """
         self._is_running = False
+        self._cancel_pending_deactivation()
 
         if self._command_task:
             self._command_task.cancel()
@@ -596,6 +607,7 @@ class QobuzPlayer:
         have something of our own active — that's the only case this was
         ever meant to guard.
         """
+        self._cancel_pending_deactivation()
         if self._current_track is not None and self._state != PlaybackState.STOPPED:
             logger.debug("claim_device: already have active content of our own, not stopping it")
             return
@@ -603,6 +615,42 @@ class QobuzPlayer:
             await self.backend.stop()
         except Exception as e:
             logger.warning(f"Failed to stop device on activation: {e}")
+
+    async def deactivate_renderer(self) -> None:
+        """Handle SET_ACTIVE(false) — debounced, not an immediate stop.
+
+        Every WS reconnect — including our own token self-refresh, now
+        happening every ~10-20 minutes instead of rarely (see
+        docs/gapless-arming-and-token-expiry.md) — races the server's own
+        bookkeeping for "is this renderer active": observed directly,
+        reconnecting sends SET_ACTIVE(true) via JOIN_SESSION, the server
+        sometimes hasn't caught up to that yet when our very next message
+        arrives, rejects it ("Renderer state updated message received
+        from non active renderer"), and immediately follows with
+        SET_ACTIVE(false) — then flips back to SET_ACTIVE(true) again
+        within anywhere from under a second to a few minutes once it
+        settles. Stopping playback on that raw signal, unconditionally,
+        turned a transient race into a real interruption every single
+        refresh cycle. Waiting a few seconds for a reactivation that
+        cancels this — see claim_device() — before actually stopping
+        keeps genuine deactivation (a different device/session actually
+        taking over) working, just no longer instant.
+        """
+        self._cancel_pending_deactivation()
+        self._pending_deactivation_task = asyncio.create_task(self._deactivate_after_grace())
+
+    async def _deactivate_after_grace(self) -> None:
+        try:
+            await asyncio.sleep(_DEACTIVATION_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        await self.stop_playback()
+
+    def _cancel_pending_deactivation(self) -> None:
+        task = self._pending_deactivation_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._pending_deactivation_task = None
 
     # =========================================================================
     # Seek Control

@@ -5,8 +5,12 @@ SrvrRndrSetActive is the Qobuz server's authoritative signal for whether
 signal previously only observed, never actually tracked.
 """
 
+import asyncio
 from unittest.mock import AsyncMock
 
+import pytest
+
+import qobuz_proxy.playback.player as player_module
 from qobuz_proxy.backends import PlaybackState
 from qobuz_proxy.playback.command_handler import PlaybackCommandHandler
 from qobuz_proxy.playback.queue import QueueTrack
@@ -82,16 +86,48 @@ class TestSetActiveHandling:
         assert player.is_active_renderer is True
         player.broadcast_current_volume.assert_awaited_once()
 
-    async def test_active_false_marks_the_player_inactive_and_stops_playback(self) -> None:
+    async def test_active_false_marks_the_player_inactive_and_eventually_stops_playback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """is_active_renderer flips immediately (it drives polling — see
+        AudioBackend.set_active); the actual stop is debounced (see
+        Player.deactivate_renderer) so it isn't asserted until the grace
+        period's pending task actually runs."""
+        monkeypatch.setattr(player_module, "_DEACTIVATION_GRACE_SECONDS", 0)
         player, _backend = _make_player()
         handler = PlaybackCommandHandler(player, queue=None)
         await player.set_active_renderer(True)
         player.stop_playback = AsyncMock()  # type: ignore[method-assign]
 
         await handler._handle_set_active(_set_active_msg(False))
-
         assert player.is_active_renderer is False
+        player.stop_playback.assert_not_awaited()  # not yet — still debounced
+
+        assert player._pending_deactivation_task is not None
+        await player._pending_deactivation_task
+
         player.stop_playback.assert_awaited_once()
+
+    async def test_reactivation_within_the_grace_period_cancels_the_stop(self) -> None:
+        """Regression: every WS reconnect (including the token self-refresh
+        introduced separately) races the server's own bookkeeping for "is
+        this renderer active" — SET_ACTIVE(false) immediately followed by
+        SET_ACTIVE(true) again once it catches up, not a genuine takeover.
+        See docs/gapless-arming-and-token-expiry.md."""
+        player, _backend = _make_player()
+        handler = PlaybackCommandHandler(player, queue=None)
+        player.broadcast_current_volume = AsyncMock()  # type: ignore[method-assign]
+        await player.set_active_renderer(True)
+        player.stop_playback = AsyncMock()  # type: ignore[method-assign]
+
+        await handler._handle_set_active(_set_active_msg(False))
+        assert player._pending_deactivation_task is not None
+
+        await handler._handle_set_active(_set_active_msg(True))
+
+        assert player._pending_deactivation_task is None
+        await asyncio.sleep(0)  # let the cancelled task actually finish
+        player.stop_playback.assert_not_awaited()
 
     async def test_active_state_is_relayed_to_the_backend(self) -> None:
         """See AudioBackend.set_active — a Sonos auto-discovery household
