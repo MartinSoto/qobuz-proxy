@@ -15,6 +15,37 @@ token's short lifetime (~5-10 min observed): once nothing has interacted
 with the app for a while, it seemingly stops proactively refreshing the
 token, and the control WebSocket falls dark until the app is touched again.
 
+## Also not this: a reconnect-after-token-refresh stop, root-caused and fixed
+
+A third distinct incident, reported directly (2026-09-05, after ~1h of solid
+playback): the app disconnected and fell back to local (phone) playback —
+consistent with a WS-token-expiry gap like the ones above (confirmed in the
+log: `Token expiring soon`/`Token expired` ~4 minutes before). Seeking via
+the **Sonos app** worked fine at that point (the physical device and its
+queue were healthy). The user then reconnected to the group from the Qobuz
+app — which **stopped the currently-playing (already-ours) track outright**.
+After that, neither Play nor Seek from the Qobuz app did anything; only
+loading a different track and returning to the original one recovered it.
+
+Root cause (fixed, see `git log` for the commit touching
+[player.py](../qobuz_proxy/playback/player.py)'s `claim_device`): every
+`SET_ACTIVE(true)` — sent not only on a genuinely fresh renderer selection
+but also on *every* control-WebSocket reconnect, including a plain token
+refresh — triggered `claim_device()`, which unconditionally sent the
+physical device a raw stop. Its own docstring's assumption ("nothing of
+ours to report — we were never playing anything before this") is only true
+for the fresh-selection case; here, our content had been playing the whole
+time, gaplessly, underneath a control channel that merely happened to be
+down. The stop silenced the device for real, but `Player`'s own
+`_state`/`_current_track` were never updated to match (`claim_device`
+deliberately doesn't touch them) — so every subsequent command kept
+computing against a track it still believed was actively playing, and
+nothing worked until a fresh track load resynced the two. Fix: skip the
+stop entirely whenever `_current_track` is already set and `_state` isn't
+`STOPPED` — the silence-a-shared-device precaution only ever needs to
+guard against a genuinely different source having taken over, not our own
+already-active session reconnecting.
+
 ## Not this: a same-day disconnection that was actually a device dropout
 
 A disconnection reported live on 2026-09-05 (~08:19, `Cocina` room) looked
