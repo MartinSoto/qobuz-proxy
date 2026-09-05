@@ -102,6 +102,9 @@ class DLNAClient:
         self._pending_volume: Optional[int] = None
         self._volume_debounce_task: Optional[asyncio.Task] = None
         self._volume_lock = asyncio.Lock()
+        # Guards reset_session() against overlapping resets — see its own
+        # docstring for the leak this prevents.
+        self._session_reset_lock = asyncio.Lock()
 
     async def connect(self) -> DLNADeviceInfo:
         """
@@ -149,20 +152,41 @@ class DLNAClient:
             connector=connector,
         )
 
-    async def reset_session(self) -> None:
+    async def reset_session(self, expected_session: Optional[aiohttp.ClientSession] = None) -> None:
         """Recreate the HTTP session after a connection-level failure.
 
         When a renderer wedges or drops its control socket, the existing
         session can keep handing out dead connections. Closing and rebuilding
         it lets subsequent SOAP calls recover without restarting the addon.
+
+        expected_session guards against a real race, observed directly in
+        production (repeated "Unclosed client session" errors during a flaky
+        device's whole retry storm): the poll loop and a command can each be
+        mid-SOAP-call against the same device at once, and a flaky device can
+        make more than one of them fail within milliseconds of each other.
+        Without this guard, each failing call would blindly close-and-replace
+        self._session — whichever session a losing racer's own replacement
+        built would then never be referenced again: an unclosed ClientSession
+        (and its live TCPConnector, potentially still holding an open socket
+        against the device) leaked every time this raced. _soap_action_detailed
+        passes the session it was actually using when it hit the error; if
+        self._session no longer *is* that session, someone else already reset
+        since, so this is a no-op — nothing to close (that already happened),
+        nothing new to build (there's already a fresh one). Omitted (the
+        explicit external recovery call in backend.py) to force a reset
+        unconditionally regardless of whichever session is current.
         """
-        logger.debug("Resetting DLNA HTTP session")
-        if self._session:
-            try:
-                await self._session.close()
-            except Exception:
-                pass
-        self._session = self._build_session()
+        async with self._session_reset_lock:
+            if expected_session is not None and self._session is not expected_session:
+                return
+            logger.debug("Resetting DLNA HTTP session")
+            old_session = self._session
+            self._session = self._build_session()
+            if old_session is not None:
+                try:
+                    await old_session.close()
+                except Exception:
+                    pass
 
     async def disconnect(self) -> None:
         """Disconnect and clean up."""
@@ -713,8 +737,12 @@ class DLNAClient:
         last_error_code: Optional[int] = None
         last_error_desc: Optional[str] = None
         for attempt in range(retries):
+            # Captured up front so the except block below can tell
+            # reset_session() exactly which session this attempt was using
+            # (see its docstring for why that matters).
+            session = self._session
             try:
-                async with self._session.post(url, data=envelope, headers=headers) as response:
+                async with session.post(url, data=envelope, headers=headers) as response:
                     if response.status == 200:
                         return SoapResult(success=True, body=await response.text())
                     else:
@@ -752,7 +780,7 @@ class DLNAClient:
                 # holding a half-dead socket. Recreate it so the remaining
                 # retries run against a fresh connection.
                 if isinstance(e, (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError)):
-                    await self.reset_session()
+                    await self.reset_session(expected_session=session)
 
             if attempt < retries - 1:
                 await asyncio.sleep(RETRY_DELAY_SECONDS)

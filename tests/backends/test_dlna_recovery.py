@@ -61,6 +61,67 @@ class TestSoapErrorReporting:
         assert reset_mock.await_count == client_module.MAX_RETRIES
 
 
+class _TrackedSession:
+    """Minimal stand-in for aiohttp.ClientSession that counts close() calls."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class TestResetSessionConcurrency:
+    async def test_overlapping_resets_of_the_same_session_converge_on_one_replacement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two SOAP calls (e.g. the poll loop and a command) can each hit a
+        connection error against the same session within milliseconds of
+        each other on a flaky device — observed directly in production as
+        repeated "Unclosed client session" errors. Both must converge on
+        one replacement instead of each blindly building (and orphaning)
+        their own — see reset_session's own docstring."""
+        client = DLNAClient(ip="1.2.3.4")
+        original = _TrackedSession()
+        client._session = original  # type: ignore[assignment]
+
+        built: list[_TrackedSession] = []
+
+        def _build() -> _TrackedSession:
+            session = _TrackedSession()
+            built.append(session)
+            return session
+
+        monkeypatch.setattr(client, "_build_session", _build)
+
+        # Both callers observed `original` as the session they were using.
+        await asyncio.gather(
+            client.reset_session(expected_session=original),  # type: ignore[arg-type]
+            client.reset_session(expected_session=original),  # type: ignore[arg-type]
+        )
+
+        assert original.close_calls == 1  # closed exactly once, not twice
+        assert len(built) == 1  # only one replacement built, not two orphaned ones
+        assert client._session is built[0]
+        assert built[0].close_calls == 0  # the surviving session was never closed
+
+    async def test_reset_without_expected_session_forces_it_unconditionally(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The explicit external recovery call (backend.py's own transport
+        recovery) has no prior session to compare against — it must always
+        reset, regardless of what's currently installed."""
+        client = DLNAClient(ip="1.2.3.4")
+        original = _TrackedSession()
+        client._session = original  # type: ignore[assignment]
+        monkeypatch.setattr(client, "_build_session", _TrackedSession)
+
+        await client.reset_session()
+
+        assert original.close_calls == 1
+        assert client._session is not original
+
+
 class TestTransportRecovery:
     async def _make_backend(self):  # type: ignore[no-untyped-def]
         """Build a DLNABackend with a mocked client, bypassing real connection."""
