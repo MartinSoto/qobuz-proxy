@@ -46,9 +46,38 @@ incident — confirming it's a different failure mode (a physical device
 dropping off the network) than the WS-control-token theory this doc tracks.
 Existing device-departure handling did the right thing (detected sustained
 unreachability, gave up cleanly, tore the speaker down, let the others
-rediscover at their new addresses); whether the dropped room resumes
-playback cleanly once it reappears is still open — not confirmed either way
-yet.
+rediscover at their new addresses). `Cocina` did reappear a few minutes
+later (same IP) and got rediscovered, but its DLNA control layer stayed
+unresponsive for a while afterward — and, tellingly, even the **official
+Sonos app** couldn't control it either at that point. That ruled out a
+proxy-specific reachability quirk and pointed at the device itself being
+wedged — which raised the real question: could *our* traffic pattern be
+what tips an already-flaky device over into fully hanging, rather than the
+device failing entirely on its own (playback is otherwise stable for hours
+at a time)?
+
+**Root cause found and fixed**: the log showed 12 `Unclosed client session`
+errors in that same ~8-minute window — a real bug in
+[client.py](../qobuz_proxy/backends/dlna/client.py)'s `reset_session()`,
+which had no guard against overlapping callers. The poll loop (every 0.5s)
+and any in-flight command (`Stop`/`SetAVTransportURI`/...) each run their
+own SOAP calls against the *same* `DLNAClient`, and a flaky device can make
+more than one of them fail within milliseconds of each other. Each failing
+call blindly closed-and-replaced `self._session` — whichever replacement a
+losing racer built was then never referenced again: an orphaned, unclosed
+`ClientSession` (and its live `TCPConnector`, potentially still holding a
+real socket open against the device). A pile of our own leaked, never-torn-
+down connections sitting against an embedded device's small connection
+table is a plausible way *we* contributed to it wedging solid enough to lock
+out the Sonos app too.
+
+Fixed: `_soap_action_detailed` now captures the session each attempt
+actually used and passes it to `reset_session(expected_session=...)`, which
+only resets if nothing else has already replaced it since — overlapping
+failures converge on one new session instead of racing to leak one each.
+Whether this fully explains the wedge (vs. just reducing how often it
+happens) isn't confirmed yet — watch for whether `Unclosed client session`
+and "even the Sonos app can't control it" stop recurring together.
 
 ## Field update (2026-09-05, ~10h container log)
 
