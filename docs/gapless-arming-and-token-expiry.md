@@ -7,6 +7,14 @@ Logging was added ([player.py](../qobuz_proxy/playback/player.py)'s
 a future occurrence can be checked against the theory below instead of
 re-deriving it.
 
+## Reproduction (reported directly, 2026-09-05)
+
+Leaving the app playing a list/album completely undisturbed for about **30
+minutes** reliably reproduces the disconnection. Consistent with the WS
+token's short lifetime (~5-10 min observed): once nothing has interacted
+with the app for a while, it seemingly stops proactively refreshing the
+token, and the control WebSocket falls dark until the app is touched again.
+
 ## Field update (2026-09-05, ~10h container log)
 
 The new warning does fire — 13 times in one overnight run — but it turns out
