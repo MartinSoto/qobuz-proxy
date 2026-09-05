@@ -360,3 +360,61 @@ suite. Fixed by making `_poll_interval()` defensive and by always awaiting
 a sleep in the loop's `except Exception` branch too, so no future exception
 source (from this change or otherwise) can reintroduce the same failure
 mode.
+
+## A real regression from the token self-refresh: reconnects racing SET_ACTIVE
+
+Reported directly (2026-09-05): after playing stably for over an hour,
+Sonos playback suddenly stopped while the app still showed as connected.
+Restarting from the Sonos app worked; a later attempt from the Qobuz app
+also worked on Sonos, but *also* — separately, confirmed by the user to be
+their phone connecting to a paired Bluetooth speaker, unrelated to this
+proxy at all — played locally on the phone (matching the already-documented
+"app falls back to local playback" behavior from the very first incident in
+this doc, just audible through Bluetooth this time instead of the phone's
+own speaker).
+
+The Sonos stop itself, though, was real and traced directly to the token
+self-refresh fix above. Every one of the four self-refresh reconnects in
+that session's log shows the same shape:
+
+```
+Renderer set active: True     (our JOIN_SESSION right after reconnecting)
+  ↓ (anywhere from ~1ms to several minutes later)
+Renderer set active: False
+Protocol error: code=1, message=Renderer state updated message received
+  from non active renderer
+Playback stopped                ← genuinely interrupts playback
+  ↓ (seconds to minutes later)
+Renderer set active: True       (server flips us back active again)
+```
+
+The server appears to race its own "is this renderer active" bookkeeping
+against our re-authentication: right after we rejoin, it can still
+momentarily think we're inactive, reject the very next thing we send, and
+tell us we're inactive — before catching up and reactivating us again
+shortly after. This was presumably always a latent protocol quirk, but
+harmless while reconnects were rare (only when the app itself reconnected,
+i.e. essentially never mid-listen). Self-refreshing every ~10-20 minutes
+turned it into a real interruption on almost every refresh cycle throughout
+a long session — the "sudden stop" reported here.
+
+**Fixed**: `_handle_set_active`'s `active=False` branch used to call
+`Player.stop_playback()` unconditionally. `Player.deactivate_renderer()` now
+debounces that stop by 5s (`_DEACTIVATION_GRACE_SECONDS`, matching
+`PLAYBACK_START_GRACE_PERIOD_SECONDS`'s own precedent for "a signal that's
+meaningful once it settles can still be transiently wrong right after a
+transition"); `claim_device()` (the `active=True` handler) cancels any
+pending deactivation first, so a reactivation within the grace window —
+exactly what this race produces — is a no-op instead of an audible stop. A
+genuine deactivation (a different device/session actually taking over)
+still stops, just no longer instantly.
+
+**Not yet fixed — a separate, still-open pattern spotted in the same log**:
+on two of the four reconnects, a full state resync arrived immediately
+after reconnecting — a `Seeking to <stale position>` followed by
+`Playback paused` (a real, commanded pause, not a device-side change) —
+independent of the SET_ACTIVE race above and not addressed by this fix.
+Looks like the app/server replaying a cached state snapshot on rejoin
+whose `playingState` doesn't reflect what's actually been happening in the
+meantime. Worth its own investigation if it keeps recurring — distinguish
+from a genuine user-issued pause before doing anything about it.
