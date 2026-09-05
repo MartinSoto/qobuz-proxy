@@ -32,6 +32,36 @@ class _FakeSession:
         return _RaisingPost(self._exc)
 
 
+class _FakeResponse:
+    """Async context manager standing in for an aiohttp response with a
+    fixed status/body."""
+
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self._body = body
+
+    async def __aenter__(self):  # type: ignore[no-untyped-def]
+        return self
+
+    async def __aexit__(self, *args):  # type: ignore[no-untyped-def]
+        return False
+
+    async def text(self) -> str:
+        return self._body
+
+
+class _FakeResponseSession:
+    """Minimal stand-in for aiohttp.ClientSession that always answers
+    post() with a fixed status/body — no exception, a real response."""
+
+    def __init__(self, status: int, body: str = ""):
+        self._status = status
+        self._body = body
+
+    def post(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return _FakeResponse(self._status, self._body)
+
+
 class TestSoapErrorReporting:
     async def test_timeout_logs_exception_type_and_resets_session(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -59,6 +89,70 @@ class TestSoapErrorReporting:
         assert "TimeoutError" in caplog.text
         # Session is recreated once per failed attempt so retries get a fresh socket.
         assert reset_mock.await_count == client_module.MAX_RETRIES
+
+
+class TestConsecutiveFailures:
+    """DLNAClient.consecutive_failures — what AudioBackend._poll_interval
+    reads to back its own poll cadence off a struggling device instead of
+    continuing to hammer it at the same rate (see backend.py)."""
+
+    async def _call(self, client: DLNAClient):  # type: ignore[no-untyped-def]
+        return await client._soap_action_detailed(
+            "http://1.2.3.4/ctrl", client_module.UPNP_AV_TRANSPORT, "GetTransportInfo", {}
+        )
+
+    async def test_increments_when_every_retry_is_exhausted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(client_module, "RETRY_DELAY_SECONDS", 0)
+        client = DLNAClient(ip="1.2.3.4")
+        client._session = _FakeSession(asyncio.TimeoutError())  # type: ignore[assignment]
+        # Real reset_session() would replace the fake session with a real
+        # aiohttp.ClientSession after the first failed attempt, sending
+        # later retries out over the real network — mock it out, same as
+        # TestSoapErrorReporting above, to keep every attempt hitting the
+        # fake.
+        monkeypatch.setattr(client, "reset_session", AsyncMock())
+
+        await self._call(client)
+        assert client.consecutive_failures == 1
+
+        await self._call(client)
+        assert client.consecutive_failures == 2
+
+    async def test_resets_on_a_successful_response(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(client_module, "RETRY_DELAY_SECONDS", 0)
+        client = DLNAClient(ip="1.2.3.4")
+        client._session = _FakeSession(asyncio.TimeoutError())  # type: ignore[assignment]
+        monkeypatch.setattr(client, "reset_session", AsyncMock())
+        await self._call(client)
+        assert client.consecutive_failures == 1
+
+        client._session = _FakeResponseSession(status=200, body="<ok/>")  # type: ignore[assignment]
+        result = await self._call(client)
+
+        assert result.success is True
+        assert client.consecutive_failures == 0
+
+    async def test_resets_on_a_permanent_upnp_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A device answering "Invalid Action" is still reachable and
+        healthy as far as backoff cares — only a total communication
+        failure counts."""
+        monkeypatch.setattr(client_module, "RETRY_DELAY_SECONDS", 0)
+        client = DLNAClient(ip="1.2.3.4")
+        client._session = _FakeSession(asyncio.TimeoutError())  # type: ignore[assignment]
+        monkeypatch.setattr(client, "reset_session", AsyncMock())
+        await self._call(client)
+        assert client.consecutive_failures == 1
+
+        client._session = _FakeResponseSession(  # type: ignore[assignment]
+            status=500, body="<errorCode>401</errorCode>"
+        )
+        result = await self._call(client)
+
+        assert result.success is False
+        assert result.error_code == 401
+        assert client.consecutive_failures == 0
 
 
 class _TrackedSession:

@@ -41,6 +41,22 @@ logger = logging.getLogger(__name__)
 # latency.
 STATE_POLL_INTERVAL_SECONDS = 0.5
 
+# Backing off the poll cadence itself once a device stops answering at all
+# (DLNAClient.consecutive_failures — see its own docstring), instead of
+# continuing to hammer it every STATE_POLL_INTERVAL_SECONDS regardless.
+# Observed directly: a device that starts timing out under sustained
+# polling can degrade all the way to needing a physical power cycle to
+# recover — this doesn't fix that on its own (a real fix is switching
+# transition/hijack/stop detection to GENA eventing instead of polling at
+# all), but a struggling device getting *fewer* requests while it's
+# already struggling, rather than the same rate, is a strict improvement
+# with no downside once it's healthy again (any successful call, from
+# polling or a command, resets consecutive_failures and this snaps
+# straight back to the normal cadence next cycle).
+POLL_BACKOFF_FAILURE_THRESHOLD = 3  # consecutive failures before backing off at all
+POLL_BACKOFF_MAX_INTERVAL_SECONDS = 10.0
+POLL_BACKOFF_MULTIPLIER = 2.0
+
 # While playing, how many poll cycles between hijack checks (is another
 # source now playing to this renderer instead of us — see
 # is_playing_our_content()). Costs an extra device round trip, unlike the
@@ -191,6 +207,10 @@ class DLNABackend(AudioBackend):
 
         self._client: Optional[DLNAClient] = None
         self._poll_task: Optional[asyncio.Task] = None
+        # Whether _poll_interval() is currently reporting a backed-off
+        # cadence — just so the transition either way gets logged once,
+        # not every single poll cycle while it lasts.
+        self._poll_backoff_active: bool = False
 
         self._current_metadata: Optional[BackendTrackMetadata] = None
         self._position_ms: int = 0
@@ -1050,6 +1070,44 @@ class DLNABackend(AudioBackend):
     # Internal
     # =========================================================================
 
+    def _poll_interval(self) -> float:
+        """How long to sleep before the next poll cycle — the normal
+        cadence, backed off once the device has stopped answering
+        anything at all (DLNAClient.consecutive_failures — see its own
+        docstring, and POLL_BACKOFF_FAILURE_THRESHOLD's, for why).
+        Recomputed fresh from the client's own persistent counter every
+        time this is called rather than tracked as loop state, so it's
+        correct regardless of which of _poll_state_loop's many `continue`
+        paths ran last cycle. Snaps straight back to the base cadence the
+        moment any SOAP call succeeds again, from polling or a command.
+
+        Never raises: this runs before this loop's own first `await` each
+        cycle, so an exception here (e.g. a test double standing in for
+        the client with no real consecutive_failures int) would skip
+        straight past `asyncio.sleep` into the loop's `except` handler
+        with no `await` in between — a synchronous busy-loop starving the
+        whole event loop, not just this backend, observed directly."""
+        failures = getattr(self._client, "consecutive_failures", 0) if self._client else 0
+        if not isinstance(failures, int):
+            failures = 0
+        backed_off = failures >= POLL_BACKOFF_FAILURE_THRESHOLD
+        if backed_off != getattr(self, "_poll_backoff_active", False):
+            self._poll_backoff_active = backed_off
+            if backed_off:
+                logger.warning(
+                    f"[{self.name}] {failures} consecutive unreachable polls — "
+                    "backing off poll cadence until it answers again"
+                )
+            else:
+                logger.info(f"[{self.name}] Device reachable again — resuming normal poll cadence")
+        if not backed_off:
+            return STATE_POLL_INTERVAL_SECONDS
+        backoff_steps = failures - POLL_BACKOFF_FAILURE_THRESHOLD + 1
+        return min(
+            STATE_POLL_INTERVAL_SECONDS * (POLL_BACKOFF_MULTIPLIER**backoff_steps),
+            POLL_BACKOFF_MAX_INTERVAL_SECONDS,
+        )
+
     async def _poll_state_loop(self) -> None:
         """Poll device state periodically.
 
@@ -1062,7 +1120,7 @@ class DLNABackend(AudioBackend):
         """
         while self._is_connected:
             try:
-                await asyncio.sleep(STATE_POLL_INTERVAL_SECONDS)
+                await asyncio.sleep(self._poll_interval())
 
                 if not self._is_connected:
                     break
@@ -1366,6 +1424,15 @@ class DLNABackend(AudioBackend):
                 break
             except Exception as e:
                 logger.debug(f"State poll error: {e}")
+                # An exception raised before this iteration's own sleep
+                # (e.g. inside _poll_interval()) would otherwise skip
+                # straight here with no `await` in between — a
+                # synchronous busy-loop starving the whole event loop for
+                # every backend, not just this one, until something
+                # external cancels the task. Guarantee a real yield point
+                # every iteration regardless of where in the loop body an
+                # exception came from.
+                await asyncio.sleep(STATE_POLL_INTERVAL_SECONDS)
 
     def _build_didl(
         self,

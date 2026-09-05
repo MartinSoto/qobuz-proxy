@@ -105,6 +105,16 @@ class DLNAClient:
         # Guards reset_session() against overlapping resets — see its own
         # docstring for the leak this prevents.
         self._session_reset_lock = asyncio.Lock()
+        # How many SOAP actions in a row have failed to reach the device at
+        # all (exhausted every retry) — reset to 0 by any action that gets
+        # a real response, success or not (a device answering "Invalid
+        # Action" is still a reachable, healthy device). AudioBackend's
+        # poll loop reads this to back off its own cadence while a device
+        # is struggling instead of continuing to hammer it — see
+        # docs/gapless-arming-and-token-expiry.md's device-dropout section
+        # for a device wedged solid enough to need a power cycle after a
+        # sustained run of these.
+        self.consecutive_failures: int = 0
 
     async def connect(self) -> DLNADeviceInfo:
         """
@@ -744,6 +754,7 @@ class DLNAClient:
             try:
                 async with session.post(url, data=envelope, headers=headers) as response:
                     if response.status == 200:
+                        self.consecutive_failures = 0
                         return SoapResult(success=True, body=await response.text())
                     else:
                         text = await response.text()
@@ -761,8 +772,11 @@ class DLNAClient:
                             logger.warning(
                                 f"UPnP error: code={error_code_str}, description={error_desc}"
                             )
-                        # Don't retry permanent failures
+                        # Don't retry permanent failures — the device
+                        # answered, it just doesn't support this action, so
+                        # it's reachable/healthy as far as backoff cares.
                         if last_error_code in (401, 602):
+                            self.consecutive_failures = 0
                             return SoapResult(
                                 success=False,
                                 error_code=last_error_code,
@@ -789,6 +803,10 @@ class DLNAClient:
             logger.error(f"SOAP {action} failed after {retries} attempts: {last_error}")
         else:
             logger.warning(f"SOAP {action} failed: {last_error}")
+        # Every retry exhausted without a real response — the device wasn't
+        # reachable at all this time, not just uncooperative about this one
+        # action. See consecutive_failures' own docstring.
+        self.consecutive_failures += 1
         return SoapResult(
             success=False,
             error_code=last_error_code,

@@ -5,7 +5,12 @@ import asyncio
 import pytest
 
 from qobuz_proxy.backends.types import BackendTrackMetadata, PlaybackState
-from qobuz_proxy.backends.dlna.backend import DLNABackend
+from qobuz_proxy.backends.dlna.backend import (
+    POLL_BACKOFF_FAILURE_THRESHOLD,
+    POLL_BACKOFF_MAX_INTERVAL_SECONDS,
+    STATE_POLL_INTERVAL_SECONDS,
+    DLNABackend,
+)
 
 
 def _make_backend() -> DLNABackend:
@@ -1358,6 +1363,92 @@ class TestPollStateLoop:
 
         callback.assert_not_called()
         assert backend._unconfirmed_stop_polls == 0
+
+
+class TestPollInterval:
+    """_poll_interval() — backs the poll loop's own cadence off once the
+    device stops answering at all (DLNAClient.consecutive_failures), so a
+    struggling device gets fewer requests instead of the same hammering
+    rate. Regression coverage for a real hang this introduced: an
+    exception raised here runs before this loop iteration's own
+    `asyncio.sleep`, so it used to skip straight to the loop's `except`
+    handler with no `await` in between — a synchronous busy-loop that
+    froze the whole event loop, hit by every _client mock in this file
+    that isn't a real DLNAClient (consecutive_failures compared against
+    an int raises on a bare Mock) and by every backend built via
+    DLNABackend.__new__ (no _poll_backoff_active — __init__ never ran)."""
+
+    def _backend(self, consecutive_failures: int = 0) -> DLNABackend:
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend.__new__(DLNABackend)
+        backend.name = "Test Speaker"
+        backend._poll_backoff_active = False
+        backend._client = AsyncMock()
+        backend._client.consecutive_failures = consecutive_failures
+        return backend
+
+    def test_base_cadence_when_healthy(self) -> None:
+        backend = self._backend(consecutive_failures=0)
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_base_cadence_stays_below_threshold(self) -> None:
+        backend = self._backend(consecutive_failures=POLL_BACKOFF_FAILURE_THRESHOLD - 1)
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_backs_off_at_threshold(self) -> None:
+        backend = self._backend(consecutive_failures=POLL_BACKOFF_FAILURE_THRESHOLD)
+        assert backend._poll_interval() > STATE_POLL_INTERVAL_SECONDS
+
+    def test_backoff_grows_with_more_failures(self) -> None:
+        backend = self._backend(consecutive_failures=POLL_BACKOFF_FAILURE_THRESHOLD)
+        first = backend._poll_interval()
+        backend._client.consecutive_failures += 3
+        assert backend._poll_interval() > first
+
+    def test_backoff_caps_at_the_max(self) -> None:
+        backend = self._backend(consecutive_failures=POLL_BACKOFF_FAILURE_THRESHOLD + 100)
+        assert backend._poll_interval() == POLL_BACKOFF_MAX_INTERVAL_SECONDS
+
+    def test_snaps_back_to_base_once_healthy_again(self) -> None:
+        backend = self._backend(consecutive_failures=POLL_BACKOFF_FAILURE_THRESHOLD + 5)
+        assert backend._poll_interval() > STATE_POLL_INTERVAL_SECONDS
+        backend._client.consecutive_failures = 0
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_no_client_is_treated_as_healthy(self) -> None:
+        backend = self._backend()
+        backend._client = None
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_never_raises_when_the_client_is_a_bare_mock(self) -> None:
+        """The exact regression: AsyncMock().consecutive_failures is
+        itself a Mock, and comparing a Mock to an int with >= raises
+        TypeError — every _client = AsyncMock() in this file (no
+        consecutive_failures override) hit this before the fix."""
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend.__new__(DLNABackend)
+        backend.name = "Test Speaker"
+        backend._poll_backoff_active = False
+        backend._client = AsyncMock()  # consecutive_failures is an unconfigured Mock
+
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_never_raises_when_poll_backoff_active_was_never_initialized(self) -> None:
+        """The other half of the regression: a backend built via __new__
+        (as every test in this file does) never ran __init__, so
+        _poll_backoff_active doesn't exist as an instance attribute at
+        all until _poll_interval() itself sets it."""
+        from unittest.mock import AsyncMock
+
+        backend = DLNABackend.__new__(DLNABackend)
+        backend.name = "Test Speaker"
+        backend._client = AsyncMock()
+        backend._client.consecutive_failures = 0
+        assert not hasattr(backend, "_poll_backoff_active")
+
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
 
 
 class TestSeekConfirmation:
