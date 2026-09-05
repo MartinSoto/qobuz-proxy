@@ -306,3 +306,57 @@ Calls an unofficial Qobuz endpoint on a recurring basis (every ~9 minutes at
 the observed token lifetime) — worth watching whether it holds up over a
 longer stretch, but the mechanism is a straight port of what the reference
 device itself already does continuously.
+
+## A second, unrelated device-wedge incident right after this fix shipped
+
+Reported directly (2026-09-05): shortly after the token self-refresh above
+was deployed, playback stuttered then stopped, and the speaker (`Sala`, a
+Sonos Five this time — a different room/model than the earlier `Cocina`
+incident) was bad enough afterward that a physical power cycle was needed
+to recover at all. Checked first because of the timing, but the log ruled
+out the fix above directly: the WS control token never even got close to
+expiring in that session (playback had only been running ~5 minutes, well
+under the ~9-11 min observed token lifetime), and `Refreshed WebSocket token
+directly from Qobuz API` never appears — that code path never ran.
+
+What the log actually showed: two isolated `SOAP GetTransportInfo` timeouts
+(each recovered on retry) over about 2.5 minutes, then the device dropped
+out of the household topology entirely and got rediscovered — and then kept
+cycling every ~10 minutes for the rest of the session. No `Unclosed client
+session` errors this time (the earlier `reset_session` race fix — see
+"Not this" above — is holding), so this is a *different* mechanism able to
+degrade a device the same way. No single smoking-gun root cause this time;
+it looks like sustained 0.5s-interval polling is simply too much for some
+real hardware over a long enough session, independent of any specific logic
+bug.
+
+**Mitigation implemented**: `DLNAClient.consecutive_failures` (client.py)
+now tracks consecutive total communication failures (every retry
+exhausted, not just an uncooperative-but-reachable device answering with a
+permanent UPnP error); `AudioBackend._poll_interval` (backend.py) backs the
+poll loop's own cadence off once that crosses a threshold, capped, snapping
+straight back the moment anything succeeds again. This doesn't fix the
+underlying tendency for hardware to wedge under continuous polling — it
+just means a struggling device gets fewer requests while it's already
+struggling instead of the same rate. **The real fix, not yet implemented**:
+switch transition/hijack/stop detection from polling to GENA eventing
+(subscribe to `AVTransport`'s event channel and react to device-pushed
+NOTIFYs), the same approach this codebase already uses for Sonos household
+topology (`dlna/sonos/events.py`) — discussed and deliberately deferred as a
+separate, larger piece of work rather than rushed alongside an active
+production issue. Position tracking would likely still need some polling
+(position isn't normally part of `AVTransport`'s evented state), just at a
+much more relaxed interval, decoupled from transition/hijack detection.
+
+Also fixed in the same pass: adding the backoff logic surfaced a real
+pre-existing hazard in `_poll_state_loop` — an exception raised before the
+loop's own `asyncio.sleep` call (which is exactly what a bare-Mock
+`_client.consecutive_failures` comparison, or reading a backoff flag never
+set on a `DLNABackend` built via `__new__`, both do) skipped straight to
+the `except` handler with **no `await` in between**: a synchronous
+busy-loop starving the entire event loop, not just this backend, until
+something external cancelled the task. Hit immediately by the existing test
+suite. Fixed by making `_poll_interval()` defensive and by always awaiting
+a sleep in the loop's `except Exception` branch too, so no future exception
+source (from this change or otherwise) can reintroduce the same failure
+mode.
