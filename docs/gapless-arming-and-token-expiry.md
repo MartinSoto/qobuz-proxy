@@ -15,6 +15,41 @@ token's short lifetime (~5-10 min observed): once nothing has interacted
 with the app for a while, it seemingly stops proactively refreshing the
 token, and the control WebSocket falls dark until the app is touched again.
 
+## Not this: a same-day disconnection that was actually a device dropout
+
+A disconnection reported live on 2026-09-05 (~08:19, `Cocina` room) looked
+identical at a glance (`Track ended naturally` mid-playlist) but turned out
+to be **unrelated to this doc's theory** — worth recording so a future
+"it disconnected again" report gets checked against the right cause first:
+
+- `08:08:51` — WS token expired (as usual) — coincidental timing, turned out
+  irrelevant to what follows.
+- `08:18:11`-`08:19:33` — every SOAP call to the physical Sonos device
+  itself (`GetTransportInfo`/`GetPositionInfo`) starts failing:
+  `TimeoutError` then `ClientConnectorError: Cannot connect to host
+  192.168.68.54:1400`. This is LAN reachability to the speaker, not the
+  control WebSocket to Qobuz.
+- `08:19:33` — STOPPED-confirmation fires, `Track ended naturally`, tries to
+  auto-advance to the already-armed next track — but every subsequent SOAP
+  call keeps failing the same way for another 13 minutes, because the
+  device is still unreachable.
+- `08:20:16` — Sonos's own topology discovery confirms the device is
+  genuinely gone (missing from the printed household topology entirely, not
+  just slow to answer HTTP) — a real Wi-Fi/network dropout of that specific
+  speaker.
+- `08:20:26`-`08:20:47` — clean teardown and rediscovery: the speaker gets
+  removed, and the household's other rooms come back at new DHCP-assigned
+  IPs shortly after.
+
+The `Gapless: no next-track info` warning never appears anywhere near this
+incident — confirming it's a different failure mode (a physical device
+dropping off the network) than the WS-control-token theory this doc tracks.
+Existing device-departure handling did the right thing (detected sustained
+unreachability, gave up cleanly, tore the speaker down, let the others
+rediscover at their new addresses); whether the dropped room resumes
+playback cleanly once it reappears is still open — not confirmed either way
+yet.
+
 ## Field update (2026-09-05, ~10h container log)
 
 The new warning does fire — 13 times in one overnight run — but it turns out
