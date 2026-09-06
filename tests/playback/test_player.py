@@ -2,6 +2,7 @@
 
 import asyncio
 import functools
+import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -320,6 +321,59 @@ class TestContextUuidPropagation:
 
         assert player._current_track.context_uuid == live_ctx
         reporter.update_context.assert_not_called()
+
+    async def test_small_gap_pause_right_after_reconnect_is_treated_as_stale(self):
+        """A fast WS reconnect (the token self-refresh) leaves the app's
+        cached position barely stale at all — the position-gap threshold
+        alone wouldn't catch this (observed directly in production: a
+        genuine spurious-pause replay with only a ~300ms-old snapshot).
+        claim_device() having run moments ago is what makes even a tiny
+        gap suspect."""
+        player, backend = _make_player()
+        backend.pause = AsyncMock(return_value=True)
+
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
+        player._state = PlaybackState.PLAYING
+        player._position_value_ms = 52_500
+        # "Now", not 0 — this test needs a genuinely small gap; a
+        # timestamp of 0 (the epoch) makes current_position_ms interpolate
+        # forward by the entire elapsed wall-clock time since 1970.
+        player._position_timestamp_ms = int(time.time() * 1000)
+        player._last_activated_at = time.monotonic()  # claim_device() "just now"
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=52_373,  # ~127ms behind — nowhere near _STALE_SNAPSHOT_THRESHOLD_MS
+            playing_state=3,  # PAUSED
+        )
+
+        assert player._state == PlaybackState.PLAYING
+        backend.pause.assert_not_called()
+
+    async def test_same_small_gap_long_after_reconnect_is_a_real_pause(self):
+        """The same small gap, without a recent reconnect, is a genuine
+        pause and must still go through — this fix only distrusts a
+        near-current-position pause right after claim_device(), not
+        small gaps in general."""
+        player, backend = _make_player()
+        backend.pause = AsyncMock(return_value=True)
+
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222")
+        player._state = PlaybackState.PLAYING
+        player._position_value_ms = 52_500
+        player._position_timestamp_ms = int(time.time() * 1000)
+        # _last_activated_at defaults to 0.0 — "long ago"
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=52_373,
+            playing_state=3,  # PAUSED
+        )
+
+        assert player._state == PlaybackState.PAUSED
+        backend.pause.assert_awaited_once()
 
     async def test_next_track_context_change_triggers_rearm(self):
         """A changed next-track context must re-arm gapless, not no-op."""

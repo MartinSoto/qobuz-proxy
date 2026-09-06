@@ -38,7 +38,27 @@ _HANDOFF_POSITION_THRESHOLD_MS = 5000
 # If the renderer is actually still playing further along the same track, treat
 # that as a stale replay and ignore the pause/seek. This is the minimum gap
 # (renderer ahead of server) at which we suppress.
+#
+# Calibrated for a WS that had been down for a while before reconnecting
+# (a gap of minutes) — too generous now that the control token
+# self-refreshes on its own (see docs/gapless-arming-and-token-expiry.md)
+# and reconnects in well under a second: the app's cached position is
+# barely stale at all, so the gap this catches on its own can be a lot
+# smaller than 5s and still be exactly the same replay (observed
+# directly: a genuine spurious pause with a ~300ms-old snapshot,
+# nowhere near this threshold). _RECONNECT_STALE_GRACE_SECONDS below
+# covers that case by time instead of position gap.
 _STALE_SNAPSHOT_THRESHOLD_MS = 5000
+
+# However small the position gap, a PAUSED-at-current-track SET_STATE
+# arriving this soon after our own last claim_device() (SET_ACTIVE(true),
+# i.e. a reconnect) is still almost certainly the same stale-replay
+# phenomenon _STALE_SNAPSHOT_THRESHOLD_MS exists for, just too recent a
+# reconnect for the position to have drifted far. Same order of magnitude
+# as PLAYBACK_START_GRACE_PERIOD_SECONDS/_DEACTIVATION_GRACE_SECONDS for
+# the same underlying reason — a signal can be transiently wrong right
+# after a transition even once it's normally trustworthy.
+_RECONNECT_STALE_GRACE_SECONDS = 5.0
 
 # How long the command queue's consumer waits for the backend to become
 # attached again (see set_backend_attached()) before dispatching a
@@ -158,6 +178,11 @@ class QobuzPlayer:
         # A pending, debounced stop from deactivate_renderer() — see its
         # own docstring. None whenever nothing is currently scheduled.
         self._pending_deactivation_task: Optional[asyncio.Task] = None
+        # When claim_device() (SET_ACTIVE(true)) last ran — see
+        # _is_stale_pause_snapshot_locked's use of this. 0.0 is
+        # deliberately "long ago" relative to any real time.monotonic()
+        # reading, never mistaken for "just now".
+        self._last_activated_at: float = 0.0
 
         # Whether the backend is currently reachable — see
         # set_backend_attached(). True for the vast majority of backends,
@@ -608,6 +633,10 @@ class QobuzPlayer:
         ever meant to guard.
         """
         self._cancel_pending_deactivation()
+        # Marks "we just (re)joined as active" for _is_stale_pause_snapshot_locked —
+        # see its own docstring for why a reconnect this recent makes even a
+        # *small* position gap suspect.
+        self._last_activated_at = time.monotonic()
         if self._current_track is not None and self._state != PlaybackState.STOPPED:
             logger.debug("claim_device: already have active content of our own, not stopping it")
             return
@@ -1008,12 +1037,15 @@ class QobuzPlayer:
         Must be called from within ``apply_remote_state``'s own command-queue
         item so the live player state it reads is consistent with the
         surrounding mutation (nothing else can run concurrently with a
-        queued item — see Player.enqueue()). Returns True when ALL of:
-          - server says PAUSED
-          - renderer is still PLAYING
-          - it's the same track the renderer is on
-          - server position is more than _STALE_SNAPSHOT_THRESHOLD_MS behind the
-            renderer's actual position
+        queued item — see Player.enqueue()). Returns True when server says
+        PAUSED, the renderer is actually still PLAYING the same track, and
+        EITHER:
+          - server position is more than _STALE_SNAPSHOT_THRESHOLD_MS behind
+            the renderer's actual position (a slow reconnect — the app's
+            cached position had a while to fall behind), or
+          - we (re)claimed active status less than
+            _RECONNECT_STALE_GRACE_SECONDS ago (a fast reconnect — barely
+            any gap yet, but still the same replay).
         """
         if playing_state != 3:
             return False
@@ -1028,16 +1060,20 @@ class QobuzPlayer:
 
         actual_pos = self.current_position_ms
         gap_ms = actual_pos - position_ms
-        if gap_ms <= _STALE_SNAPSHOT_THRESHOLD_MS:
+        just_reconnected = (
+            time.monotonic() - self._last_activated_at < _RECONNECT_STALE_GRACE_SECONDS
+        )
+        if gap_ms <= _STALE_SNAPSHOT_THRESHOLD_MS and not just_reconnected:
             return False
 
         logger.info(
             "Ignoring stale SET_STATE: server says PAUSED at %dms, renderer is "
-            "PLAYING at %dms (%.1fs ahead) on same track — likely a session-"
+            "PLAYING at %dms (%.1fs ahead%s) on same track — likely a session-"
             "restore replay after WebSocket reconnect; keeping playback.",
             position_ms,
             actual_pos,
             gap_ms / 1000.0,
+            ", just reconnected" if just_reconnected else "",
         )
         return True
 
