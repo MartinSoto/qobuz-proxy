@@ -60,6 +60,16 @@ _STALE_SNAPSHOT_THRESHOLD_MS = 5000
 # after a transition even once it's normally trustworthy.
 _RECONNECT_STALE_GRACE_SECONDS = 5.0
 
+# How long playback can sit PAUSED or STOPPED before it's no longer worth
+# proactively keeping the control WebSocket alive for (see
+# is_worth_keeping_ws_alive(), queried by WsManager's own self-refresh —
+# docs/gapless-arming-and-token-expiry.md). Deliberately generous: this
+# only ever lets an *idle* session's WS lapse naturally (falling back to
+# the pre-self-refresh behavior of waiting for the app) rather than
+# refreshing forever in the background with nobody listening — a normal
+# listening pause (stepped away, a phone call) must never trip this.
+_WS_IDLE_TIMEOUT_SECONDS = 3600.0
+
 # How long the command queue's consumer waits for the backend to become
 # attached again (see set_backend_attached()) before dispatching a
 # playback-directing item anyway. Mirrors DLNABackend's own
@@ -183,6 +193,10 @@ class QobuzPlayer:
         # deliberately "long ago" relative to any real time.monotonic()
         # reading, never mistaken for "just now".
         self._last_activated_at: float = 0.0
+
+        # When the state last left PLAYING (PAUSED or STOPPED), or None while
+        # actually PLAYING — see is_worth_keeping_ws_alive().
+        self._non_playing_since: Optional[float] = None
 
         # Whether the backend is currently reachable — see
         # set_backend_attached(). True for the vast majority of backends,
@@ -680,6 +694,29 @@ class QobuzPlayer:
         if task is not None and not task.done():
             task.cancel()
         self._pending_deactivation_task = None
+
+    def is_worth_keeping_ws_alive(self) -> bool:
+        """Whether the control WebSocket is currently worth proactively
+        keeping alive via self-refresh — polled periodically by WsManager
+        (see WsManager._refresh_token_from_api,
+        docs/gapless-arming-and-token-expiry.md).
+
+        PLAYING always counts. PAUSED/STOPPED count too, but only for up to
+        _WS_IDLE_TIMEOUT_SECONDS of continuous non-playing time — genuinely
+        idle (nobody's about to resume) shouldn't keep refreshing a session
+        forever in the background. Once that grace runs out we simply stop
+        renewing and let the current token lapse naturally, exactly like
+        before self-refresh existed; a resume from either side (the app, or
+        the device's own controls — see _handle_unprompted_state_change)
+        flips the state back to PLAYING and this starts counting again from
+        scratch.
+        """
+        if self._state == PlaybackState.PLAYING:
+            self._non_playing_since = None
+            return True
+        if self._non_playing_since is None:
+            self._non_playing_since = time.monotonic()
+        return time.monotonic() - self._non_playing_since < _WS_IDLE_TIMEOUT_SECONDS
 
     # =========================================================================
     # Seek Control

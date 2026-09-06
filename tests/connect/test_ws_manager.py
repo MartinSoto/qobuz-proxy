@@ -247,6 +247,48 @@ class TestSelfRefreshWsToken:
         assert ws_manager._ws_token is not None
         assert ws_manager._ws_token.jwt == "self-refreshed"
 
+    async def test_not_worth_keeping_alive_skips_the_refresh(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        """See Player.is_worth_keeping_ws_alive — a long-idle session must
+        stop self-renewing and let its token lapse naturally instead of
+        refreshing forever with nobody listening."""
+        api_client = AsyncMock()
+        api_client.get_ws_token = AsyncMock(
+            return_value={"jwt": "self-refreshed", "exp": 9999999999, "endpoint": "wss://x/ws"}
+        )
+        ws_manager = WsManager(config, api_client=api_client, is_worth_keeping_alive=lambda: False)
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await ws_manager._refresh_token_from_api(buffer_s=60) is False
+        api_client.get_ws_token.assert_not_awaited()
+
+    async def test_worth_keeping_alive_still_refreshes(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        api_client = AsyncMock()
+        api_client.get_ws_token = AsyncMock(
+            return_value={"jwt": "self-refreshed", "exp": 9999999999, "endpoint": "wss://x/ws"}
+        )
+        ws_manager = WsManager(config, api_client=api_client, is_worth_keeping_alive=lambda: True)
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await ws_manager._refresh_token_from_api(buffer_s=60) is True
+
+    async def test_no_callback_keeps_refreshing_as_before(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        """None (the default — no policy wired up, e.g. most existing
+        tests) must keep the pre-existing always-refresh behavior."""
+        api_client = AsyncMock()
+        api_client.get_ws_token = AsyncMock(
+            return_value={"jwt": "self-refreshed", "exp": 9999999999, "endpoint": "wss://x/ws"}
+        )
+        ws_manager = WsManager(config, api_client=api_client)
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await ws_manager._refresh_token_from_api(buffer_s=60) is True
+
 
 class TestForceReconnect:
     """force_reconnect() — used when a renderer detects an external

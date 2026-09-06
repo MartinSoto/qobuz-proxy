@@ -6,6 +6,9 @@ import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+import qobuz_proxy.playback.player as player_module
 from qobuz_proxy.backends import PlaybackState, PlayResult
 from qobuz_proxy.playback.player import QobuzPlayer
 from qobuz_proxy.playback.queue import QueueTrack, RepeatMode
@@ -563,3 +566,78 @@ class TestRepeatOneNaturalEnd:
 
         # The repeat-one restart was coalesced away — never ran.
         backend.play.assert_not_awaited()
+
+
+class TestIsWorthKeepingWsAlive:
+    """Player.is_worth_keeping_ws_alive() — queried by WsManager's own
+    self-refresh (see docs/gapless-arming-and-token-expiry.md) to decide
+    whether a long-idle Connect session's WS token is still worth
+    proactively renewing, or should simply be left to lapse."""
+
+    def test_playing_is_always_worth_it(self) -> None:
+        player, _backend = _make_player()
+        player._state = PlaybackState.PLAYING
+
+        assert player.is_worth_keeping_ws_alive() is True
+
+    def test_playing_resets_the_non_playing_clock(self) -> None:
+        player, _backend = _make_player()
+        player._non_playing_since = time.monotonic() - 10_000
+        player._state = PlaybackState.PLAYING
+
+        player.is_worth_keeping_ws_alive()
+
+        assert player._non_playing_since is None
+
+    def test_freshly_paused_is_still_worth_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(player_module, "_WS_IDLE_TIMEOUT_SECONDS", 3600.0)
+        player, _backend = _make_player()
+        player._state = PlaybackState.PAUSED
+
+        assert player.is_worth_keeping_ws_alive() is True
+        assert player._non_playing_since is not None
+
+    def test_freshly_stopped_is_still_worth_it(self) -> None:
+        player, _backend = _make_player()
+        player._state = PlaybackState.STOPPED
+
+        assert player.is_worth_keeping_ws_alive() is True
+
+    def test_paused_past_the_idle_timeout_is_not_worth_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(player_module, "_WS_IDLE_TIMEOUT_SECONDS", 60.0)
+        player, _backend = _make_player()
+        player._state = PlaybackState.PAUSED
+        player._non_playing_since = time.monotonic() - 61.0
+
+        assert player.is_worth_keeping_ws_alive() is False
+
+    def test_stopped_past_the_idle_timeout_is_not_worth_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(player_module, "_WS_IDLE_TIMEOUT_SECONDS", 60.0)
+        player, _backend = _make_player()
+        player._state = PlaybackState.STOPPED
+        player._non_playing_since = time.monotonic() - 61.0
+
+        assert player.is_worth_keeping_ws_alive() is False
+
+    def test_resuming_after_idling_out_counts_as_worth_it_again(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A resume — from either side, see _handle_unprompted_state_change
+        for the device-initiated case — must restart the idle clock from
+        scratch rather than staying permanently "timed out"."""
+        monkeypatch.setattr(player_module, "_WS_IDLE_TIMEOUT_SECONDS", 60.0)
+        player, _backend = _make_player()
+        player._state = PlaybackState.STOPPED
+        player._non_playing_since = time.monotonic() - 61.0
+        assert player.is_worth_keeping_ws_alive() is False
+
+        player._state = PlaybackState.PLAYING
+        assert player.is_worth_keeping_ws_alive() is True
+
+        player._state = PlaybackState.PAUSED
+        assert player.is_worth_keeping_ws_alive() is True
+        assert player._non_playing_since is not None

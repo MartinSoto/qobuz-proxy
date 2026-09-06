@@ -58,7 +58,12 @@ class WsManager:
     - Routing incoming messages to registered handlers
     """
 
-    def __init__(self, config: Config, api_client: Optional["QobuzAPIClient"] = None):
+    def __init__(
+        self,
+        config: Config,
+        api_client: Optional["QobuzAPIClient"] = None,
+        is_worth_keeping_alive: Optional[Callable[[], bool]] = None,
+    ):
         """
         Initialize WebSocket manager.
 
@@ -70,9 +75,17 @@ class WsManager:
                 the phone app to reconnect and push a new one. None (e.g.
                 in tests) simply disables that and falls back to the old
                 app-only behavior.
+            is_worth_keeping_alive: Queried before every self-refresh (see
+                _refresh_token_from_api) — lets the caller (Player, via
+                is_worth_keeping_ws_alive) say "don't bother, nothing's
+                listening right now" so a long-idle session's token lapses
+                naturally instead of being kept alive forever in the
+                background. None (e.g. in tests, or when no such policy is
+                wired up) always keeps refreshing, matching prior behavior.
         """
         self.config = config
         self._api_client = api_client
+        self._is_worth_keeping_alive = is_worth_keeping_alive
         self._device_uuid = self._uuid_to_bytes(config.device.uuid)
         self._codec = ProtocolCodec(self._device_uuid)
 
@@ -668,8 +681,15 @@ class WsManager:
         is still something only the app can hand us; this only ever
         replaces the *token*, keeping that same session alive indefinitely
         instead of needing the app to reconnect every time it expires.
+
+        Also skipped outright when is_worth_keeping_alive says nothing's
+        actually listening right now (see __init__) — we simply don't
+        renew, letting the current token lapse on its own rather than
+        holding the Connect session open forever in the background.
         """
         if self._api_client is None or self._session_uuid is None:
+            return False
+        if self._is_worth_keeping_alive is not None and not self._is_worth_keeping_alive():
             return False
 
         previous_jwt = self._ws_token.jwt if self._ws_token else ""
