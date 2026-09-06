@@ -409,12 +409,26 @@ exactly what this race produces — is a no-op instead of an audible stop. A
 genuine deactivation (a different device/session actually taking over)
 still stops, just no longer instantly.
 
-**Not yet fixed — a separate, still-open pattern spotted in the same log**:
-on two of the four reconnects, a full state resync arrived immediately
-after reconnecting — a `Seeking to <stale position>` followed by
-`Playback paused` (a real, commanded pause, not a device-side change) —
-independent of the SET_ACTIVE race above and not addressed by this fix.
-Looks like the app/server replaying a cached state snapshot on rejoin
-whose `playingState` doesn't reflect what's actually been happening in the
-meantime. Worth its own investigation if it keeps recurring — distinguish
-from a genuine user-issued pause before doing anything about it.
+**Now also fixed (2026-09-06)**: the "still open" pattern flagged above —
+a full state resync (`Seeking to <stale position>` then a genuine
+`Playback paused`) immediately after reconnecting — was reported recurring
+directly: playback "just stops" mid-track with no other symptom, and
+tapping play resumes from the exact same position (the signature of a
+real pause, not a track change or connection loss). Root cause: a
+purpose-built defense already existed for this
+(`_is_stale_pause_snapshot_locked`, ignores a replayed PAUSED snapshot
+when the renderer is confirmed still playing further along) but only
+triggered when the position gap exceeded `_STALE_SNAPSHOT_THRESHOLD_MS`
+(5s) — calibrated for the old world where a reconnect could follow
+minutes of WS downtime. With reconnects now taking well under a second,
+the app's cached position is barely stale — confirmed directly, one
+occurrence arrived with only a ~300ms-old snapshot, nowhere near 5s, so
+the guard never fired.
+
+Fixed: `claim_device()` (every `SET_ACTIVE(true)`, i.e. every reconnect)
+now records when it last ran; `_is_stale_pause_snapshot_locked` treats a
+PAUSED snapshot on the current track as stale if *either* the position
+gap is large (the original check) *or* we reconnected within the last
+`_RECONNECT_STALE_GRACE_SECONDS` (5s) — catching the fast-reconnect case
+directly by the thing we actually know (we just reconnected) instead of
+only inferring it from a gap that no longer reliably forms in time.
