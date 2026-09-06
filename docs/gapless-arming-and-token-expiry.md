@@ -432,3 +432,35 @@ gap is large (the original check) *or* we reconnected within the last
 `_RECONNECT_STALE_GRACE_SECONDS` (5s) — catching the fast-reconnect case
 directly by the thing we actually know (we just reconnected) instead of
 only inferring it from a gap that no longer reliably forms in time.
+
+## Letting the WS session idle out on its own (2026-09-06)
+
+Self-refresh above was deliberately unconditional: it keeps the Connect
+session alive indefinitely as long as the process runs, even through a
+full night with nothing playing — reported directly ("I left the proxy
+running overnight and this morning, the app was still connected and ready
+to play. Nice thing, but I wonder if it's just too much."). Harmless
+(the app just sees a device that's always ready), but not something worth
+doing forever with genuinely nobody listening — it's still relying on us,
+rather than the phone's own OS, to keep a background connection alive.
+
+Fixed: `Player.is_worth_keeping_ws_alive()` tracks how long playback has
+been continuously `PAUSED` or `STOPPED` (`_non_playing_since`); `PLAYING`
+always resets it. `WsManager` is handed this as a callback
+(`is_worth_keeping_alive`, wired up in `speaker.py`) and checks it at the
+top of `_refresh_token_from_api()` — once idle time passes
+`_WS_IDLE_TIMEOUT_SECONDS` (1 hour), it simply stops attempting the
+refresh and the current token is left to lapse naturally, exactly the
+pre-self-refresh behavior, just deferred an hour instead of triggering
+immediately on the first pause.
+
+This deliberately never force-disconnects anything — it only withholds a
+renewal that would otherwise happen automatically. A resume from either
+side revives it: from the app, normally; from the device's own controls
+(e.g. pressing Play directly on a Sonos speaker after the WS session has
+already lapsed), `_handle_unprompted_state_change` already flips
+`Player`'s state back to `PLAYING` on any device-reported transition into
+playback regardless of who asked for it, which is exactly the signal
+`is_worth_keeping_ws_alive()` reads — no separate wiring needed for the
+device-initiated case, it falls out of machinery that already existed for
+an unrelated reason (recovering from a transient unprompted pause/stop).
