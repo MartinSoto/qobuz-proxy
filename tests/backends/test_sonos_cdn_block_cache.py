@@ -346,18 +346,45 @@ class TestConnectionReuse:
         assert server.get_ranges == [0, 128]
         await cache.close()
 
-    async def test_only_one_connection_is_kept_across_tracks(self, cdn):
+    async def test_two_tracks_each_keep_their_own_connection(self, cdn):
+        """Gapless pre-buffering routinely means the current track and the
+        armed next one are both being actively read at once — up to
+        max_open_connections (2 by default) must each keep their own
+        reusable connection instead of the second track's activity
+        evicting the first's."""
         server, url = cdn
         cache = CDNBlockCache(resolver=_resolver_for(url), block_size=64)
 
         await cache.read_block("42", FORMAT_ID, 0)
-        await cache.read_block("43", FORMAT_ID, 0)  # different track -> new connection
+        await cache.read_block("43", FORMAT_ID, 0)  # a second, distinct track
         server.get_ranges.clear()
-        # Whatever was kept for "42" is gone now — block 1 of "42" is no
-        # longer contiguous with anything open, so it needs its own GET.
+        # Both connections are still there — reading the next block of
+        # *either* track reuses its own, no fresh GET needed for either.
         await cache.read_block("42", FORMAT_ID, 1)
+        await cache.read_block("43", FORMAT_ID, 1)
 
+        assert server.get_ranges == []
+        await cache.close()
+
+    async def test_a_third_track_evicts_the_least_recently_used_connection(self, cdn):
+        server, url = cdn
+        cache = CDNBlockCache(resolver=_resolver_for(url), block_size=64)
+
+        await cache.read_block("42", FORMAT_ID, 0)
+        await cache.read_block("43", FORMAT_ID, 0)
+        await cache.read_block("44", FORMAT_ID, 0)  # a third distinct track — over the cap
+        server.get_ranges.clear()
+
+        # "44" (most recently added) still reuses its own connection...
+        await cache.read_block("44", FORMAT_ID, 1)
+        assert server.get_ranges == []
+
+        # ...but "42" was the least recently used and got retired to make
+        # room for "44" — continuing it needs a fresh GET.
+        server.get_ranges.clear()
+        await cache.read_block("42", FORMAT_ID, 1)
         assert server.get_ranges == [64]
+
         await cache.close()
 
     async def test_idle_connection_is_retired_after_the_configured_window(self, cdn):
@@ -382,11 +409,11 @@ class TestConnectionReuse:
         cache = CDNBlockCache(resolver=_resolver_for(url), block_size=64)
 
         await cache.read_block("42", FORMAT_ID, 0)
-        assert cache._open_conn is not None
+        assert cache._open_conns
 
         await cache.close()
 
-        assert cache._open_conn is None
+        assert cache._open_conns == {}
 
 
 class TestExpiredUrlRefresh:

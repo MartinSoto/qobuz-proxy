@@ -22,14 +22,27 @@ Two things keep this from being "just" an LRU dict of byte ranges:
 - Single-flight coalescing: concurrent read_block() calls for the same
   key share one upstream fetch and all resolve (or fail) together, rather
   than each firing its own request.
-- One lingering connection: fetching a block leaves that one HTTP
-  response open (not closed) for a short idle window. A *later* request
-  for exactly the block that would come next off that same response reads
-  it directly off the still-open stream — no new TLS handshake, no new
-  Range GET — instead of the far more common "index 0, then 1, then 2..."
-  sequential-decode pattern paying for a fresh connection every block.
-  Only one such connection is ever kept: opening (or reusing) one always
-  retires whatever was being kept before it.
+- Lingering connections: fetching a block leaves that HTTP response open
+  (not closed) for a short idle window. A *later* request for exactly the
+  block that would come next off that same response reads it directly
+  off the still-open stream — no new TLS handshake, no new Range GET —
+  instead of the far more common "index 0, then 1, then 2..." sequential-
+  decode pattern paying for a fresh connection every block. Up to
+  DEFAULT_MAX_OPEN_CONNECTIONS are kept at once, one per distinct
+  (track_id, format_id) — not just one overall. Gapless pre-buffering
+  means a renderer routinely has *two* tracks' worth of requests actually
+  interleaved against this same cache (the tail of the current track and
+  the head of the next one, both mid-flight at once, not one finishing
+  before the other starts) — one shared slot meant every interleaved read
+  for the "other" track evicted the current track's own lingering
+  connection and forced a fresh one, on both sides, every single time
+  they alternated. Suspected (not yet fully confirmed live) as a cause of
+  audible stalls reported at Hi-Res track boundaries — a couple of
+  seconds of silence while a torn-down connection gets re-established,
+  worse there since the transcode path's own CPU-bound decode/resample
+  work is already tighter on real-time margin (see
+  docs/gapless-arming-and-token-expiry.md). Beyond the cap, the least-
+  recently-used connection is retired to make room.
 
 Synchronous-vs-async note: this is pure asyncio, unlike LazyHttpFlacSource
 (which is deliberately synchronous because libsndfile's I/O callbacks are).
@@ -55,8 +68,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_BLOCK_SIZE = 256 * 1024  # 256 KiB
-DEFAULT_MAX_CACHE_SIZE = 2 * 1024 * 1024  # 2 MiB — 8 blocks at the default size
+# 16 MiB — 64 blocks at the default size. Comfortably covers several
+# seconds of even Hi-Res (24-bit/96kHz+) content on *each* of two tracks
+# at once (current + gapless next, routinely both mid-flight together —
+# see the module docstring) without either evicting the other's still-
+# needed blocks; trivial in absolute memory terms for an always-on
+# background service.
+DEFAULT_MAX_CACHE_SIZE = 16 * 1024 * 1024
 DEFAULT_CONNECTION_IDLE_SECONDS = 10.0
+# How many distinct (track_id, format_id) lingering connections to keep
+# at once — see the module docstring's "Lingering connections" bullet.
+# 2 covers the routine case (current track + gapless next); a third
+# distinct track being actively read at the same time is not a scenario
+# gapless pre-buffering ever produces.
+DEFAULT_MAX_OPEN_CONNECTIONS = 2
 # Each entry is tiny (a (track_id, format_id) key -> an int), so this bounds
 # entry *count* rather than bytes — unlike _blocks, nothing else ever shrinks
 # this dict, so without a cap it grows for the process's entire lifetime.
@@ -98,12 +123,14 @@ class _ExpiredURLError(Exception):
 
 @dataclass
 class _OpenConnection:
-    """The one CDN connection this cache keeps alive between reads.
+    """One lingering CDN connection this cache keeps alive between reads,
+    for one (track_id, format_id) — see CDNBlockCache._open_conns and the
+    module docstring's "Lingering connections" bullet.
 
     `lock` guards every access to `response`/`session` so a reuse-read
     (read_block landing on `next_block`) and a discard (idle timeout, or
-    this connection getting retired by a new one) can never touch the
-    socket at the same time. See module docstring for the reuse story.
+    this connection getting retired to make room for another) can never
+    touch the socket at the same time.
     """
 
     key: TrackKey
@@ -121,7 +148,7 @@ class CDNBlockCache:
         cache = CDNBlockCache(resolver=stream_resolver)
         data = await cache.read_range(track_id, format_id, start, end)
         ...
-        await cache.close()  # release the one lingering connection, if any
+        await cache.close()  # release any lingering connections
     """
 
     def __init__(
@@ -132,12 +159,14 @@ class CDNBlockCache:
         connection_idle_seconds: float = DEFAULT_CONNECTION_IDLE_SECONDS,
         request_timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         max_track_size_entries: int = DEFAULT_MAX_TRACK_SIZE_ENTRIES,
+        max_open_connections: int = DEFAULT_MAX_OPEN_CONNECTIONS,
     ) -> None:
         self._resolver = resolver
         self._block_size = block_size
         self._max_cache_size = max_cache_size
         self._connection_idle_seconds = connection_idle_seconds
         self._max_track_size_entries = max_track_size_entries
+        self._max_open_connections = max_open_connections
         self._get_timeout = ClientTimeout(
             total=None, connect=request_timeout_seconds, sock_read=request_timeout_seconds
         )
@@ -155,9 +184,11 @@ class CDNBlockCache:
         self._track_sizes: Dict[TrackKey, int] = {}
         self._track_size_inflight: "Dict[TrackKey, asyncio.Future[int]]" = {}
 
-        # The one lingering connection (see module docstring). None when
-        # nothing is currently being kept open.
-        self._open_conn: Optional[_OpenConnection] = None
+        # Lingering connections, one per (track_id, format_id) — see the
+        # module docstring's "Lingering connections" bullet. Insertion/
+        # access order is recency (same idiom as _blocks/_track_sizes),
+        # for LRU eviction beyond _max_open_connections.
+        self._open_conns: "Dict[TrackKey, _OpenConnection]" = {}
 
         # Diagnostics only — not used for correctness. Real HTTP requests
         # issued (HEAD + GET), so tests/logs can confirm reuse is working.
@@ -233,10 +264,9 @@ class CDNBlockCache:
         return b"".join(parts)[start - block_start : end - block_start]
 
     async def close(self) -> None:
-        """Release the one lingering connection, if any. Safe to call even
+        """Release every lingering connection, if any. Safe to call even
         if nothing is currently open."""
-        conn = self._open_conn
-        if conn is not None:
+        for conn in list(self._open_conns.values()):
             await self._discard_open_connection(conn)
 
     # -- Fetch orchestration --------------------------------------------------
@@ -366,19 +396,20 @@ class CDNBlockCache:
 
         return await self._do_with_retry(track_id, format_id, _attempt)
 
-    # -- Reusing the one lingering connection --------------------------------
+    # -- Reusing lingering connections ----------------------------------------
 
     async def _read_from_open_connection(
         self, track_id: str, format_id: int, block_index: int, length: int
     ) -> Optional[bytes]:
-        conn = self._open_conn
-        if conn is None or conn.key != (track_id, format_id) or conn.next_block != block_index:
+        key: TrackKey = (track_id, format_id)
+        conn = self._open_conns.get(key)
+        if conn is None or conn.next_block != block_index:
             return None
 
         async with conn.lock:
             # Re-check: another coroutine may have retired/replaced this
             # connection while we were waiting for the lock.
-            if self._open_conn is not conn or conn.next_block != block_index:
+            if self._open_conns.get(key) is not conn or conn.next_block != block_index:
                 return None
             self._cancel_idle_timer(conn)
             try:
@@ -391,27 +422,56 @@ class CDNBlockCache:
                 )
                 conn.response.close()
                 await conn.session.close()
-                if self._open_conn is conn:
-                    self._open_conn = None
+                if self._open_conns.get(key) is conn:
+                    del self._open_conns[key]
                 return None
             conn.next_block = block_index + 1
+            self._touch_open_connection(key, conn)
             self._arm_idle_timer(conn)
             return data
 
     async def _set_open_connection(self, new_conn: _OpenConnection) -> None:
-        """Install `new_conn` as the one lingering connection, retiring
-        whatever was being kept before it (only one is ever kept)."""
-        old = self._open_conn
-        self._open_conn = new_conn
+        """Install `new_conn` as the lingering connection for its own
+        (track_id, format_id), retiring whatever was already kept for that
+        *same* key (a fresh connection replacing one that just failed a
+        reuse read, or a redundant concurrent fetch) — then, if that put
+        the total over `_max_open_connections`, retires the least-
+        recently-used *other* key's connection to make room. Distinct keys
+        never evict each other just for existing at the same time — see
+        the module docstring's "Lingering connections" bullet for why more
+        than one at once matters here."""
+        old = self._open_conns.get(new_conn.key)
+        # pop-then-reinsert (not a plain assignment) so a *replaced*
+        # existing key still moves to the end — a plain dict[key]=value
+        # on an already-present key leaves its position unchanged, which
+        # would make eviction below pick the wrong (not actually oldest)
+        # connection to retire.
+        self._open_conns.pop(new_conn.key, None)
+        self._open_conns[new_conn.key] = new_conn
         self._arm_idle_timer(new_conn)
         if old is not None and old is not new_conn:
             await self._discard_open_connection(old)
+        while len(self._open_conns) > self._max_open_connections:
+            oldest_key, oldest_conn = next(iter(self._open_conns.items()))
+            if oldest_conn is new_conn:
+                break  # nothing older left to evict — max_open_connections < 1
+            await self._discard_open_connection(oldest_conn)
+
+    def _touch_open_connection(self, key: TrackKey, conn: _OpenConnection) -> None:
+        """Mark `key` as the most recently used entry — same pop-then-
+        reinsert idiom as _touch/_touch_track_size, for the same reason:
+        insertion order is recency, so eviction in _set_open_connection
+        picks the right (least-recently-used) connection when a *new*
+        key needs room."""
+        if self._open_conns.get(key) is conn:
+            del self._open_conns[key]
+            self._open_conns[key] = conn
 
     async def _discard_open_connection(self, conn: _OpenConnection) -> None:
         self._cancel_idle_timer(conn)
         async with conn.lock:
-            if self._open_conn is conn:
-                self._open_conn = None
+            if self._open_conns.get(conn.key) is conn:
+                del self._open_conns[conn.key]
             conn.response.close()
             await conn.session.close()
 
