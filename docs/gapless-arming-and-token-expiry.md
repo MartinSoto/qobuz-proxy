@@ -611,3 +611,58 @@ mechanism is well-reasoned from reading the code (two tracks' worth of
 requests really do interleave, and the single-connection design really
 did retire the other's connection on every alternation) but wasn't
 directly instrumented/measured against the specific reported incident.
+
+## The deferred-retire mitigation itself was the real bug (2026-09-07)
+
+Reported live right after deploying the deferred-retire mitigation from
+the previous section: the queue started jumping forward every couple of
+seconds — through the *correct* next tracks in the album, just wildly
+too fast (2-4 seconds each instead of minutes) — until playback gave up
+and stopped entirely. The CDN-cache connection fix deployed alongside it
+made no observed improvement to the original stutter either.
+
+The ~2-second cadence between jumps was the giveaway: it matched
+`_QUEUE_RETIRE_DELAY_SECONDS` exactly. Root cause, worked out by tracing
+through the actual queue-position arithmetic: retiring a queue entry
+shifts every later position down by one, so a successful retire has to
+renumber `_current_track_queue_nr` right afterward for the *next*
+retire to still target the right entry. Deferring the retire into a
+background task broke this invariant: if a second transition landed
+before the first transition's delayed retire had actually run, that
+*already-scheduled* task's captured queue position went stale the
+moment the earlier retire actually fired and shifted real positions —
+so it went on to retire the wrong entry once it woke up, plausibly the
+one that was by then actually playing. A real Sonos device auto-
+advancing off its own currently-playing queue entry getting yanked out
+from under it would explain the runaway cascade cleanly: each wrong
+retire produces another transition landing closer to the last one,
+which only makes the *next* already-scheduled retire's captured
+position even more stale — a feedback loop that only gets worse until
+something finally gives up.
+
+This only ever manifests once transitions land closer together than the
+deferred delay — never true for a normal few-minutes-per-track album
+until the bug itself started producing exactly that condition.
+
+**Fixed by reverting to synchronous retirement.** This is the only
+approach that's actually correct: a single poll-loop coroutine only
+ever processes one transition at a time, so a retire (and its
+renumbering) always completes — and reflects the real, current queue
+position — before the *next* transition's own retire is even computed,
+regardless of how close together transitions land. The grouped-speaker-
+stutter concern that motivated deferring in the first place was never
+actually confirmed to help (tested immediately after deploying it: "the
+stutter appears unchanged") — so reverting gives up nothing of
+demonstrated value while removing a serious, now-proven correctness bug.
+The queue-trimming feature itself (see the "Stale Sonos queue entry
+replayed" section above) is unaffected — only *when* the retire happens
+changed, back to immediate.
+
+Lesson for next time this general class of idea comes up: any fix that
+introduces state carried across an `asyncio.create_task(...)`, meant to
+be applied to a value that can also be mutated by something else in the
+meantime, needs the *next* mutation to be able to see (or invalidate)
+what's already in flight — a bare "does it still match what I captured"
+guard isn't enough once the thing doing the mutating is itself a queue
+of similarly-deferred tasks that can each go stale relative to each
+other, not just relative to a single later event.
