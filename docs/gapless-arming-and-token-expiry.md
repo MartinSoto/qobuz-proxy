@@ -464,3 +464,68 @@ playback regardless of who asked for it, which is exactly the signal
 `is_worth_keeping_ws_alive()` reads — no separate wiring needed for the
 device-initiated case, it falls out of machinery that already existed for
 an unrelated reason (recovering from a transient unprompted pause/stop).
+
+## Stale Sonos queue entry replayed after an album finished (2026-09-07)
+
+Reported live: after an album played through in full — no repeat, no
+autoplay — the speaker spontaneously started streaming a *middle* track
+of that same album again, tens of minutes after it had already played
+cleanly. The Qobuz app still showed the actual last track as "playing"
+throughout, frozen; the Sonos app showed the real (resumed) track.
+
+Confirmed from the container logs: the last track's own audio GET
+completed normally (~4m21s, matching its duration) and a
+"no next-track info" warning was logged right after it started, exactly
+as expected for a genuine end of queue. From that point until the
+spontaneous replay ~15 minutes later, there is no state-change,
+track-ended, hijack, or "Trusting STOPPED" log line at all — none of the
+existing detection paths ever fired. Whatever the device's own state
+string was doing internally during that gap couldn't be pinned down
+further without DEBUG-level polling logs, which weren't enabled — but
+the structural vulnerability that let a *specific, previously-played*
+track resurface at all doesn't require knowing that: it requires that
+track to still exist in the device's own queue.
+
+Root cause: `SonosBackend`'s queue-based playback (`_start_transport`
+adds the current track, `_arm_next_track` appends each gapless "next")
+never removed anything from the device's real AVTransport queue once a
+track had been consumed — only `clear_next_track()` ever called
+`RemoveTrackFromQueue`, and only for an *armed-but-not-yet-played* entry.
+A full album session left every already-played track sitting in the
+device's own queue indefinitely, fully browsable/selectable there for
+the rest of the session (or until the next explicit `play()`, which
+clears the whole queue). Whatever nudged the device into position 3 that
+day, it could only find something to play there because we'd never
+removed it.
+
+Fixed: `DLNABackend` gained a generic `_retire_queue_entry()` hook
+(a no-op for a plain SetNextAVTransportURI renderer — nothing to trim)
+and now tracks `_current_track_queue_nr` alongside the existing
+`_next_track_queue_nr`. A confirmed forward gapless transition retires
+the now-superseded track's entry — and re-syncs the recorded position
+afterward, since removing an earlier queue slot shifts every later one
+down by one, which would otherwise make the *next* retire target the
+wrong entry. A genuine full stop (nothing armed, confirmed via the
+existing STOPPED-confirmation machinery) retires the last remaining
+entry too, including the edge case where a next track had been armed
+but the device stopped instead of transitioning to it. `SonosBackend`
+overrides the hook to actually call `RemoveTrackFromQueue`, and records
+the queue position its own `_start_transport` gets back from
+`AddURIToQueue`, mirroring `_arm_next_track`'s existing bookkeeping for
+"next". The device's queue is now trimmed to roughly "current + next"
+at all times instead of accumulating an entire listening session's
+worth of already-played tracks.
+
+Open question, not yet confirmed either way: the ~15-minute silence
+before the replay, with *zero* detection activity of any kind, is also
+consistent with the device's own `GetTransportInfo` state string simply
+never leaving "PLAYING" after the queue ended (a plausible Sonos quirk,
+distinct from the already-handled case where the state string goes
+STOPPED but the URI doesn't — see `_UNCONFIRMED_STOP_TIMEOUT_SECONDS`
+above). If a stuck-PLAYING state was also happening, the Qobuz app
+being left showing the last track as still playing (rather than idle)
+would be explained by that too, separately from the queue-trim fix
+above. Left as a follow-up to watch for — if the app is ever again seen
+stuck showing a finished track as playing (without an accompanying
+track-jump, now that the queue is trimmed), that's the evidence needed
+to pin this down and fix it directly.
