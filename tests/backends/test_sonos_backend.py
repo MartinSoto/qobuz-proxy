@@ -90,6 +90,52 @@ class TestSonosGaplessQueue:
         client.remove_track_from_queue.assert_not_called()
 
 
+class TestSonosQueueTrimming:
+    """SonosBackend._start_transport/_retire_queue_entry — keeping the
+    device's own AVTransport queue trimmed to roughly "current + next"
+    instead of accumulating every already-played track for the life of a
+    session. See docs/gapless-arming-and-token-expiry.md for the incident
+    this closes: a stale, long-since-played entry never got removed and
+    was played again on its own, tens of minutes after an album ended."""
+
+    async def test_start_transport_records_the_current_queue_position(self):
+        backend, client = _make_backend()
+        client.clear_queue = AsyncMock(return_value=True)
+        client.add_uri_to_queue = AsyncMock(return_value=1)
+        client.play_from_queue = AsyncMock(return_value=True)
+
+        assert await backend._start_transport("http://proxy/track.flac", "<didl/>") is True
+
+        assert backend._current_track_queue_nr == 1
+
+    async def test_start_transport_falls_back_without_recording_a_position(self):
+        """If adding to the queue fails outright, there's no queue
+        position to remember — falling back to a plain transport URI
+        instead (see the base class docstring)."""
+        backend, client = _make_backend()
+        client.clear_queue = AsyncMock(return_value=True)
+        client.add_uri_to_queue = AsyncMock(return_value=None)
+        backend._play_via_transport = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        assert await backend._start_transport("http://proxy/track.flac", "<didl/>") is True
+
+        assert backend._current_track_queue_nr is None
+
+    async def test_retire_queue_entry_removes_it(self):
+        backend, client = _make_backend()
+
+        assert await backend._retire_queue_entry(3) is True
+
+        client.remove_track_from_queue.assert_awaited_once_with(3)
+
+    async def test_retire_queue_entry_with_none_is_a_noop(self):
+        backend, client = _make_backend()
+
+        assert await backend._retire_queue_entry(None) is False
+
+        client.remove_track_from_queue.assert_not_called()
+
+
 class TestIsPlayingOurContent:
     """Sonos queue playback's GetMediaInfo.CurrentURI is the *queue* URI,
     not the track URL — SonosBackend uses GetPositionInfo.TrackURI

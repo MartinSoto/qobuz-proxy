@@ -241,6 +241,14 @@ class DLNABackend(AudioBackend):
         self._next_track_queue_nr: Optional[int] = None
         self._gapless_supported: bool = True
         self._current_proxy_url: Optional[str] = None
+        # Queue position of the track currently playing — only ever set by
+        # SonosBackend's queue-based _start_transport, mirroring
+        # _next_track_queue_nr. Lets a confirmed forward transition retire
+        # the now-superseded entry (see _retire_queue_entry) instead of
+        # leaving every already-played track sitting in the device's own
+        # queue for the rest of the session — see that method's own
+        # docstring for the bug this closes.
+        self._current_track_queue_nr: Optional[int] = None
 
         # Whether a poll has actually observed the device reporting
         # self._current_proxy_url since the last explicit switch — see
@@ -407,6 +415,7 @@ class DLNABackend(AudioBackend):
         self._next_track_proxy_url = None
         self._next_track_metadata = None
         self._next_track_queue_nr = None
+        self._current_track_queue_nr = None
         self._gapless_supported = True
         self._external_takeover_notified = False
         # A seek issued to the *old* device has nothing to confirm on a
@@ -607,10 +616,14 @@ class DLNABackend(AudioBackend):
             raise RuntimeError("No proxy server configured")
 
         # Clear gapless state — explicit play invalidates armed next track
-        # (no queue removal needed: Sonos play clears the whole queue)
+        # (no queue removal needed: Sonos play clears the whole queue,
+        # which is also why _current_track_queue_nr resets to None here
+        # rather than being retired — there's nothing left to remove it
+        # from).
         self._next_track_proxy_url = None
         self._next_track_metadata = None
         self._next_track_queue_nr = None
+        self._current_track_queue_nr = None
         # A prior seek's confirmation wait is meaningless against a
         # freshly loaded track.
         self._awaiting_seek_confirmation = False
@@ -740,11 +753,19 @@ class DLNABackend(AudioBackend):
         self._next_track_metadata = None
         self._next_track_queue_nr = None
         self._awaiting_seek_confirmation = False
+        # Retire the current track's queue entry regardless of whether the
+        # transport-stop SOAP call itself succeeds below — an explicit stop
+        # doesn't clear the device's queue the way a fresh play() does (see
+        # _retire_queue_entry's own docstring), so without this an entry
+        # would otherwise sit there until the next explicit play.
+        retiring_queue_nr = self._current_track_queue_nr
+        self._current_track_queue_nr = None
 
         if self._client and await self._client.stop():
             self._position_ms = 0
             self._playback_started_at = 0.0  # Clear grace period
             self._notify_state_change(PlaybackState.STOPPED)
+        await self._retire_queue_entry(retiring_queue_nr)
 
     # =========================================================================
     # Position Control
@@ -1066,6 +1087,28 @@ class DLNABackend(AudioBackend):
         self._next_track_metadata = None
         self._next_track_queue_nr = None
 
+    async def _retire_queue_entry(self, queue_nr: Optional[int]) -> bool:
+        """Release a device queue slot the device has now moved past for
+        good — a no-op for a plain DLNA renderer (SetNextAVTransportURI
+        has no queue to trim). SonosBackend overrides this to actually
+        remove the entry via RemoveTrackFromQueue, returning whether a
+        removal actually happened — the transition-detection call site
+        uses that to keep self._current_track_queue_nr in sync (removing
+        an earlier queue position shifts every later one down by one).
+
+        Without this, SonosBackend's queue-based playback (see its own
+        module docstring) accumulates every already-played track for the
+        life of a continuous gapless session, never trimming anything —
+        _arm_next_track/clear_next_track only ever manage the one *armed*
+        slot. Confirmed directly as the cause of a real incident: hours
+        into an album, tens of minutes after it had naturally finished
+        (nothing armed, nothing playing), the device spontaneously started
+        streaming a middle track again — one that had already played
+        clean, from a stale queue entry that had simply never been
+        removed. See docs/gapless-arming-and-token-expiry.md.
+        """
+        return False
+
     # =========================================================================
     # Internal
     # =========================================================================
@@ -1258,9 +1301,15 @@ class DLNABackend(AudioBackend):
                                 f"[{self.name}] Gapless: transition detected — device moved "
                                 "to next track"
                             )
+                            # The track being left behind — retired below,
+                            # once notifications go out, so nothing lingers
+                            # in the device's own queue for the rest of the
+                            # session (see _retire_queue_entry).
+                            retiring_queue_nr = self._current_track_queue_nr
                             # Update state to reflect the new track
                             self._current_metadata = self._next_track_metadata
                             self._current_proxy_url = self._next_track_proxy_url
+                            self._current_track_queue_nr = self._next_track_queue_nr
                             if self._next_track_metadata:
                                 self._duration_ms = self._next_track_metadata.duration_ms
                             self._position_ms = 0
@@ -1279,6 +1328,14 @@ class DLNABackend(AudioBackend):
                             self._notify_next_track_started()
                             self._notify_position_update(0)
                             self._external_takeover_notified = False
+                            retired = await self._retire_queue_entry(retiring_queue_nr)
+                            # Removing an earlier queue position shifts
+                            # every later one down by one — keep the new
+                            # current track's own recorded position in
+                            # sync, or the *next* retire would target the
+                            # wrong (now off-by-one) entry.
+                            if retired and self._current_track_queue_nr is not None:
+                                self._current_track_queue_nr -= 1
                             continue
 
                         if not in_grace_period and not self._is_playing_our_content_given(
@@ -1359,6 +1416,15 @@ class DLNABackend(AudioBackend):
                         )
                         self._next_track_proxy_url = None
                         self._next_track_metadata = None
+                        # The armed entry never got played — orphaned in the
+                        # device's own queue otherwise (see
+                        # _retire_queue_entry). Retired here, ahead of the
+                        # current track's own entry below, since it sits at
+                        # a *later* queue position — removing it first
+                        # doesn't disturb the current track's position.
+                        orphaned_next_queue_nr = self._next_track_queue_nr
+                        self._next_track_queue_nr = None
+                        await self._retire_queue_entry(orphaned_next_queue_nr)
 
                     if in_grace_period:
                         confirmed = False
@@ -1387,7 +1453,16 @@ class DLNABackend(AudioBackend):
                     self._unconfirmed_stop_since = 0.0
                     if was_playing:
                         self._notify_track_ended()
+                    # Confirmed genuinely stopped with nothing armed after
+                    # it (an armed next would have taken the transition
+                    # branch above instead) — retire its queue entry too,
+                    # same reasoning as _retire_queue_entry's own
+                    # docstring, so a natural end doesn't leave even the
+                    # last track sitting in the device's queue indefinitely.
+                    retiring_queue_nr = self._current_track_queue_nr
+                    self._current_track_queue_nr = None
                     self._notify_state_change(PlaybackState.STOPPED)
+                    await self._retire_queue_entry(retiring_queue_nr)
                     continue
                 self._unconfirmed_stop_polls = 0
                 self._unconfirmed_stop_since = 0.0

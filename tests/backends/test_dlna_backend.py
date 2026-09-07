@@ -766,6 +766,7 @@ class TestPollStateLoop:
         backend._next_track_proxy_url = None
         backend._next_track_metadata = None
         backend._next_track_queue_nr = None
+        backend._current_track_queue_nr = None
         backend._position_ms = 0
         backend._duration_ms = 0
         backend._playback_started_at = time.monotonic() - 3600  # well outside grace
@@ -1061,6 +1062,50 @@ class TestPollStateLoop:
         assert backend._current_proxy_url == "http://proxy/next.flac"
         assert backend._next_track_proxy_url is None
 
+    async def test_gapless_transition_retires_the_superseded_queue_entry(self) -> None:
+        """A confirmed forward transition must retire the now-superseded
+        track's own queue entry — see _retire_queue_entry's docstring for
+        the incident this prevents: a device queue that never trims
+        already-played entries can wander back into one, tens of minutes
+        after it last legitimately played."""
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._current_track_queue_nr = 1
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._next_track_queue_nr = 2
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/next.flac")
+        backend._retire_queue_entry = AsyncMock(return_value=True)
+
+        await self._run_poll_cycles(backend)
+
+        backend._retire_queue_entry.assert_awaited_once_with(1)
+        # Removing an earlier queue position shifts everything after it
+        # down by one — the new current track's own recorded position
+        # must follow, or the *next* retire would target the wrong entry.
+        assert backend._current_track_queue_nr == 1
+
+    async def test_failed_retire_does_not_renumber(self) -> None:
+        """If the removal itself failed, nothing actually shifted in the
+        device's queue — the recorded position must be left alone rather
+        than drifting it for no reason."""
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._current_track_queue_nr = 1
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._next_track_queue_nr = 2
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/next.flac")
+        backend._retire_queue_entry = AsyncMock(return_value=False)
+
+        await self._run_poll_cycles(backend)
+
+        assert backend._current_track_queue_nr == 2
+
     async def test_gapless_and_hijack_share_a_single_read_when_both_due(self) -> None:
         """The whole point of merging them: a cycle where something's
         armed *and* the hijack throttle is also due must only read the
@@ -1230,6 +1275,57 @@ class TestPollStateLoop:
         await self._run_poll_cycles(backend, cycles=1)
 
         callback.assert_called_once()
+
+    async def test_natural_full_stop_retires_the_last_queue_entry(self) -> None:
+        """A confirmed genuine stop with nothing armed next must retire
+        the last remaining queue entry too — otherwise it lingers in the
+        device's own queue until the next explicit play()."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        backend._get_current_transport_uri = AsyncMock(return_value="")
+        backend._current_track_queue_nr = 7
+        backend._retire_queue_entry = AsyncMock(return_value=True)
+        callback = MagicMock()
+        backend.on_track_ended(callback)
+
+        await self._run_poll_cycles(backend, cycles=1)
+
+        callback.assert_called_once()
+        backend._retire_queue_entry.assert_awaited_once_with(7)
+        assert backend._current_track_queue_nr is None
+
+    async def test_orphaned_armed_next_is_retired_when_device_stops_anyway(self) -> None:
+        """The "device stopped despite armed next track" fallthrough must
+        not leave the never-played armed entry sitting in the queue —
+        removed ahead of the current track's own entry, since it sits at
+        a *later* queue position (removing it first doesn't disturb the
+        current track's own position)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        backend._get_current_transport_uri = AsyncMock(return_value="")
+        backend._current_track_queue_nr = 7
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._next_track_queue_nr = 8
+        retired = []
+
+        async def _retire(queue_nr: int) -> bool:
+            retired.append(queue_nr)
+            return True
+
+        backend._retire_queue_entry = _retire
+        callback = MagicMock()
+        backend.on_track_ended(callback)
+
+        await self._run_poll_cycles(backend, cycles=1)
+
+        callback.assert_called_once()
+        assert retired == [8, 7]
 
     async def test_natural_track_end_eventually_trusted_via_timeout_fallback(self) -> None:
         """Reproduces the last-track-in-queue hang (test1.log, 2026-08-28):

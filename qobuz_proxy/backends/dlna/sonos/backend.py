@@ -66,9 +66,11 @@ class SonosBackend(DLNABackend):
             logger.warning("Failed to clear queue, falling back to transport URI")
             return await self._play_via_transport(url, didl)
 
-        if not await client.add_uri_to_queue(url, didl):
+        queue_nr = await client.add_uri_to_queue(url, didl)
+        if queue_nr is None:
             logger.warning("Failed to add to queue, falling back to transport URI")
             return await self._play_via_transport(url, didl)
+        self._current_track_queue_nr = queue_nr
 
         if await client.play_from_queue(0):
             return True
@@ -106,6 +108,15 @@ class SonosBackend(DLNABackend):
             await self._sonos_client.remove_track_from_queue(self._next_track_queue_nr)
         self._next_track_queue_nr = None
         await super().clear_next_track()
+
+    async def _retire_queue_entry(self, queue_nr: Optional[int]) -> bool:
+        """Remove a now-superseded track's entry from the device's own
+        AVTransport queue — see the base class docstring for why this
+        matters for Sonos specifically (queue-based playback, see this
+        module's own docstring)."""
+        if self._client and queue_nr is not None:
+            return await self._sonos_client.remove_track_from_queue(queue_nr)
+        return False
 
     async def _get_current_transport_uri(self) -> Optional[str]:
         """Sonos queue playback's GetMediaInfo.CurrentURI returns the
