@@ -1062,12 +1062,63 @@ class TestPollStateLoop:
         assert backend._current_proxy_url == "http://proxy/next.flac"
         assert backend._next_track_proxy_url is None
 
-    async def test_gapless_transition_retires_the_superseded_queue_entry(self) -> None:
+    async def test_gapless_transition_schedules_a_deferred_retire(self) -> None:
         """A confirmed forward transition must retire the now-superseded
         track's own queue entry — see _retire_queue_entry's docstring for
         the incident this prevents: a device queue that never trims
         already-played entries can wander back into one, tens of minutes
-        after it last legitimately played."""
+        after it last legitimately played. Deferred rather than immediate
+        (see _QUEUE_RETIRE_DELAY_SECONDS) — not asserted synchronously."""
+        from unittest.mock import AsyncMock, patch
+
+        from qobuz_proxy.backends.dlna import backend as backend_module
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._current_track_queue_nr = 1
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._next_track_queue_nr = 2
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/next.flac")
+        backend._retire_queue_entry = AsyncMock(return_value=True)
+
+        with patch.object(backend_module, "_QUEUE_RETIRE_DELAY_SECONDS", 0.0):
+            await self._run_poll_cycles(backend)
+            await asyncio.sleep(0.01)  # let the deferred task actually run
+
+        backend._retire_queue_entry.assert_awaited_once_with(1)
+        # Removing an earlier queue position shifts everything after it
+        # down by one — the new current track's own recorded position
+        # must follow, or the *next* retire would target the wrong entry.
+        assert backend._current_track_queue_nr == 1
+
+    async def test_failed_retire_does_not_renumber(self) -> None:
+        """If the removal itself failed, nothing actually shifted in the
+        device's queue — the recorded position must be left alone rather
+        than drifting it for no reason."""
+        from unittest.mock import AsyncMock, patch
+
+        from qobuz_proxy.backends.dlna import backend as backend_module
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._current_track_queue_nr = 1
+        backend._next_track_proxy_url = "http://proxy/next.flac"
+        backend._next_track_queue_nr = 2
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/next.flac")
+        backend._retire_queue_entry = AsyncMock(return_value=False)
+
+        with patch.object(backend_module, "_QUEUE_RETIRE_DELAY_SECONDS", 0.0):
+            await self._run_poll_cycles(backend)
+            await asyncio.sleep(0.01)  # let the deferred task actually run
+
+        assert backend._current_track_queue_nr == 2
+
+    async def test_gapless_transition_does_not_retire_synchronously(self) -> None:
+        """The retire must not happen inline with the transition itself —
+        see _QUEUE_RETIRE_DELAY_SECONDS for why (a queue-based backend's
+        group is already busy resyncing at that exact moment)."""
         from unittest.mock import AsyncMock
 
         backend = self._make_backend()
@@ -1081,30 +1132,26 @@ class TestPollStateLoop:
 
         await self._run_poll_cycles(backend)
 
-        backend._retire_queue_entry.assert_awaited_once_with(1)
-        # Removing an earlier queue position shifts everything after it
-        # down by one — the new current track's own recorded position
-        # must follow, or the *next* retire would target the wrong entry.
-        assert backend._current_track_queue_nr == 1
+        backend._retire_queue_entry.assert_not_awaited()
 
-    async def test_failed_retire_does_not_renumber(self) -> None:
-        """If the removal itself failed, nothing actually shifted in the
-        device's queue — the recorded position must be left alone rather
-        than drifting it for no reason."""
-        from unittest.mock import AsyncMock
+    async def test_deferred_retire_skips_renumbering_if_superseded(self) -> None:
+        """A later transition moving self._current_track_queue_nr on to
+        something else before this fires means that later transition now
+        owns the number — blindly decrementing it here would corrupt a
+        value this stale task has no business touching any more."""
+        from unittest.mock import AsyncMock, patch
+
+        from qobuz_proxy.backends.dlna import backend as backend_module
 
         backend = self._make_backend()
-        backend._state = PlaybackState.PLAYING
-        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
-        backend._current_track_queue_nr = 1
-        backend._next_track_proxy_url = "http://proxy/next.flac"
-        backend._next_track_queue_nr = 2
-        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/next.flac")
-        backend._retire_queue_entry = AsyncMock(return_value=False)
+        backend._retire_queue_entry = AsyncMock(return_value=True)
+        backend._current_track_queue_nr = 99  # a later transition already moved on
 
-        await self._run_poll_cycles(backend)
+        with patch.object(backend_module, "_QUEUE_RETIRE_DELAY_SECONDS", 0.0):
+            await backend._delayed_retire_queue_entry(1, expected_current_after=2)
 
-        assert backend._current_track_queue_nr == 2
+        backend._retire_queue_entry.assert_awaited_once_with(1)
+        assert backend._current_track_queue_nr == 99  # left untouched
 
     async def test_gapless_and_hijack_share_a_single_read_when_both_due(self) -> None:
         """The whole point of merging them: a cycle where something's

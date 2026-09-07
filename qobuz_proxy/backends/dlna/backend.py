@@ -89,6 +89,20 @@ _STOP_CONFIRMATIONS = 3
 # ended while genuinely still playing) is worse than a slow correct one.
 _UNCONFIRMED_STOP_TIMEOUT_SECONDS = 10.0
 
+# How long a confirmed forward gapless transition waits before retiring
+# the now-superseded track's queue entry (see _retire_queue_entry) —
+# deliberately *not* done synchronously right at the transition itself.
+# A queue-based backend (Sonos) is, at that exact moment, already busy
+# renegotiating internal group sync for the track change; reported live
+# (2026-09-07): grouped speakers stuttering and taking a few seconds to
+# resync specifically when the *queue* advances to its next track (not on
+# an explicit switch). Queuing another AVTransport queue-edit call in
+# that same instant is a plausible aggravating factor even if Sonos's own
+# resync overhead is the baseline cause — deferred a couple of seconds so
+# it lands well after the group has already settled onto the new track,
+# instead of piling onto the exact moment it's settling.
+_QUEUE_RETIRE_DELAY_SECONDS = 2.0
+
 # Grace period during which transport state is expected to be transiently
 # unreliable (seconds) — covers both a track just starting (prevents false
 # track-ended events while the device is loading) and a coordinator
@@ -1109,6 +1123,35 @@ class DLNABackend(AudioBackend):
         """
         return False
 
+    async def _delayed_retire_queue_entry(
+        self, queue_nr: Optional[int], expected_current_after: Optional[int]
+    ) -> None:
+        """Background-task wrapper around _retire_queue_entry for a
+        forward gapless transition — see _QUEUE_RETIRE_DELAY_SECONDS for
+        why this isn't awaited inline right at the transition itself.
+
+        expected_current_after is what self._current_track_queue_nr was
+        set to immediately after the transition this retire belongs to.
+        Renumbering (see _retire_queue_entry's own docstring) is only
+        applied if it still holds that same value by the time this fires —
+        a later transition already having moved it on to something else
+        means that transition's own handling owns the number now, and
+        this stale task blindly decrementing it would corrupt it instead.
+        In practice this only matters for tracks shorter than the delay
+        itself, essentially never for real audio.
+        """
+        try:
+            await asyncio.sleep(_QUEUE_RETIRE_DELAY_SECONDS)
+        except asyncio.CancelledError:
+            return
+        retired = await self._retire_queue_entry(queue_nr)
+        if (
+            retired
+            and expected_current_after is not None
+            and self._current_track_queue_nr == expected_current_after
+        ):
+            self._current_track_queue_nr = expected_current_after - 1
+
     # =========================================================================
     # Internal
     # =========================================================================
@@ -1301,10 +1344,15 @@ class DLNABackend(AudioBackend):
                                 f"[{self.name}] Gapless: transition detected — device moved "
                                 "to next track"
                             )
-                            # The track being left behind — retired below,
-                            # once notifications go out, so nothing lingers
-                            # in the device's own queue for the rest of the
-                            # session (see _retire_queue_entry).
+                            # The track being left behind — retired in the
+                            # background, a couple of seconds from now, so
+                            # nothing lingers in the device's own queue for
+                            # the rest of the session (see
+                            # _retire_queue_entry) without piling another
+                            # queue-edit call onto the exact instant a
+                            # queue-based backend's group is already busy
+                            # resyncing for this same transition (see
+                            # _QUEUE_RETIRE_DELAY_SECONDS).
                             retiring_queue_nr = self._current_track_queue_nr
                             # Update state to reflect the new track
                             self._current_metadata = self._next_track_metadata
@@ -1328,14 +1376,11 @@ class DLNABackend(AudioBackend):
                             self._notify_next_track_started()
                             self._notify_position_update(0)
                             self._external_takeover_notified = False
-                            retired = await self._retire_queue_entry(retiring_queue_nr)
-                            # Removing an earlier queue position shifts
-                            # every later one down by one — keep the new
-                            # current track's own recorded position in
-                            # sync, or the *next* retire would target the
-                            # wrong (now off-by-one) entry.
-                            if retired and self._current_track_queue_nr is not None:
-                                self._current_track_queue_nr -= 1
+                            asyncio.create_task(
+                                self._delayed_retire_queue_entry(
+                                    retiring_queue_nr, self._current_track_queue_nr
+                                )
+                            )
                             continue
 
                         if not in_grace_period and not self._is_playing_our_content_given(
