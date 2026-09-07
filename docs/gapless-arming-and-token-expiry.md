@@ -569,3 +569,45 @@ competing for the coordinator's attention at those points.
 Worth watching whether this actually resolves the stutter, or whether
 Sonos's own group-resync overhead was the whole story regardless of our
 own queue-edit traffic.
+
+## Brief silence a few seconds into a track, worse at Hi-Res (2026-09-07)
+
+Reported live, after the two stutter mitigations above didn't change
+anything: speakers playing the first few seconds of a track fine, then
+going silent for a few seconds before picking back up — much more common
+at Hi-Res rates. Since the group-transition-timing fixes above made no
+observed difference, this pointed away from Sonos's own group-resync
+overhead and toward the audio pipeline itself.
+
+`CDNBlockCache` is one instance per proxy server (per room), shared
+across *every* track it serves — including gapless pre-buffering, where
+a renderer routinely starts pulling the armed next track's bytes while
+the current one is still actively streaming out. That's two tracks'
+worth of CDN reads genuinely interleaved against the same cache at once,
+not one finishing before the other begins. The cache's one-lingering-
+connection optimization (reusing an open HTTP response for the next
+sequential block instead of paying for a fresh TLS handshake + Range GET
+every time) was keyed on nothing more than "whichever fetch happened
+most recently" — every time the two tracks' reads alternated, each one's
+read tore down and replaced the *other's* connection. Both tracks paid
+full reconnect latency on nearly every block instead of ever getting the
+reuse this was built for — a very plausible source of exactly the
+reported stall (a couple of seconds of silence while a connection that
+just got torn out from under it gets re-established), worse at Hi-Res
+since the transcode path's own decode/resample work already runs
+tighter against real-time margin than a plain passthrough would.
+
+Fixed: the cache now keeps up to `max_open_connections` (2 by default)
+lingering connections at once, one per distinct (track_id, format_id),
+evicting only the least-recently-used one once a third distinct track
+needs a slot — the routine current+next case no longer shares (and
+fights over) a single slot at all. Also bumped `DEFAULT_MAX_CACHE_SIZE`
+from 2 MiB to 16 MiB, so each of two concurrent tracks has several
+seconds of margin at Hi-Res bitrates instead of the LRU itself evicting
+blocks either one still needs.
+
+Not yet confirmed live whether this actually resolves the stalls — the
+mechanism is well-reasoned from reading the code (two tracks' worth of
+requests really do interleave, and the single-connection design really
+did retire the other's connection on every alternation) but wasn't
+directly instrumented/measured against the specific reported incident.
