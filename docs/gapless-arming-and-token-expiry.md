@@ -529,3 +529,43 @@ above. Left as a follow-up to watch for — if the app is ever again seen
 stuck showing a finished track as playing (without an accompanying
 track-jump, now that the queue is trimmed), that's the evidence needed
 to pin this down and fix it directly.
+
+## Grouped-speaker stutter at natural track transitions (2026-09-07)
+
+Reported live, shortly after the queue-trimming fix above shipped:
+speakers in a Sonos group stuttering and taking a few seconds to resync
+specifically when the *queue* naturally advances to its next track (not
+on an explicit switch from the app). Coordination within a Sonos group
+happens entirely on Sonos's own side — this proxy only ever talks to the
+group coordinator, never to individual members — so some baseline resync
+cost at every track boundary is expected and outside our control. But
+the timing lines up exactly with a plausible aggravating factor of our
+own: the queue-trimming fix above retires the just-superseded track's
+queue entry (`RemoveTrackFromQueue`) *synchronously, right at the moment
+the transition is detected* — a second AVTransport queue-edit call to
+the coordinator landing in the same instant it's already busy
+renegotiating group sync for the track change, on top of whatever that
+already costs.
+
+Not fully confirmed (no direct before/after audio timing evidence), but
+low-risk to address regardless: the retire's correctness doesn't depend
+on doing it *immediately*, only on doing it before too much queue growth
+piles back up — nothing else touches the queue in the couple of seconds
+right after a transition.
+
+Fixed: `_retire_queue_entry` for a confirmed forward transition now runs
+in a background task delayed by `_QUEUE_RETIRE_DELAY_SECONDS` (2s)
+instead of being awaited inline before the poll loop continues, landing
+after the group has already settled onto the new track rather than
+piling onto the exact moment it's settling. The queue-position
+renumbering that has to accompany a successful retire (see the previous
+section) moves into that same deferred task, guarded against a later
+transition having already moved `_current_track_queue_nr` on to
+something else before this one fires (only possible for a track shorter
+than the delay itself — essentially never for real audio). The full-stop
+and orphaned-armed-next retire paths are untouched: nothing else is
+competing for the coordinator's attention at those points.
+
+Worth watching whether this actually resolves the stutter, or whether
+Sonos's own group-resync overhead was the whole story regardless of our
+own queue-edit traffic.
