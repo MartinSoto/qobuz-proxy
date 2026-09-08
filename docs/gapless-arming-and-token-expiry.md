@@ -666,3 +666,76 @@ what's already in flight — a bare "does it still match what I captured"
 guard isn't enough once the thing doing the mutating is itself a queue
 of similarly-deferred tasks that can each go stale relative to each
 other, not just relative to a single later event.
+
+## Weaker Sonos hardware overwhelmed as coordinator (2026-09-08)
+
+Reported live: after fine-tuning the network, grouped playback (a Five
+or a Beam as coordinator, driving a Play:3 pair plus two Ones) played
+perfectly — smooth Hi-Res-downsampled sync, heavy seeking/skipping with
+zero stuttering. But when a Sonos *One* was the coordinator instead, the
+same group would work for a while and then become overwhelmed, needing
+recovery.
+
+Investigated the actual connection mechanics rather than guessing.
+Confirmed **empirically, against the real devices** (a One, a Five, and
+a third unit) that every one of them sends `Connection: close` on every
+single SOAP response — Sonos firmware itself refuses persistent
+connections for UPnP control, regardless of what the client offers. So
+`DLNAClient`'s `force_close=True` (one fresh TCP connection per SOAP
+call) isn't a defensive assumption inherited from testing against
+`gmediarender` that happens to also apply here — it's the only thing
+that actually works against real Sonos hardware; keep-alive was never
+an available option to begin with.
+
+Given that constraint, two real problems remained:
+
+1. **No coordination between independent callers.** The poll loop (every
+   0.5s), playback commands, volume changes, and Sonos queue operations
+   each independently open their own fresh connection to the same
+   device, from separate concurrently-running asyncio tasks, with zero
+   awareness of each other. A struggling device could be asked to field
+   several brand-new connections at once instead of one at a time — and
+   a slow/retrying call (up to ~34s worst case: 3 attempts × 10s timeout,
+   2s between) gave the rest of the system no signal to back off in the
+   meantime; everyone else just kept trying independently.
+2. **The 0.5s poll interval itself was inherited, not deliberately
+   chosen** — it came from merging two previously-independent polling
+   loops and picking whichever was faster, "to avoid regressing"
+   whatever depended on it at the time. Nothing downstream actually
+   needs sub-second resolution: the app interpolates position locally
+   between our own 5s-heartbeat reports; hijack detection is already
+   throttled separately (`_HIJACK_CHECK_INTERVAL_POLLS`); natural-stop
+   confirmation already has a 10s hard fallback regardless
+   (`_UNCONFIRMED_STOP_TIMEOUT_SECONDS`). A weaker coordinator (already
+   busy re-distributing decoded, downsampled Hi-Res audio to every other
+   member of its group — work entirely on Sonos's own side, proportional
+   to group size) getting hit with unconditional half-second polling on
+   top of that, regardless of its own hardware headroom, is a plausible
+   way to tip it over given enough time.
+
+**Fixed**, in two parts:
+
+- `DLNAClient` now serializes every actual network call to a device —
+  every SOAP call (`_soap_action_detailed`) and the one-time device-
+  description fetch — behind a single per-client `asyncio.Lock`,
+  covering a call's *entire* retry sequence, not just one attempt.
+  Each caller keeps its own independent cadence and simply queues for
+  its turn rather than racing everyone else's calls (and their retries)
+  against a device that may already be behind. Requires no new "skip
+  this cycle" bookkeeping anywhere: the poll loop is already a single
+  sequential coroutine, so queuing on the lock throttles it exactly the
+  way it already self-throttles against its own slow calls today —
+  every caller waits its turn, and by the time it gets one, it's asking
+  for genuinely current state rather than replaying something stale.
+- `STATE_POLL_INTERVAL_SECONDS` raised 0.5s → 2.0s, a direct cut to
+  baseline load independent of the locking change above. Explicitly a
+  "start small and revisit" figure per the user's own framing — worth
+  watching for any sluggishness in state-reporting responsiveness before
+  concluding it's the right long-term value.
+
+Not yet confirmed live against the specific One-as-coordinator failure —
+both changes are well-reasoned from the mechanics involved (confirmed
+directly against real hardware for the connection-close behavior; the
+concurrency risk and the interval's provenance both confirmed by reading
+the code) but the actual "does the One survive now" test still needs a
+real session.
