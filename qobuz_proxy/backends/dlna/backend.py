@@ -35,11 +35,26 @@ logger = logging.getLogger(__name__)
 # State polling interval. Also the cadence of hijack detection and
 # stopped-confirmation (see _HIJACK_CHECK_INTERVAL_POLLS and
 # _STOP_CONFIRMATIONS below) — this loop is the only thing that ever
-# reads transport state/position from the physical device, so it runs at
-# the faster of the two cadences that used to poll independently rather
-# than the slower one, to avoid regressing external-takeover/stop-detection
-# latency.
-STATE_POLL_INTERVAL_SECONDS = 0.5
+# reads transport state/position from the physical device.
+#
+# Raised from the original 0.5s (2026-09-08) — that figure was inherited
+# from merging two previously-independent polling loops and taking
+# whichever was faster, not chosen for an actual requirement. Nothing
+# downstream needs sub-second resolution: the app interpolates position
+# locally between our own 5s-heartbeat state reports
+# (STATE_HEARTBEAT_TIMEOUT_SECONDS), hijack checks are already throttled
+# separately (_HIJACK_CHECK_INTERVAL_POLLS), and natural-stop confirmation
+# already has a 10s hard fallback regardless
+# (_UNCONFIRMED_STOP_TIMEOUT_SECONDS) — a slower base rate only delays
+# cosmetic things (when the track name/progress bar catches up) by a
+# couple of seconds, never the audio itself. Meanwhile every SOAP call
+# opens a brand-new TCP connection (DLNAClient force_close=True — real
+# Sonos hardware sends `Connection: close` on every response, confirmed
+# live, so there's no persistent-connection alternative), and weaker
+# coordinators (e.g. a Sonos One driving a multi-room group) were
+# observed becoming unresponsive under the combined load of that plus
+# constant polling. See docs/gapless-arming-and-token-expiry.md.
+STATE_POLL_INTERVAL_SECONDS = 2.0
 
 # Backing off the poll cadence itself once a device stops answering at all
 # (DLNAClient.consecutive_failures — see its own docstring), instead of

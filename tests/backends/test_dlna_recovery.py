@@ -1,6 +1,7 @@
 """Tests for DLNA SOAP error reporting and connection/transport recovery."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -214,6 +215,184 @@ class TestResetSessionConcurrency:
 
         assert original.close_calls == 1
         assert client._session is not original
+
+
+class _GatedResponse:
+    """Async context manager whose entry blocks on an external event —
+    lets a test deterministically control when one call's SOAP response
+    "arrives" relative to another call queued behind it."""
+
+    def __init__(self, status: int, body: str, gate: asyncio.Event):
+        self.status = status
+        self._body = body
+        self._gate = gate
+
+    async def __aenter__(self):  # type: ignore[no-untyped-def]
+        await self._gate.wait()
+        return self
+
+    async def __aexit__(self, *args):  # type: ignore[no-untyped-def]
+        return False
+
+    async def text(self) -> str:
+        return self._body
+
+
+class _GatedSession:
+    """Minimal stand-in for aiohttp.ClientSession whose post() doesn't
+    resolve until the given gate is set."""
+
+    def __init__(self, gate: asyncio.Event, status: int = 200, body: str = "<ok/>"):
+        self._gate = gate
+        self._status = status
+        self._body = body
+
+    def post(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return _GatedResponse(self._status, self._body, self._gate)
+
+
+class _CountingSession:
+    """Minimal stand-in for aiohttp.ClientSession that always answers
+    immediately (200 OK), tracking how many post() calls are concurrently
+    inside their response context at once."""
+
+    def __init__(self) -> None:
+        self.max_concurrent = 0
+        self._concurrent = 0
+
+    def post(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return self._response()
+
+    @asynccontextmanager
+    async def _response(self):  # type: ignore[no-untyped-def]
+        self._concurrent += 1
+        self.max_concurrent = max(self.max_concurrent, self._concurrent)
+        try:
+            await asyncio.sleep(0)  # yield control, giving a race a chance to happen
+            yield _FakeResponse(200, "<ok/>")
+        finally:
+            self._concurrent -= 1
+
+
+class TestCallSerialization:
+    """DLNAClient._call_lock — every SOAP call to one device, retries
+    included, runs to completion before the next caller's call even
+    starts, regardless of which independent task (poll loop, a command,
+    volume change) issued it. See its own docstring for the device-
+    overload reasoning."""
+
+    async def _call(self, client: DLNAClient):  # type: ignore[no-untyped-def]
+        return await client._soap_action_detailed(
+            "http://1.2.3.4/ctrl", client_module.UPNP_AV_TRANSPORT, "GetTransportInfo", {}
+        )
+
+    async def test_concurrent_calls_never_actually_overlap(self) -> None:
+        client = DLNAClient(ip="1.2.3.4")
+        session = _CountingSession()
+        client._session = session  # type: ignore[assignment]
+
+        results = await asyncio.gather(self._call(client), self._call(client), self._call(client))
+
+        assert all(r.success for r in results)
+        assert session.max_concurrent == 1
+
+    async def test_a_second_caller_waits_for_the_first_to_finish(self) -> None:
+        client = DLNAClient(ip="1.2.3.4")
+        gate = asyncio.Event()
+        client._session = _GatedSession(gate)  # type: ignore[assignment]
+        order: list[str] = []
+
+        async def _first():  # type: ignore[no-untyped-def]
+            await self._call(client)
+            order.append("first")
+
+        async def _second():  # type: ignore[no-untyped-def]
+            await self._call(client)
+            order.append("second")
+
+        first_task = asyncio.create_task(_first())
+        await asyncio.sleep(0)  # let the first call actually start and block on the gate
+        second_task = asyncio.create_task(_second())
+        await asyncio.sleep(0)  # let the second call try to acquire the lock and queue
+
+        assert order == []  # first is gated, second is queued behind it — neither done
+
+        gate.set()  # release the first call's response
+        await asyncio.gather(first_task, second_task)
+
+        assert order == ["first", "second"]
+
+    async def test_a_slow_retrying_call_keeps_a_second_caller_waiting_throughout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lock covers the whole retry loop, not just one attempt — a
+        caller queued behind a call that's still failing and retrying
+        must not sneak its own connection in between retries."""
+        monkeypatch.setattr(client_module, "RETRY_DELAY_SECONDS", 0)
+        client = DLNAClient(ip="1.2.3.4")
+        client._session = _FakeSession(asyncio.TimeoutError())  # type: ignore[assignment]
+        monkeypatch.setattr(client, "reset_session", AsyncMock())
+        order: list[str] = []
+
+        async def _failing():  # type: ignore[no-untyped-def]
+            await self._call(client)
+            order.append("failing")
+
+        async def _second():  # type: ignore[no-untyped-def]
+            await self._call(client)
+            order.append("second")
+
+        await asyncio.gather(_failing(), _second())
+
+        # The failing call (all MAX_RETRIES attempts) must fully finish
+        # before the second one, queued behind it, ever gets a turn.
+        assert order == ["failing", "second"]
+        assert client.consecutive_failures == 2  # each call exhausted its own retries
+
+    async def test_device_description_fetch_shares_the_same_lock(self) -> None:
+        """_fetch_device_description (connect()'s one-time call) goes
+        through the same self._call_lock as every other call — a poll or
+        command racing a fresh connect()/retarget must queue behind it
+        too, not open a second connection to a device that may still be
+        settling in from just being contacted for the first time."""
+
+        class _GatedGetSession:
+            def __init__(self, gate: asyncio.Event) -> None:
+                self._gate = gate
+
+            def get(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                return _GatedResponse(200, "<root/>", self._gate)
+
+            def post(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                return _GatedResponse(200, "<ok/>", self._gate)
+
+        client = DLNAClient(ip="1.2.3.4", description_url="http://1.2.3.4/desc.xml")
+        gate = asyncio.Event()
+        client._session = _GatedGetSession(gate)  # type: ignore[assignment]
+        order: list[str] = []
+
+        async def _describe():  # type: ignore[no-untyped-def]
+            try:
+                await client._fetch_device_description()
+            except Exception:
+                pass  # the fake XML won't parse into a full DLNADeviceInfo — irrelevant here
+            order.append("describe")
+
+        async def _soap_call():  # type: ignore[no-untyped-def]
+            await self._call(client)
+            order.append("soap")
+
+        describe_task = asyncio.create_task(_describe())
+        await asyncio.sleep(0)  # let the fetch start and block on the gate
+        soap_task = asyncio.create_task(_soap_call())
+        await asyncio.sleep(0)  # let the SOAP call try to acquire the lock and queue
+
+        assert order == []
+
+        gate.set()
+        await asyncio.gather(describe_task, soap_task)
+
+        assert order == ["describe", "soap"]
 
 
 class TestTransportRecovery:

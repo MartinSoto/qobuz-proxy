@@ -105,6 +105,19 @@ class DLNAClient:
         # Guards reset_session() against overlapping resets — see its own
         # docstring for the leak this prevents.
         self._session_reset_lock = asyncio.Lock()
+        # Serializes every actual network call to this device — the poll
+        # loop, playback commands, volume changes, and Sonos queue
+        # operations all go through _soap_action_detailed (or, for the
+        # one-time device-description fetch, _fetch_device_description)
+        # regardless of which independent task they originate from, so at
+        # most one call (its retries included) is ever in flight against
+        # this device at a time. Each caller keeps its own cadence and
+        # simply queues for its turn rather than racing everyone else's
+        # SOAP calls — including their retries and force_close=True's own
+        # fresh TCP connection per attempt — on top of a device that may
+        # already be struggling to keep up. See
+        # docs/gapless-arming-and-token-expiry.md for the reasoning.
+        self._call_lock = asyncio.Lock()
         # How many SOAP actions in a row have failed to reach the device at
         # all (exhausted every retry) — reset to 0 by any action that gets
         # a real response, success or not (a device answering "Invalid
@@ -568,7 +581,15 @@ class DLNAClient:
 
         If a description_url is available (from SSDP LOCATION or config), it is
         tried first.  Falls back to probing well-known paths on ip:port.
+
+        Serialized via self._call_lock like every other call to this
+        device, though in practice this only ever runs once, right at
+        connect() — see its own docstring.
         """
+        async with self._call_lock:
+            return await self._fetch_device_description_locked()
+
+    async def _fetch_device_description_locked(self) -> DLNADeviceInfo:
         if not self._session:
             raise DLNAClientError("Session not initialized")
 
@@ -729,9 +750,28 @@ class DLNAClient:
         """
         Send SOAP action with retry logic, returning detailed result.
 
+        Serialized against every other call to this device via
+        self._call_lock — see its own docstring. A caller waiting here is
+        exactly the intended behavior, not a bug: it means someone else's
+        call (its retries included) is still in flight against this same
+        device.
+
         Returns:
             SoapResult with success/failure info and UPnP error codes
         """
+        async with self._call_lock:
+            return await self._soap_action_locked(url, service, action, args, max_retries)
+
+    async def _soap_action_locked(
+        self,
+        url: str,
+        service: str,
+        action: str,
+        args: Dict[str, str],
+        max_retries: Optional[int] = None,
+    ) -> SoapResult:
+        """The actual SOAP call + retry loop — see _soap_action_detailed,
+        which holds self._call_lock for the whole of this."""
         if not url or not self._session:
             logger.warning(f"No URL for service {service}")
             return SoapResult(success=False)
