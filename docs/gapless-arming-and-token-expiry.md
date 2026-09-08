@@ -733,9 +733,12 @@ Given that constraint, two real problems remained:
   watching for any sluggishness in state-reporting responsiveness before
   concluding it's the right long-term value.
 
-Not yet confirmed live against the specific One-as-coordinator failure —
-both changes are well-reasoned from the mechanics involved (confirmed
-directly against real hardware for the connection-close behavior; the
-concurrency risk and the interval's provenance both confirmed by reading
-the code) but the actual "does the One survive now" test still needs a
-real session.
+**Confirmed live (2026-09-08)**: a Gen 2 Sonos One now coordinates the
+whole household "almost effortlessly" — heavy seeking with no major
+issues while playing Hi-Res content downsampled to 96/24. Every other
+model coordinates perfectly too. A Gen 1 One still struggles more than
+the rest of the lineup, but that's expected — meaningfully older/weaker
+hardware even by Sonos's own standards — and not treated as a remaining
+instance of this bug; nothing suggests it's hitting the same overload
+pattern as badly as before, just that it's the weakest device in the
+household relative to everything else that's now solid.
