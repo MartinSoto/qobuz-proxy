@@ -200,7 +200,7 @@ class TestEncoding:
         """Test Controller-role join session message encoding."""
         frame = codec.encode_ctrl_join_session(
             device_uuid=device_uuid,
-            friendly_name="LIVE - Test Device",
+            friendly_name="Test Device",
         )
 
         assert isinstance(frame, bytes)
@@ -215,7 +215,7 @@ class TestEncoding:
         implemented yet") — omitting it is what actually works."""
         frame = codec.encode_ctrl_join_session(
             device_uuid=device_uuid,
-            friendly_name="LIVE - Test Device",
+            friendly_name="Test Device",
         )
 
         decoded = codec.decode_frame(frame)
@@ -239,7 +239,7 @@ class TestEncoding:
         phone app and the web player themselves do this dual join."""
         frame = codec.encode_ctrl_join_session(
             device_uuid=device_uuid,
-            friendly_name="LIVE - Test Device",
+            friendly_name="Test Device",
             max_audio_quality=6,
         )
 
@@ -249,7 +249,7 @@ class TestEncoding:
         assert batch is not None
         device_info = batch.messages[0].ctrlSrvrJoinSession.deviceInfo
         assert device_info.deviceUuid == device_uuid
-        assert device_info.friendlyName == "LIVE - Test Device"
+        assert device_info.friendlyName == "Test Device"
         assert device_info.type == common_pb2.DEVICE_TYPE_SPEAKER
         assert device_info.model == "Python"
 

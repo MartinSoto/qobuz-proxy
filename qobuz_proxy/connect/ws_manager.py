@@ -57,14 +57,13 @@ HIJACK_RECONNECT_HOLD_SECONDS = 8.0
 # 2026-09-12) picked up a renamed display but were never actually
 # reactivated, and a pure Controller-only ghost from before this fix
 # (no Renderer role at all) has no path back — nothing will ever join
-# under that synthetic identity again. In the meantime, and for whatever
-# residual staleness remains, generate_sonos_speaker_uuid is deliberately
-# deterministic per Sonos group_id, so a live room and its own stale
-# ghost still share not just a name but the literal same deviceUuid —
-# indistinguishable in the app's picker without help. Prefixing every
-# *live* join's friendly name is the practical workaround for whatever
-# staleness remains: it's the one thing that reliably lets the real,
-# working entry be picked out from its ghosts in the app.
+# under that synthetic identity again. generate_sonos_speaker_uuid is
+# deliberately deterministic per Sonos group_id, so any surviving stale
+# ghost shares not just a name but the literal same deviceUuid with its
+# live counterpart. A "LIVE - " name prefix was carried on every live
+# join for a while as a way to tell the two apart in the app's picker;
+# removed once that stopped being needed day to day (see git history
+# around 2026-09-13 for the prefix itself, if it's ever worth reviving).
 #
 # A tempting-looking further step — deliberately claiming is_active=True
 # for a second, already-known deviceUuid on top of an already-live
@@ -76,7 +75,6 @@ HIJACK_RECONNECT_HOLD_SECONDS = 8.0
 # instant the claim lands. It relocates staleness rather than curing it,
 # so there's no code for it here — reselecting a room for real, the way
 # the app already does, is the only supported way to reclaim it.
-LIVE_RENDERER_NAME_PREFIX = "LIVE - "
 
 # Message handler callback type
 MessageHandler = Callable[[int, Any], None]
@@ -407,7 +405,7 @@ class WsManager:
         self.config.device.name = friendly_name
         data = self._codec.encode_device_info_updated(
             device_uuid=self._device_uuid,
-            friendly_name=f"{LIVE_RENDERER_NAME_PREFIX}{friendly_name}",
+            friendly_name=friendly_name,
             max_audio_quality=self._max_audio_quality,
         )
         return await self.send_message(data)
@@ -633,7 +631,7 @@ class WsManager:
 
         join_frame = self._codec.encode_join_session(
             device_uuid=self._device_uuid,
-            friendly_name=f"{LIVE_RENDERER_NAME_PREFIX}{self.config.device.name}",
+            friendly_name=self.config.device.name,
             session_uuid=self._session_uuid,
             max_audio_quality=self._max_audio_quality,
             is_active=claims_active,
@@ -675,7 +673,7 @@ class WsManager:
 
         join_frame = self._codec.encode_ctrl_join_session(
             device_uuid=self._device_uuid,
-            friendly_name=f"{LIVE_RENDERER_NAME_PREFIX}{self.config.device.name}",
+            friendly_name=self.config.device.name,
             max_audio_quality=self._max_audio_quality,
         )
         await self._ws.send(join_frame)
