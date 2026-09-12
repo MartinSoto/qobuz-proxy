@@ -56,6 +56,11 @@ class QConnectMessageType(IntEnum):
     SRVR_RNDR_SET_SHUFFLE_MODE = 46
     SRVR_RNDR_SET_AUTOPLAY_MODE = 47
 
+    # Controller -> Server — see ProtocolCodec.encode_ctrl_join_session.
+    # Listen-only: this proxy never sends any other CtrlSrvr* command, so
+    # it's not a full Controller implementation.
+    CTRL_SRVR_JOIN_SESSION = 61
+
     # Server -> Controller
     SRVR_CTRL_QUEUE_STATE = 90
     SRVR_CTRL_QUEUE_TRACKS_LOADED = 91
@@ -357,6 +362,84 @@ class ProtocolCodec:
 
         return self.encode_payload(batch.SerializeToString())
 
+    def encode_ctrl_join_session(
+        self,
+        device_uuid: bytes,
+        friendly_name: str,
+        max_audio_quality: int = 27,
+        session_uuid: Optional[bytes] = None,
+    ) -> bytes:
+        """
+        Joins the *Controller* role on the same session, alongside the
+        existing Renderer join (encode_join_session) — never sent as a
+        substitute for it. Confirmed live via a captured browser session:
+        the Qobuz web player joins as both simultaneously, on one
+        WebSocket, and that is why it (unlike a pure-Renderer session)
+        receives SRVR_CTRL_* broadcasts — including
+        SRVR_CTRL_QUEUE_TRACKS_LOADED, the full ordered queue a pure
+        Renderer never gets (see queue_diagnostics.py).
+
+        sessionUuid is deliberately omitted by default: passing the id
+        this proxy was externally handed for its Renderer join gets it
+        rejected outright ("join a known session is not implemented
+        yet"). There's only ever one Connect session per account
+        (regular-subscription constraint, confirmed directly: the app and
+        the browser coexist on it simultaneously), and the server
+        resolves "your account's one live session" from the authenticated
+        connection itself once no sessionUuid is asserted — pass one
+        explicitly only to re-test the already-rejected path.
+
+        Deliberately listen-only: this sends the join and nothing else on
+        the Controller channel — never SetActiveRenderer, SetPlayerState,
+        or any other CtrlSrvr* command, which would be this proxy actually
+        acting as a second controller and could collide with whatever the
+        real app is doing.
+
+        Uses the *same* device_uuid, friendly_name and DeviceInfo shape as
+        the Renderer join (via _build_device_info) rather than a second,
+        distinctly-typed identity — a separate synthetic identity was
+        tried first, on the theory that reusing the Renderer's own could
+        confuse the server's per-device bookkeeping. The opposite proved
+        true live: two identities on one socket got "Renderer state
+        updated message received from non active renderer" from the
+        server and left a permanently orphaned ghost entry behind on
+        every disconnect; sharing the identity fixed both, and matches
+        how the phone app and the web player themselves do this same dual
+        join (confirmed live: both show up as a single entity in the
+        device list, never two).
+
+        Args:
+            device_uuid: 16-byte device UUID — the same one passed to
+                encode_join_session for this connection's Renderer role.
+            friendly_name: Display name — the same one used for the
+                Renderer role.
+            max_audio_quality: Quality ID, only used to fill in
+                DeviceCapabilities consistently with the Renderer join;
+                this facet advertises no audio capability of its own.
+            session_uuid: 16-byte session UUID — omitted by default (see
+                above); the first, rejected attempt always supplied one.
+
+        Returns:
+            Encoded frame bytes
+        """
+        device_info = self._build_device_info(device_uuid, friendly_name, max_audio_quality)
+
+        join = payload_pb2.CtrlSrvrJoinSession()
+        if session_uuid is not None:
+            join.sessionUuid = session_uuid
+        join.deviceInfo.CopyFrom(device_info)
+
+        qc_msg = payload_pb2.QConnectMessage()
+        qc_msg.messageType = QConnectMessageType.CTRL_SRVR_JOIN_SESSION
+        qc_msg.ctrlSrvrJoinSession.CopyFrom(join)
+
+        batch = payload_pb2.QConnectBatch()
+        batch.messagesTime = self._now_ms()
+        batch.messagesId = self._next_msg_id()
+        batch.messages.append(qc_msg)
+
+        return self.encode_payload(batch.SerializeToString())
+
     def encode_volume_changed(self, volume: int) -> bytes:
         """
         Encode volume changed notification.
@@ -500,6 +583,53 @@ class ProtocolCodec:
         batch.messages.append(qc_msg)
 
         return self.encode_payload(batch.SerializeToString())
+
+    def encode_disconnect(self, reconnect: bool = False) -> bytes:
+        """
+        Encode a client -> server DISCONNECT notification.
+
+        This is the outer QCloud envelope's own teardown message
+        (envelope_pb2.Disconnect) — the *inverse* of the DISCONNECT frame
+        this codec already decodes when the *server* sends one to us
+        ("Server requested disconnect", ws_manager._handle_message).
+        Nothing sent one from the client side before this.
+
+        Directly implicated in a real, live-confirmed symptom
+        (2026-09-12): a Speaker's own past device identities (a
+        since-regrouped Sonos room, or the same room after a plain proxy
+        restart) keep showing up in SRVR_CTRL_ADD_RENDERER forever, and
+        picking one in the app does nothing ("stale and unusable").
+        WsManager.stop() previously only closed the raw WebSocket —
+        indistinguishable, from the server's point of view, from a
+        network blip — leaving cleanup to whatever heartbeat/timeout the
+        server relies on for a renderer that just vanishes (see
+        force_reconnect's own docstring), which a fast clean close
+        apparently defeats or outlives. There is no per-renderer "leave"
+        message in the Renderer -> Server set (the QConnect payload
+        protocol has JOIN but no LEAVE), so this envelope-level message —
+        sent once, right before closing — is the only explicit way to
+        tell the server this specific connection, and every role
+        (Renderer, and Controller) it registered on this session, is
+        genuinely done rather than merely interrupted.
+
+        Args:
+            reconnect: False (the default) means "gone for good" — used
+                for a real shutdown (Speaker.stop(), Sonos topology
+                loss). True would mean "temporary, expect me back
+                shortly"; not used by any call site yet — force_reconnect
+                and the token-refresh close still just close() directly,
+                since those are deliberately indistinguishable-from-a-
+                blip reconnects by design.
+
+        Returns:
+            Encoded frame bytes
+        """
+        msg = envelope_pb2.Disconnect()
+        msg.msgId = self._next_msg_id()
+        msg.msgDate = self._now_ms()
+        msg.reconnect = reconnect
+
+        return self._pack_frame(MessageType.DISCONNECT, msg.SerializeToString())
 
     def _pack_frame(self, msg_type: MessageType, data: bytes) -> bytes:
         """

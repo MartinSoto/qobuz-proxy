@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from qobuz_proxy.config import Config
+from qobuz_proxy.connect.protocol import MessageType
 from qobuz_proxy.connect.types import ConnectTokens, JWTConnectToken
 from qobuz_proxy.connect.ws_manager import (
     HIJACK_RECONNECT_HOLD_SECONDS,
@@ -573,3 +574,38 @@ class TestStartStop:
         """Test that stopping when not running is safe."""
         await ws_manager.stop()
         assert ws_manager._should_run is False
+
+    @pytest.mark.asyncio
+    async def test_stop_sends_disconnect_before_closing(self, ws_manager: WsManager) -> None:
+        """A real Speaker.stop() (process shutdown, or Sonos topology loss
+        tearing down a departed room) must tell the server this specific
+        connection is gone for good — see ProtocolCodec.encode_disconnect.
+        Without it, this proxy's own past device identities keep showing
+        up as permanently stale, unusable renderers (live-confirmed
+        2026-09-12)."""
+        mock_ws = AsyncMock()
+        ws_manager._ws = mock_ws
+
+        await ws_manager.stop()
+
+        assert mock_ws.send.await_count == 1
+        sent_frame = mock_ws.send.await_args[0][0]
+        assert sent_frame[0] == MessageType.DISCONNECT
+        mock_ws.close.assert_awaited_once()
+        # Sent before closing, not after or racing it.
+        assert mock_ws.method_calls.index(("send", (sent_frame,), {})) < mock_ws.method_calls.index(
+            ("close", (), {})
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_swallows_disconnect_send_errors(self, ws_manager: WsManager) -> None:
+        """A connection already unhealthy enough to be getting stopped may
+        refuse this final send too — that must never block or fail the
+        shutdown itself."""
+        mock_ws = AsyncMock()
+        mock_ws.send.side_effect = OSError("connection already gone")
+        ws_manager._ws = mock_ws
+
+        await ws_manager.stop()  # must not raise
+
+        mock_ws.close.assert_awaited_once()

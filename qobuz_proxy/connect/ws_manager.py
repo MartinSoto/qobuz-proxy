@@ -39,8 +39,75 @@ SELF_REFRESH_RETRY_SECONDS = 30.0
 # normal reconnect cycle resume — see its docstring.
 HIJACK_RECONNECT_HOLD_SECONDS = 8.0
 
+# A SRVR_CTRL_ADD_RENDERER entry for a Sonos-backed speaker used to never
+# get reaped once its WS connection ended (2026-09-12 investigation,
+# against a real household): a plain graceful close and an explicit
+# application-level DISCONNECT(reconnect=False) sent right before it
+# (see WsManager.stop's _send_disconnect) both produced an identical,
+# permanently-stale result — at the time, traced to the Controller-role
+# join using a second, synthetic deviceUuid distinct from the Renderer's
+# own, which apparently left the server unable to tell which single
+# identity a given connection really represented. Once the Controller
+# join was switched to reuse the Renderer's own deviceUuid (see
+# _send_ctrl_join_session), a room reselected and used again *did*
+# properly reclaim its old, previously-stale identity and then
+# disappeared instantly on a later clean stop — matching real-client
+# behavior for the first time. Not fully generalized yet: identities
+# only ever passively probed (is_active=False, see git history around
+# 2026-09-12) picked up a renamed display but were never actually
+# reactivated, and a pure Controller-only ghost from before this fix
+# (no Renderer role at all) has no path back — nothing will ever join
+# under that synthetic identity again. In the meantime, and for whatever
+# residual staleness remains, generate_sonos_speaker_uuid is deliberately
+# deterministic per Sonos group_id, so a live room and its own stale
+# ghost still share not just a name but the literal same deviceUuid —
+# indistinguishable in the app's picker without help. Prefixing every
+# *live* join's friendly name is the practical workaround for whatever
+# staleness remains: it's the one thing that reliably lets the real,
+# working entry be picked out from its ghosts in the app.
+#
+# A tempting-looking further step — deliberately claiming is_active=True
+# for a second, already-known deviceUuid on top of an already-live
+# connection, to try to reclaim a specific stale entry on demand — was
+# tried and abandoned: the server tracks a strict one-to-one link between
+# a socket and "the identity it currently represents", so the claim
+# *reassigns* that link instead of adding to it. The room the connection
+# was actually representing gets orphaned in exactly the same way the
+# instant the claim lands. It relocates staleness rather than curing it,
+# so there's no code for it here — reselecting a room for real, the way
+# the app already does, is the only supported way to reclaim it.
+LIVE_RENDERER_NAME_PREFIX = "LIVE - "
+
 # Message handler callback type
 MessageHandler = Callable[[int, Any], None]
+
+# Server -> Controller queue/session message types the proxy never registers
+# a handler for — it's Renderer-only (see queue.py's module docstring: a
+# Renderer session is assumed to never receive these at all). A real capture
+# (qobuz-queue-1.log, 2026-09-12: four explicit track taps within one album
+# via SET_STATE, tracked with this very logging in place) saw none of
+# them arrive, consistent with that assumption rather than against it — kept
+# here anyway as a standing, zero-cost tripwire in case a different flow
+# (queue reorder, the app's own queue UI, autoplay) ever does trigger one.
+# Deliberately observation-only: no parsing, no state kept, just a clearly
+# labeled log line instead of letting them blend into the generic "no
+# handler" fallback below if/when they do show up.
+# Names mirror the QConnectMessageType enum (qconnect_payload.proto) — kept
+# as a plain literal dict rather than looked up via the generated pb2 module
+# (untyped: no stubs installed for google.protobuf, same gap protocol.py
+# already lives with for every other pb2 attribute access) so this doesn't
+# add a new mypy attr-defined error to a file that otherwise has none.
+_QUEUE_POSITION_MESSAGE_TYPES = {
+    81: "SRVR_CTRL_SESSION_STATE",  # trackIndex
+    89: "SRVR_CTRL_QUEUE_CLEARED",
+    90: "SRVR_CTRL_QUEUE_STATE",  # full ordered queue snapshot
+    91: "SRVR_CTRL_QUEUE_TRACKS_LOADED",  # full queue + starting position
+    92: "SRVR_CTRL_QUEUE_TRACKS_INSERTED",
+    93: "SRVR_CTRL_QUEUE_TRACKS_ADDED",
+    94: "SRVR_CTRL_QUEUE_TRACKS_REMOVED",
+    95: "SRVR_CTRL_QUEUE_TRACKS_REORDERED",
+    105: "SRVR_CTRL_QUEUE_VERSION_CHANGED",
+}
 
 
 class TokenRefreshRequired(Exception):
@@ -197,6 +264,7 @@ class WsManager:
         """Stop WebSocket connection."""
         self._should_run = False
         if self._ws:
+            await self._send_disconnect()
             await self._ws.close()
         if self._receive_task:
             self._receive_task.cancel()
@@ -205,6 +273,21 @@ class WsManager:
             except asyncio.CancelledError:
                 pass
         logger.info("WebSocket manager stopped")
+
+    async def _send_disconnect(self) -> None:
+        """Tell the server this connection is going away for good, right
+        before closing it — see ProtocolCodec.encode_disconnect for why
+        this matters (stale, permanently-unusable renderer entries).
+        Best-effort: a connection already unhealthy enough to be getting
+        stopped may not accept one final send either, and that must never
+        block or fail the shutdown itself."""
+        if not self._ws:
+            return
+        try:
+            await self._ws.send(self._codec.encode_disconnect(reconnect=False))
+            logger.info("Sent DISCONNECT (reconnect=False)")
+        except Exception as e:
+            logger.debug(f"Failed to send DISCONNECT before close: {e}")
 
     @property
     def is_connected(self) -> bool:
@@ -324,7 +407,7 @@ class WsManager:
         self.config.device.name = friendly_name
         data = self._codec.encode_device_info_updated(
             device_uuid=self._device_uuid,
-            friendly_name=friendly_name,
+            friendly_name=f"{LIVE_RENDERER_NAME_PREFIX}{friendly_name}",
             max_audio_quality=self._max_audio_quality,
         )
         return await self.send_message(data)
@@ -491,6 +574,10 @@ class WsManager:
                 # Send join session message
                 await self._send_join_session()
 
+                # Also join as Controller — see _send_ctrl_join_session's
+                # own docstring for why this is needed at all.
+                await self._send_ctrl_join_session()
+
                 self._is_connected = True
                 self._reconnect_delay = INITIAL_RECONNECT_DELAY  # Reset backoff
                 logger.info("Connected and authenticated")
@@ -546,7 +633,7 @@ class WsManager:
 
         join_frame = self._codec.encode_join_session(
             device_uuid=self._device_uuid,
-            friendly_name=self.config.device.name,
+            friendly_name=f"{LIVE_RENDERER_NAME_PREFIX}{self.config.device.name}",
             session_uuid=self._session_uuid,
             max_audio_quality=self._max_audio_quality,
             is_active=claims_active,
@@ -556,6 +643,43 @@ class WsManager:
             f"Sent JOIN_SESSION with max_quality={self._max_audio_quality}, "
             f"is_active={claims_active}"
         )
+
+    async def _send_ctrl_join_session(self) -> None:
+        """Join the Controller role too, alongside the existing Renderer
+        join above, on this same WebSocket — confirmed against a captured
+        browser session that the Qobuz web player does exactly this, and
+        it's why it (unlike a pure-Renderer session) receives SRVR_CTRL_*
+        broadcasts, including the full ordered queue via
+        SRVR_CTRL_QUEUE_TRACKS_LOADED (see queue_diagnostics.py). Listen-
+        only: sends the join and nothing else on the Controller channel.
+
+        sessionUuid is deliberately omitted — passing the id this proxy
+        was externally handed for its Renderer join gets it rejected
+        outright ("join a known session is not implemented yet"; see
+        encode_ctrl_join_session's own docstring). There is only ever one
+        Connect session per account, and the server resolves it from the
+        authenticated connection itself once no sessionUuid is asserted.
+
+        Uses the *same* deviceUuid as the Renderer join, not a separate
+        synthetic identity — a second identity was tried first and
+        reasoned to be safer, but it's what the phone app and the web
+        player do *not* do (both show up as a single entity in the
+        device list, confirmed live) and it's what caused this proxy's
+        own two-identities-on-one-socket version to intermittently get
+        "Renderer state updated message received from non active
+        renderer" from the server and to leave the Controller-role
+        identity stuck as a permanently orphaned ghost on every
+        disconnect. Sharing the identity fixed both."""
+        if not self._ws:
+            return
+
+        join_frame = self._codec.encode_ctrl_join_session(
+            device_uuid=self._device_uuid,
+            friendly_name=f"{LIVE_RENDERER_NAME_PREFIX}{self.config.device.name}",
+            max_audio_quality=self._max_audio_quality,
+        )
+        await self._ws.send(join_frame)
+        logger.info("Sent CTRL_SRVR_JOIN_SESSION with no sessionUuid, same deviceUuid as Renderer")
 
     async def _receive_loop(self) -> None:
         """Receive and dispatch messages."""
@@ -607,6 +731,12 @@ class WsManager:
                     handler(msg_type, msg)
                 except Exception as e:
                     logger.error(f"Handler error for type {msg_type}: {e}")
+            elif msg_type in _QUEUE_POSITION_MESSAGE_TYPES:
+                # See _QUEUE_POSITION_MESSAGE_TYPES — logged plainly (info,
+                # not warning: expected to arrive, not an error) so these
+                # are easy to spot and inspect if/when they show up.
+                type_name = _QUEUE_POSITION_MESSAGE_TYPES[msg_type]
+                logger.info(f"Observed queue message {type_name} (type {msg_type}): {msg}")
             else:
                 logger.warning(f"No handler for message type {msg_type}: {msg}")
 

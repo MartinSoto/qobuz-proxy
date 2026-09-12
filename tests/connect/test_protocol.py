@@ -9,6 +9,7 @@ from qobuz_proxy.connect.protocol import (
     ProtocolCodec,
     QConnectMessageType,
 )
+from qobuz_proxy.proto import common as common_pb2
 
 
 @pytest.fixture
@@ -97,6 +98,34 @@ class TestEncoding:
         assert len(frame) > 0
         assert frame[0] == MessageType.PAYLOAD
 
+    def test_encode_disconnect(self, codec: ProtocolCodec) -> None:
+        """Test DISCONNECT message encoding."""
+        frame = codec.encode_disconnect()
+
+        assert isinstance(frame, bytes)
+        assert len(frame) > 0
+        assert frame[0] == MessageType.DISCONNECT
+
+    def test_encode_disconnect_reconnect_flag_round_trips(self, codec: ProtocolCodec) -> None:
+        """The reconnect flag must actually reach the wire.
+
+        DecodedMessage doesn't surface `reconnect` (nothing has ever
+        needed it — the server->client DISCONNECT decode path only reads
+        msgId), so this parses the envelope message directly, the same
+        way the CTRL_SRVR_JOIN_SESSION sessionUuid-omission fix was
+        verified live.
+        """
+        from qobuz_proxy.proto import envelope as envelope_pb2
+
+        for reconnect in (False, True):
+            frame = codec.encode_disconnect(reconnect=reconnect)
+            length, offset = codec._decode_varint(frame, 1)
+            raw_payload = frame[offset : offset + length]
+
+            msg = envelope_pb2.Disconnect()
+            msg.ParseFromString(raw_payload)
+            assert msg.reconnect == reconnect
+
     def test_encode_join_session(self, codec: ProtocolCodec, device_uuid: bytes) -> None:
         """Test join session message encoding."""
         session_uuid = uuid.UUID("11111111-2222-3333-4444-555555555555").bytes
@@ -166,6 +195,63 @@ class TestEncoding:
         batch = codec.decode_qconnect_batch(decoded.payload)
         assert batch is not None
         assert batch.messages[0].rndrSrvrJoinSession.isActive is False
+
+    def test_encode_ctrl_join_session(self, codec: ProtocolCodec, device_uuid: bytes) -> None:
+        """Test Controller-role join session message encoding."""
+        frame = codec.encode_ctrl_join_session(
+            device_uuid=device_uuid,
+            friendly_name="LIVE - Test Device",
+        )
+
+        assert isinstance(frame, bytes)
+        assert len(frame) > 0
+        assert frame[0] == MessageType.PAYLOAD
+
+    def test_encode_ctrl_join_session_omits_session_uuid_by_default(
+        self, codec: ProtocolCodec, device_uuid: bytes
+    ) -> None:
+        """A first attempt that asserted a sessionUuid on this call was
+        rejected outright by the server ("join a known session is not
+        implemented yet") — omitting it is what actually works."""
+        frame = codec.encode_ctrl_join_session(
+            device_uuid=device_uuid,
+            friendly_name="LIVE - Test Device",
+        )
+
+        decoded = codec.decode_frame(frame)
+        assert decoded is not None
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        assert batch is not None
+        assert not batch.messages[0].ctrlSrvrJoinSession.HasField("sessionUuid")
+
+    def test_encode_ctrl_join_session_uses_same_device_info_shape_as_renderer(
+        self, codec: ProtocolCodec, device_uuid: bytes
+    ) -> None:
+        """Regression: this used to build its own DeviceInfo with
+        model="Controller (diagnostic)" and type=LAPTOP, a second,
+        distinctly-typed identity from the Renderer's own. Live testing
+        against a real household showed the opposite of the intended
+        safety: two identities on one socket got "Renderer state updated
+        message received from non active renderer" from the server and
+        left a permanently orphaned ghost entry on every disconnect.
+        Sharing the exact DeviceInfo shape (same brand/model/type/
+        capabilities as the Renderer join) fixed both and matches how the
+        phone app and the web player themselves do this dual join."""
+        frame = codec.encode_ctrl_join_session(
+            device_uuid=device_uuid,
+            friendly_name="LIVE - Test Device",
+            max_audio_quality=6,
+        )
+
+        decoded = codec.decode_frame(frame)
+        assert decoded is not None
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        assert batch is not None
+        device_info = batch.messages[0].ctrlSrvrJoinSession.deviceInfo
+        assert device_info.deviceUuid == device_uuid
+        assert device_info.friendlyName == "LIVE - Test Device"
+        assert device_info.type == common_pb2.DEVICE_TYPE_SPEAKER
+        assert device_info.model == "Python"
 
     def test_encode_device_info_updated(self, codec: ProtocolCodec, device_uuid: bytes) -> None:
         """Test device info updated (rename) message encoding."""
