@@ -553,7 +553,28 @@ class QobuzPlayer:
             logger.debug(f"Fixed volume mode: ignoring set_volume({level})")
             return self._volume  # Return current (ignored)
 
-        # Apply to backend
+        # A command re-asserting the volume we already have is a genuine
+        # no-op — skip the backend call and, critically, the app-facing
+        # report too. Confirmed live (2026-09-12): while this proxy's
+        # Controller role used a second, synthetic deviceUuid distinct
+        # from its Renderer role, a server confused about which identity
+        # owned this connection echoed our own RndrSrvrVolumeChanged
+        # report straight back as a fresh SrvrRndrSetVolume command —
+        # every report became another command to handle, a self-
+        # sustaining loop with no natural end (~4000 calls in 27s in one
+        # capture), which starved the single command queue badly enough
+        # to also block natural-track-end detection (the same queue) for
+        # the rest of that session. The Controller role now joins under
+        # the Renderer's own deviceUuid instead (see ws_manager.py's
+        # _send_ctrl_join_session), which fixed the identity confusion
+        # this stemmed from — but skipping a same-value command is safe
+        # regardless of cause, since nothing is lost when nothing
+        # changes, so this stays as a second, independent line of
+        # defense against the same failure mode however it might recur.
+        if clamped == self._volume:
+            logger.debug(f"set_volume({clamped}): already at this level, no-op")
+            return clamped
+
         await self.backend.set_volume(clamped)
         self._volume = clamped
 
