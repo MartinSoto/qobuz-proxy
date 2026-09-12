@@ -8,7 +8,7 @@ import asyncio
 import functools
 import logging
 import time
-from typing import Awaitable, Callable, Optional, TypeVar, TYPE_CHECKING
+from typing import Awaitable, Callable, Dict, Optional, TypeVar, TYPE_CHECKING
 
 from qobuz_proxy.backends import (
     AudioBackend,
@@ -88,6 +88,37 @@ _BACKEND_ATTACH_WAIT_SECONDS = 8.0
 # can still be transiently wrong right after a transition.
 _DEACTIVATION_GRACE_SECONDS = 5.0
 
+# enqueue()'s default coalesce_group — every existing coalesce=True call
+# site (SET_STATE, natural track-end, an explicit stop_playback) shares
+# this one, matching the original single-slot behavior: any one of them
+# supersedes an earlier still-pending one of any of the others, which is
+# the intended "the goal is always the latest desired playback state"
+# behavior _superseded_by_newer_command() exists for.
+_PLAYBACK_COALESCE_GROUP = "playback"
+
+# A separate coalesce group for volume commands — see VolumeCommandHandler's
+# call site in speaker.py. Volume floods (a server echoing our own
+# RndrSrvrVolumeChanged report back as a fresh SET_VOLUME command, live-
+# confirmed 2026-09-12/13 to cycle through several recently-seen values
+# rather than repeat one, defeating a same-value check alone) must not
+# share a slot with _PLAYBACK_COALESCE_GROUP — an unrelated queued volume
+# command superseding a pending track-change command (or vice versa)
+# would be a real, unrelated correctness bug, not just a missed
+# optimization.
+VOLUME_COALESCE_GROUP = "volume"
+
+# EMERGENCY safety net (2026-09-13) — coalescing alone was not enough:
+# a real, live volume spike still reached the physical speaker after it
+# was in place. Root cause of the underlying echo/flood is still
+# unknown (see git history and set_volume()'s own comment for what's
+# been ruled out so far). Set True to stop forwarding volume commands
+# to the real backend entirely — set_volume() still runs its own
+# bookkeeping and logs what it *would* have sent, so the actual pattern
+# of incoming commands stays fully observable via logs while this is on.
+# Leave True until the real trigger is found and fixed; only then is it
+# safe to flip back off and re-test with volume actually applied again.
+_VOLUME_BACKEND_DISABLED = True
+
 
 class _CommandQueueItem:
     """One entry in Player._command_queue — see Player.enqueue().
@@ -98,11 +129,14 @@ class _CommandQueueItem:
     happen to wrap the same bound method.
     """
 
-    __slots__ = ("coro_fn", "coalesce", "cancelled")
+    __slots__ = ("coro_fn", "coalesce", "coalesce_group", "cancelled")
 
-    def __init__(self, coro_fn: Callable[[], Awaitable[None]], coalesce: bool) -> None:
+    def __init__(
+        self, coro_fn: Callable[[], Awaitable[None]], coalesce: bool, coalesce_group: str
+    ) -> None:
         self.coro_fn = coro_fn
         self.coalesce = coalesce
+        self.coalesce_group = coalesce_group
         self.cancelled = False
 
 
@@ -227,9 +261,13 @@ class QobuzPlayer:
         # specifically.
         self._command_queue: "asyncio.Queue[_CommandQueueItem]" = asyncio.Queue()
         self._command_task: Optional[asyncio.Task] = None
-        # Pending (not yet started) coalesce=True items, in enqueue order —
-        # what enqueue() scans/cancels when a new one supersedes them.
-        self._pending_coalescable: list[_CommandQueueItem] = []
+        # At most one pending (not yet started) coalesce=True item per
+        # coalesce_group — what enqueue() replaces/cancels when a new one
+        # in the same group supersedes it. Keyed by group rather than a
+        # single shared slot so unrelated coalesced command streams (e.g.
+        # playback-directing SET_STATE/track-ended/stop vs. volume, see
+        # VOLUME_COALESCE_GROUP) never cancel each other out.
+        self._pending_coalescable: Dict[str, _CommandQueueItem] = {}
         # True for the duration of _command_consumer_loop actually awaiting
         # a dequeued item — replaces _playback_lock.locked() as the "is a
         # command currently running" signal _on_state_change discriminates
@@ -575,7 +613,17 @@ class QobuzPlayer:
             logger.debug(f"set_volume({clamped}): already at this level, no-op")
             return clamped
 
-        await self.backend.set_volume(clamped)
+        # Volume-to-backend forwarding disabled (2026-09-13) — see
+        # _VOLUME_BACKEND_DISABLED's own comment. Coalescing (see
+        # VOLUME_COALESCE_GROUP) was not sufficient on its own: a real,
+        # live spike still reached the physical speaker after it was in
+        # place. Log what *would* have been sent instead of sending it,
+        # so the actual pattern of incoming commands stays fully visible
+        # while the real trigger is tracked down.
+        if _VOLUME_BACKEND_DISABLED:
+            logger.warning(f"Volume backend disabled: NOT forwarding set_volume({clamped})")
+        else:
+            await self.backend.set_volume(clamped)
         self._volume = clamped
 
         # Report change to app
@@ -808,50 +856,66 @@ class QobuzPlayer:
     # Command Queue
     # =========================================================================
 
-    def enqueue(self, coro_fn: Callable[[], Awaitable[None]], *, coalesce: bool = False) -> None:
+    def enqueue(
+        self,
+        coro_fn: Callable[[], Awaitable[None]],
+        *,
+        coalesce: bool = False,
+        coalesce_group: str = _PLAYBACK_COALESCE_GROUP,
+    ) -> None:
         """Queue an action to run on the single command consumer, in FIFO
         order, one at a time. Synchronous — callable from a sync context,
         e.g. a WsManager handler lambda (see speaker.py) or a backend
         callback that can't itself be async (see _on_track_ended).
 
-        coalesce=True marks this as a playback-directing command: any
-        earlier coalesce=True item still sitting in the queue (not yet
-        started running) is dropped first, so a burst of these — e.g. an
-        aggressive seek-bar scrub sending a SET_STATE per pixel, or a
-        natural track end racing a user's explicit skip — still only ever
-        runs its last one, matching what the old generation-based
-        supersede mechanism did. An item already running can't be
-        preempted outright (nothing interrupts an in-flight device round
-        trip), but apply_remote_state() cooperatively checks
-        _superseded_by_newer_command() at its own natural checkpoints and
-        bails out early rather than committing more device work toward a
-        target a newer command has already moved past — see there for why
-        that matters (rapid swiping can otherwise visibly land on a track
-        in the middle of the swipe instead of the final one, on a renderer
-        slow enough that commands stop overlapping cleanly). Volume/queue
-        commands (coalesce=False, the default) were never covered by any
-        of this and stay plain FIFO.
+        coalesce=True marks this as a command that supersedes an earlier
+        one of the same coalesce_group still sitting in the queue (not
+        yet started running) — that earlier one is dropped first, so a
+        burst of these only ever runs its last one. The default group
+        (_PLAYBACK_COALESCE_GROUP) covers playback-directing commands —
+        e.g. an aggressive seek-bar scrub sending a SET_STATE per pixel,
+        or a natural track end racing a user's explicit skip — matching
+        what the old generation-based supersede mechanism did. An item
+        already running can't be preempted outright (nothing interrupts
+        an in-flight device round trip), but apply_remote_state()
+        cooperatively checks _superseded_by_newer_command() at its own
+        natural checkpoints and bails out early rather than committing
+        more device work toward a target a newer command has already
+        moved past — see there for why that matters (rapid swiping can
+        otherwise visibly land on a track in the middle of the swipe
+        instead of the final one, on a renderer slow enough that commands
+        stop overlapping cleanly).
+
+        A different coalesce_group (e.g. VOLUME_COALESCE_GROUP) gets the
+        same flood protection without cross-cancelling an unrelated
+        group's pending command — an incoming volume adjustment must
+        never supersede a playback-directing one already queued, or vice
+        versa. Plain FIFO commands (coalesce=False, the default) stay
+        uncoalesced and are never affected by any of this.
         """
         if coalesce:
-            for pending in self._pending_coalescable:
-                pending.cancelled = True
-            self._pending_coalescable.clear()
-        item = _CommandQueueItem(coro_fn, coalesce)
+            prior = self._pending_coalescable.get(coalesce_group)
+            if prior is not None:
+                prior.cancelled = True
+        item = _CommandQueueItem(coro_fn, coalesce, coalesce_group)
         if coalesce:
-            self._pending_coalescable.append(item)
+            self._pending_coalescable[coalesce_group] = item
         self._command_queue.put_nowait(item)
 
     def _superseded_by_newer_command(self) -> bool:
-        """Whether a newer coalescible command is already queued behind
-        whatever's currently running — see enqueue(). apply_remote_state()
-        checks this at its own checkpoints, between awaits, to bail out of
-        driving the device toward a target that's already known to be
-        stale rather than running it to completion first: the goal is
-        always the *latest* desired state, not every intermediate one a
-        burst of rapid commands happened to name along the way — the
-        queued command that will run next does its own complete job
-        regardless, so nothing here is lost by stopping early."""
-        return bool(self._pending_coalescable)
+        """Whether a newer coalescible *playback-directing* command is
+        already queued behind whatever's currently running — see
+        enqueue(). apply_remote_state() checks this at its own
+        checkpoints, between awaits, to bail out of driving the device
+        toward a target that's already known to be stale rather than
+        running it to completion first: the goal is always the *latest*
+        desired state, not every intermediate one a burst of rapid
+        commands happened to name along the way — the queued command
+        that will run next does its own complete job regardless, so
+        nothing here is lost by stopping early. Deliberately scoped to
+        _PLAYBACK_COALESCE_GROUP only — an unrelated pending volume
+        command must never make playback-directing code bail out."""
+        return self._pending_coalescable.get(_PLAYBACK_COALESCE_GROUP) is not None
 
     async def _command_consumer_loop(self) -> None:
         """The only thing that ever runs a queued command — one at a time,
@@ -877,13 +941,12 @@ class QobuzPlayer:
                 break
             try:
                 if item.coalesce:
-                    # No longer pending: about to run, or already dropped
-                    # by a later coalescing command (already removed from
-                    # this list in that case — remove() would raise).
-                    try:
-                        self._pending_coalescable.remove(item)
-                    except ValueError:
-                        pass
+                    # No longer pending: about to run, or already
+                    # superseded by a later command in the same group
+                    # (which has since taken this slot for itself — only
+                    # clear it if it's still this exact item).
+                    if self._pending_coalescable.get(item.coalesce_group) is item:
+                        del self._pending_coalescable[item.coalesce_group]
                 if item.cancelled:
                     logger.debug("Command queue: skipping a coalesced-away item")
                     continue

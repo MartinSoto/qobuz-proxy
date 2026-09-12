@@ -37,6 +37,7 @@ from qobuz_proxy.playback import (
     VolumeCommandHandler,
 )
 from qobuz_proxy.playback.command_handler import MSG_TYPE_SET_STATE
+from qobuz_proxy.playback.player import VOLUME_COALESCE_GROUP
 from qobuz_proxy.backends import AudioBackend, BackendFactory, PlaybackState
 from qobuz_proxy.playback.play_reporter import PlayReporter
 from qobuz_proxy.playback.state_reporter import PlaybackStateReport
@@ -653,8 +654,20 @@ class Speaker:
                 for msg_type in volume_handler.get_message_types():
                     self._ws_manager.register_handler(
                         msg_type,
+                        # coalesce=True, its own group (VOLUME_COALESCE_GROUP):
+                        # a burst of rapid volume commands — most notably a
+                        # server echoing our own volume report straight back
+                        # as a fresh command, observed live to cycle through
+                        # several recently-seen values rather than repeat one
+                        # — must only ever run its last one, the same flood
+                        # protection SET_STATE already had. A separate group
+                        # from playback-directing commands: an unrelated
+                        # pending volume adjustment must never supersede (or
+                        # be superseded by) a queued track change.
                         lambda mt, msg: player.enqueue(
-                            functools.partial(volume_handler.handle_message, mt, msg)
+                            functools.partial(volume_handler.handle_message, mt, msg),
+                            coalesce=True,
+                            coalesce_group=VOLUME_COALESCE_GROUP,
                         ),
                     )
 
