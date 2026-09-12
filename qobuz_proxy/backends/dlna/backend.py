@@ -104,6 +104,28 @@ _STOP_CONFIRMATIONS = 3
 # ended while genuinely still playing) is worse than a slow correct one.
 _UNCONFIRMED_STOP_TIMEOUT_SECONDS = 10.0
 
+# How close the last known position must have been to the track's own known
+# duration for an otherwise-unconfirmed raw STOPPED read (while PLAYING) to
+# be trusted immediately instead of waiting on _device_confirms_stopped() or
+# _UNCONFIRMED_STOP_TIMEOUT_SECONDS — see its use in _poll_state_loop.
+# Confirmed directly, live (qobuz-queue-play-to-end-of-album.log,
+# 2026-09-12): at the natural end of a queue, Sonos's CurrentTransportState
+# reports plain STOPPED correctly and immediately (matching what the Sonos
+# app itself shows), but _device_confirms_stopped()'s own corroboration
+# signal (GetPositionInfo.TrackURI) never changes away from the finished
+# track — so a genuine, already-unambiguous stop only ever got trusted via
+# the far slower timeout fallback. "We were already essentially at the end"
+# is real, independent evidence a plain repeat-count isn't: a Sonos
+# disturbance unrelated to our own playback (see
+# test_natural_track_end_not_confirmed_while_device_still_shows_our_content,
+# reproducing test2.log, 2026-08-27) can also report STOPPED for several
+# consecutive polls while only a fraction of the track has streamed — a
+# repeat count alone can't tell that apart from a real end, only position
+# vs. duration can. Generous relative to STATE_POLL_INTERVAL_SECONDS (the
+# last known position is always at least one poll interval stale) without
+# being so generous it'd trust a stop from comfortably mid-track.
+_NEAR_KNOWN_END_TOLERANCE_MS = 3000
+
 # Grace period during which transport state is expected to be transiently
 # unreliable (seconds) — covers both a track just starting (prevents false
 # track-ended events while the device is loading) and a coordinator
@@ -1420,7 +1442,7 @@ class DLNABackend(AudioBackend):
                 # A STOPPED read while we think we're still PAUSED or
                 # PLAYING — a confirmed external stop, or (PLAYING case) a
                 # natural end — is never trusted from a single unconfirmed
-                # read alone. Two independent paths to trusting it, either
+                # read alone. Three independent paths to trusting it, any
                 # one enough:
                 #   (a) the fast path — _device_confirms_stopped() actually
                 #       returns True. While PAUSED that must happen
@@ -1431,11 +1453,24 @@ class DLNABackend(AudioBackend):
                 #       a single confirmed read is trusted immediately, as
                 #       before — natural end already has the grace period
                 #       and gapless-armed handling protecting it.
-                #   (b) the fallback — a raw STOPPED read has persisted for
+                #   (b) the near-known-end path — while PLAYING specifically,
+                #       the last known position was already within
+                #       _NEAR_KNOWN_END_TOLERANCE_MS of the track's own known
+                #       duration, regardless of what _device_confirms_
+                #       stopped() (a) says. See that constant's own comment
+                #       for why "already near the end" — not just repetition
+                #       — is the evidence that actually distinguishes a real
+                #       natural end from an unrelated Sonos disturbance mid-
+                #       track (which can also report STOPPED for several
+                #       consecutive polls — see
+                #       test_natural_track_end_not_confirmed_while_device_
+                #       still_shows_our_content).
+                #   (c) the fallback — a raw STOPPED read has persisted for
                 #       _UNCONFIRMED_STOP_TIMEOUT_SECONDS regardless of (a)
-                #       ever succeeding, for a device that never clears its
-                #       own TrackURI at all. See both constants' own
-                #       comments.
+                #       or (b) ever succeeding — a device that never clears
+                #       its own TrackURI *and* an unknown/stale duration (so
+                #       (b) has no evidence to work with either). See both
+                #       constants' own comments.
                 # A "cold" pause — nothing ever started on this device —
                 # never reaches this since self._state stays whatever it
                 # was before, never PAUSED, in that case.
@@ -1449,6 +1484,11 @@ class DLNABackend(AudioBackend):
                     timed_out = (
                         time.monotonic() - self._unconfirmed_stop_since
                         >= _UNCONFIRMED_STOP_TIMEOUT_SECONDS
+                    )
+                    near_known_end = (
+                        was_playing
+                        and self._duration_ms > 0
+                        and self._position_ms >= self._duration_ms - _NEAR_KNOWN_END_TOLERANCE_MS
                     )
 
                     if was_playing and self._next_track_proxy_url:
@@ -1473,6 +1513,8 @@ class DLNABackend(AudioBackend):
                     if in_grace_period:
                         confirmed = False
                         self._unconfirmed_stop_polls = 0
+                    elif near_known_end:
+                        confirmed = True
                     elif await self._device_confirms_stopped():
                         if was_playing:
                             confirmed = True

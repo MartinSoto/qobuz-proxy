@@ -1775,8 +1775,18 @@ class QobuzPlayer:
                 )
                 return
 
-        # No next track available - stop playback
+        # No next track available - stop playback. Must actually tell the
+        # backend to stop, not just update our own bookkeeping — left as a
+        # bare state update before, this never sent AVTransport.Stop, so a
+        # Sonos device left on a non-NORMAL play mode (REPEAT_ONE/ALL, set
+        # by anything else that last touched it — the Qobuz protocol layer
+        # has no visibility into or control over this) would keep looping
+        # the last track forever with nothing here ever telling it to stop.
+        # See _intended_playing for why that's reset here too, same as
+        # every other real stop path in this class (_stop_playback_locked).
         logger.info("No next track available - playback stopped")
+        self._intended_playing = False
+        await self.backend.stop()
         self._state = PlaybackState.STOPPED
         self._current_track = None
         self._position_value_ms = 0

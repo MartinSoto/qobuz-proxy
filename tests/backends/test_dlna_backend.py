@@ -1367,6 +1367,39 @@ class TestPollStateLoop:
         callback.assert_called_once()
         assert retired == [8, 7]
 
+    async def test_natural_track_end_confirmed_quickly_when_near_known_end(self) -> None:
+        """Reproduces the last-track-in-queue hang, fixed (qobuz-queue-
+        play-to-end-of-album.log, 2026-09-12): Sonos's CurrentTransportState
+        genuinely and immediately reports STOPPED at the natural end of a
+        queue, but GetPositionInfo.TrackURI never stops reporting the
+        finished track's own URI, so _device_confirms_stopped() never
+        returns True. Previously this only ever got confirmed via the full
+        _UNCONFIRMED_STOP_TIMEOUT_SECONDS fallback (see the test below) even
+        though the last known position already sat right at the track's own
+        known duration — unambiguous evidence on its own that this is a
+        real end, not a transient disturbance (contrast the "still shows
+        our content" test above, where duration/position give no such
+        evidence and the read must not be trusted)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._state = PlaybackState.PLAYING
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
+        # Fixture default already reports the matching (still-ours) URI —
+        # never confirms via _device_confirms_stopped(), same as the real
+        # bug. The near-known-end evidence must carry this on its own.
+        backend._duration_ms = 330000
+        backend._position_ms = 328500  # well within tolerance of the end
+        callback = MagicMock()
+        backend.on_track_ended(callback)
+        state_callback = MagicMock()
+        backend.on_state_change(state_callback)
+
+        await self._run_poll_cycles(backend, cycles=1)
+
+        callback.assert_called_once()
+        state_callback.assert_called_once_with(PlaybackState.STOPPED)
+
     async def test_natural_track_end_eventually_trusted_via_timeout_fallback(self) -> None:
         """Reproduces the last-track-in-queue hang (test1.log, 2026-08-28):
         the last queued track finishes with nothing armed next, but Sonos
