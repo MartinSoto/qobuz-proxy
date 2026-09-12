@@ -583,11 +583,21 @@ class SonosDiscoveryManager:
         plus whoever it's currently combined with to play together, not
         the household's static rooms), coordinator called out separately
         from its other members since it's the only one commands can
-        target. Bonded stereo pairs and HT satellites are never dynamic
-        group members in their own right (SonosGroup.member_uuids only
-        ever holds direct ZoneGroupMember children — see topology.py's
-        module docstring), so nothing here needs to filter Invisible
-        entries the way discovery/enrichment does."""
+        target.
+
+        A bonded stereo pair's non-coordinator is normally only ever a
+        nested, Invisible ZoneGroupMember of its pair's own group — never
+        a coordinator in its own right — which is what the previous
+        version of this docstring assumed made filtering unnecessary here.
+        A real household disproved that (2026-09-12): its own
+        ZoneGroupState transiently listed a bonded pair's second unit as
+        the sole member of its *own* self-coordinated ZoneGroup, which
+        this log then displayed as if it were an independent room. Actual
+        processing (_apply_topology) already guards against exactly this
+        by skipping any group whose coordinator resolves to an Invisible
+        member; mirror that guard here too so this diagnostic dump
+        reflects what really got processed instead of contradicting it.
+        """
         if not logger.isEnabledFor(logging.INFO):
             return
         logger.info(
@@ -604,6 +614,16 @@ class SonosDiscoveryManager:
                         ],
                     }
                     for g in groups
+                    # Drop only a *confirmed* Invisible coordinator (see
+                    # docstring above) — a coordinator missing from
+                    # `members` entirely is the incomplete-response case
+                    # this module exists to survive, and must still be
+                    # logged (via _describe_member's placeholder) rather
+                    # than silently dropped.
+                    if not (
+                        (coordinator := members.get(g.coordinator_uuid)) is not None
+                        and coordinator.invisible
+                    )
                 ],
                 indent=2,
             )

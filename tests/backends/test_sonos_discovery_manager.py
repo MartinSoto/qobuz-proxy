@@ -932,6 +932,37 @@ class TestPollOnce:
         assert lost_calls == []
 
 
+class TestLogTopology:
+    """_log_topology's own diagnostic dump used to list a bonded stereo
+    pair's secondary as an independent room whenever Sonos's topology
+    transiently reported it as the sole member of its own self-
+    coordinated ZoneGroup — a real household hit this (2026-09-12).
+    _apply_topology's actual processing already skips any group whose
+    coordinator is Invisible; _log_topology must mirror that guard so the
+    dump reflects what was really processed instead of contradicting it.
+    """
+
+    def test_group_with_invisible_coordinator_is_omitted(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        manager, *_ = _make_manager()
+        members = {
+            "RINCON_A": _member("RINCON_A", "Sala", "10.0.1.30"),
+            "RINCON_A2": _member("RINCON_A2", "Sala", "10.0.1.33", invisible=True),
+        }
+        groups = [
+            SonosGroup(coordinator_uuid="RINCON_A", member_uuids=["RINCON_A", "RINCON_A2"]),
+            # The bonded pair's secondary transiently self-coordinating its
+            # own group — the phantom entry that must not be logged.
+            SonosGroup(coordinator_uuid="RINCON_A2", member_uuids=["RINCON_A2"]),
+        ]
+
+        with caplog.at_level(logging.INFO, logger=MODULE):
+            manager._log_topology(members, groups)
+
+        [record] = [r for r in caplog.records if "topology changed" in r.message]
+        dumped = json.loads(record.message.split("\n", 1)[1])
+        assert [g["group_id"] for g in dumped] == [""]  # only the real "Sala" group
+
+
 class TestPendingGroups:
     """The heart of surviving a real controller handoff: a group_id that
     stops being reported isn't necessarily gone — see the module
