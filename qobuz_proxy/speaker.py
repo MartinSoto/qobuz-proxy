@@ -368,6 +368,28 @@ class Speaker:
         self._backend = backend
         logger.info(f"[{self.name}] Connected to backend: {backend.name}")
 
+        if self._config.auto_managed:
+            # A Sonos auto-discovery household can have any number of rooms
+            # simultaneously discovered — each gets its own Speaker/backend,
+            # connected (and, per DLNABackend.connect(), already polling)
+            # the moment BackendFactory.create_from_config() returns above —
+            # but the app only ever drives one of them at a time (see
+            # AudioBackend.set_active / DLNABackend._poll_state_loop). This
+            # room hasn't been told anything about that yet; left alone, it
+            # polls its physical device forever even if the app never picks
+            # it in this run at all (confirmed live: a genuinely idle room
+            # kept polling continuously for a whole session). A manually
+            # configured speaker keeps the default "active" backend — some
+            # setups never receive a SET_ACTIVE message at all (see
+            # AudioBackend.__init__) and must keep working without one —
+            # but an auto-discovered room is never the only possible
+            # target, so there's no such risk here. Immediately reversing
+            # the poll loop connect() just started is exactly what a real
+            # SrvrRndrSetActive(false) does once a Qobuz session actually
+            # exists for this speaker to receive one from; set_active(True)
+            # resumes it the moment one actually picks this room.
+            await backend.set_active(False)
+
         # Resolve effective quality (handle AUTO_QUALITY)
         self._effective_quality = self._config.max_quality
         if self._effective_quality == AUTO_QUALITY:
