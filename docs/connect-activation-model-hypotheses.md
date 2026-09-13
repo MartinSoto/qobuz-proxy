@@ -353,18 +353,26 @@ never sent anything resembling a play instruction, not (or not only) a
 timing gap. Matches what [[sonos-queue-version-never-echoed]] flagged as
 unconfirmed speculation — now confirmed.
 
-**Not yet implemented.** The fix requires wiring
-`SRVR_CTRL_QUEUE_TRACKS_LOADED` (currently only observed/logged, not
-consumed — see `queue_diagnostics.py`'s own docstring, written before
-this evidence existed) into `Player`: on receipt, while active, load
-`tracks[queuePosition]` and (per normal tap-to-play UX, and because no
-follow-up `SET_STATE` should be assumed to ever arrive) start it playing
-immediately, and echo the message's `queueVersion` back like `SET_STATE`
-already does. Needs the same atomic-apply care `apply_remote_state`
-already has (a burst of rapid taps is exactly the coalescing case
-`_superseded_by_newer_command` exists for) — likely belongs in
-`command_handler.py` alongside `_handle_set_state`, sharing
-`apply_remote_state` rather than duplicating its load/play logic.
+**Implemented (2026-09-13).** `PlaybackCommandHandler._handle_queue_tracks_loaded`
+(`command_handler.py`) now handles `SRVR_CTRL_QUEUE_TRACKS_LOADED`
+directly: while active, loads `tracks[queuePosition]` (absent reads as
+0) and starts it playing immediately via the same `apply_remote_state`
+`_handle_set_state` uses — no separate load/play logic — with
+`position_ms=0` always (tapping a track plays it from the start, per the
+user's own read: "no way to select otherwise, just play"). Echoes
+`queueVersion` back the same way `_handle_set_state` does, *before* the
+active-renderer check — so our own bookkeeping stays current even while
+we're not the one driving playback, ready for whenever we do become
+active. Also populates `_next_track_info` (`tracks[queuePosition + 1]`)
+for gapless, reusing the exact dict shape `_handle_set_state`'s
+`nextQueueItem` handling already produces. Registered in
+`get_message_types()`, dispatched in `handle_message()`, and coalesced
+in the same (default) group as `SET_STATE` in `speaker.py`'s
+registration — a rapid tap burst only ever runs its last one, same
+protection `_superseded_by_newer_command` already gives `SET_STATE`.
+Unit tests: `tests/playback/test_command_handler_queue_tracks_loaded.py`.
+Not yet live-tested — next step per the user's own plan is confirming
+this against a real play-from-tap, then seeking/gapless on top of it.
 
 ## Open questions / not yet tested
 

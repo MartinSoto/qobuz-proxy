@@ -36,7 +36,7 @@ from qobuz_proxy.playback import (
     StateReporter,
     VolumeCommandHandler,
 )
-from qobuz_proxy.playback.command_handler import MSG_TYPE_SET_STATE
+from qobuz_proxy.playback.command_handler import MSG_TYPE_QUEUE_TRACKS_LOADED, MSG_TYPE_SET_STATE
 from qobuz_proxy.playback.player import VOLUME_COALESCE_GROUP
 from qobuz_proxy.backends import AudioBackend, BackendFactory, PlaybackState
 from qobuz_proxy.playback.play_reporter import PlayReporter
@@ -645,9 +645,16 @@ class Speaker:
                 for msg_type in playback_handler.get_message_types():
                     self._ws_manager.register_handler(
                         msg_type,
+                        # QUEUE_TRACKS_LOADED coalesces the same way and in
+                        # the same (default) group as SET_STATE — a rapid
+                        # burst of taps is exactly the case
+                        # _superseded_by_newer_command() exists for, and
+                        # the two message types are just two different ways
+                        # the app signals "play this track now" (see
+                        # MSG_TYPE_QUEUE_TRACKS_LOADED's own comment).
                         lambda mt, msg: player.enqueue(
                             functools.partial(playback_handler.handle_message, mt, msg),
-                            coalesce=(mt == MSG_TYPE_SET_STATE),
+                            coalesce=(mt in (MSG_TYPE_SET_STATE, MSG_TYPE_QUEUE_TRACKS_LOADED)),
                         ),
                     )
 

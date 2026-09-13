@@ -26,12 +26,29 @@ MSG_TYPE_SET_LOOP_MODE = 45  # SrvrRndrSetLoopMode
 MSG_TYPE_SET_SHUFFLE_MODE = 46  # SrvrRndrSetShuffleMode
 MSG_TYPE_SET_AUTOPLAY_MODE = 47  # SrvrRndrSetAutoplayMode
 
+# SrvrCtrlQueueLoadTracks — nominally a Controller-role broadcast (no
+# rendererId field at all — it's session/queue-scoped, not targeted), but
+# this is how the app actually signals "play this queue item", full stop.
+# Confirmed live (2026-09-13, docs/connect-activation-model-hypotheses.md):
+# tapping a track in an album/playlist view never produces a
+# SrvrRndrSetState with a currentQueueItem — only this message, with
+# queuePosition/queueVersion advancing. A Renderer session only receives
+# it at all because of the dual Renderer+Controller join (see
+# ws_manager.py's _send_ctrl_join_session) — previously believed
+# (wrongly, see queue_diagnostics.py) to never reach a renderer socket.
+MSG_TYPE_QUEUE_TRACKS_LOADED = 91  # SrvrCtrlQueueLoadTracks
+
 # The server signals "no current/next track" with an all-bits-set
 # QueueTrackRef rather than omitting the field — HasField() is still True,
 # so these sentinel values must be checked explicitly. Widths match the
 # proto: trackId is fixed32, queueItemId is uint64.
 _SENTINEL_TRACK_ID = 0xFFFFFFFF
 _SENTINEL_QUEUE_ITEM_ID = 0xFFFFFFFFFFFFFFFF
+
+# PlayingState.PLAYING_STATE_PLAYING (qconnect_common.proto) — used directly
+# as an int, the same way _handle_set_state passes state.playingState
+# straight through to apply_remote_state() without a named enum.
+_PLAYING_STATE_PLAYING = 2
 
 
 def _is_no_track_sentinel(ref: Any) -> bool:
@@ -79,6 +96,7 @@ class PlaybackCommandHandler:
             MSG_TYPE_SET_LOOP_MODE,
             MSG_TYPE_SET_SHUFFLE_MODE,
             MSG_TYPE_SET_AUTOPLAY_MODE,
+            MSG_TYPE_QUEUE_TRACKS_LOADED,
         ]
 
     async def handle_message(self, msg_type: int, message: Any) -> None:
@@ -99,6 +117,8 @@ class PlaybackCommandHandler:
                 await self._handle_set_shuffle_mode(message)
             elif msg_type == MSG_TYPE_SET_AUTOPLAY_MODE:
                 await self._handle_set_autoplay_mode(message)
+            elif msg_type == MSG_TYPE_QUEUE_TRACKS_LOADED:
+                await self._handle_queue_tracks_loaded(message)
             else:
                 logger.warning(f"Unhandled playback message type: {msg_type}")
         except Exception as e:
@@ -234,6 +254,94 @@ class PlaybackCommandHandler:
         )
 
         # Notify gapless system about next track change (after state handling)
+        if next_track_changed and self._on_next_track_changed:
+            await self._on_next_track_changed()
+
+    async def _handle_queue_tracks_loaded(self, message: Any) -> None:
+        """
+        Handle SrvrCtrlQueueLoadTracks (type 91) — see MSG_TYPE_QUEUE_TRACKS_LOADED's
+        own comment for why this, not SrvrRndrSetState, is the real "play
+        this" signal for tapping a track in an album/playlist view.
+
+        Carries no rendererId — it's a session-wide Controller broadcast,
+        not targeted at us specifically, so it arrives regardless of which
+        renderer is currently active. Only acted on while we're the active
+        one; otherwise it's not our concern (and, per the same reasoning
+        that gates StateReporter — see its own docstring — nothing of ours
+        should be driven by it either).
+        """
+        if not message.HasField("srvrCtrlQueueTracksLoaded"):
+            logger.warning("QUEUE_TRACKS_LOADED message missing srvrCtrlQueueTracksLoaded field")
+            return
+
+        loaded = message.srvrCtrlQueueTracksLoaded
+
+        # Keep our own queue-version bookkeeping current regardless of
+        # activation state — same reasoning as SET_STATE's queueVersion
+        # handling above: so a report sent once we *do* become active
+        # reflects reality instead of whatever the connect-time restore
+        # last said (see docs/connect-activation-model-hypotheses.md,
+        # "queueVersion never echoed").
+        if loaded.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=loaded.queueVersion.major, minor=loaded.queueVersion.minor)
+            )
+
+        if not self.player.is_active_renderer:
+            logger.debug("Not the active renderer, ignoring QUEUE_TRACKS_LOADED")
+            return
+
+        position = loaded.queuePosition  # absent reads as 0, the server's convention
+        if not (0 <= position < len(loaded.tracks)):
+            logger.warning(
+                f"QUEUE_TRACKS_LOADED: queuePosition={position} out of range "
+                f"for {len(loaded.tracks)} track(s)"
+            )
+            return
+
+        track_ref = loaded.tracks[position]
+        # Per-track contextUuid, falling back to the message-level one —
+        # mirrors currentQueueItem.contextUuid's own fallback in
+        # _handle_set_state above.
+        context_uuid = (
+            track_ref.contextUuid
+            if track_ref.contextUuid
+            else (loaded.contextUuid if loaded.contextUuid else None)
+        )
+
+        logger.info(f"QUEUE_TRACKS_LOADED selects position {position}: trackId={track_ref.trackId}")
+
+        # Tapping a track plays it, full stop — no follow-up SrvrRndrSetState
+        # should be assumed to ever arrive to say so explicitly (confirmed
+        # live: see the doc reference above). Always starts at 0, not
+        # wherever a stale _current_track happened to be paused.
+        await self.player.apply_remote_state(
+            track_id=str(track_ref.trackId),
+            queue_item_id=track_ref.queueItemId,
+            position_ms=0,
+            playing_state=_PLAYING_STATE_PLAYING,
+            context_uuid=context_uuid,
+        )
+
+        # Populate next-track info for gapless, the same way a SET_STATE's
+        # nextQueueItem does — we already have the whole queue right here.
+        next_position = position + 1
+        next_track_changed = False
+        if next_position < len(loaded.tracks):
+            next_ref = loaded.tracks[next_position]
+            next_context_uuid = next_ref.contextUuid if next_ref.contextUuid else context_uuid
+            new_next_info = {
+                "queueItemId": next_ref.queueItemId,
+                "trackId": str(next_ref.trackId),
+                "contextUuid": next_context_uuid,
+            }
+            if new_next_info != self._next_track_info:
+                next_track_changed = True
+            self._next_track_info = new_next_info
+        elif self._next_track_info is not None:
+            self._next_track_info = None
+            next_track_changed = True
+
         if next_track_changed and self._on_next_track_changed:
             await self._on_next_track_changed()
 
