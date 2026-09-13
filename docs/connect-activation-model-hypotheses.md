@@ -8,14 +8,15 @@ from this proxy (`qobuz-player-take-from-proxy.har` + a matching
 `qobuz-queue.log`) — all 2026-09-13, via `scripts/qconnect_trace.py`.**
 The bug the third capture found (see "Fixes implemented" below) is now
 fixed, unit-tested, and confirmed live: tap-to-play, seeking, and album
-switching all work with the controller role active. One further bug this
-surfaced (a fresh process's first tap playing a stale restored track
-instead) is masked for the tap-a-track case but **confirmed still live**
-for plain "press play" right after a reconnect — a first attempted fix
-(gating `isActive`) broke real device activation entirely and was
-reverted; see "The first track after a fresh start didn't play" below
-for the full arc, including exactly which path remains fragile and why.
-This doc exists to hold the hypotheses and the evidence for/against each
+switching all work with the controller role active. A further, separate
+symptom this surfaced (a fresh process's first tap playing an
+already-loaded track instead of the newly-tapped one) turned out, on
+reflection, not to be a server bug at all — see "The first track after a
+fresh start didn't play" below for the full arc, including a first
+attempted fix (gating `isActive`) that broke real device activation and
+was reverted, and the final correction: the "stale restore" framing was
+wrong throughout, and there is no known bug left to fix here. This doc
+exists to hold the hypotheses and the evidence for/against each
 one steady across sessions, not to declare the investigation finished.
 
 ## Context
@@ -392,12 +393,15 @@ The user's own diagnosis, checked directly against a fresh capture
 
 `WsManager._send_join_session()` claimed `isActive=true` unconditionally
 on *every* `JOIN_SESSION`, including a truly fresh process start with
-nothing of our own loaded yet. The server tracks its own last-known
-state per `deviceUuid` across reconnects, so an `isActive=true` join —
-whatever the reason — gets a restore `SET_STATE` handed straight back:
-`currentQueueItem` = queueItemId 1 / trackId 46554934, paused at 0ms —
-the *literal same* track/queueItemId every earlier capture that day had
-already restored, confirming it as genuinely stale, not this session's.
+nothing of our own loaded yet. An `isActive=true` join gets a restore
+`SET_STATE` handed straight back: `currentQueueItem` = queueItemId 1 /
+trackId 46554934, paused at 0ms — the *literal same* track/queueItemId
+every earlier capture that day had already restored. Read in the moment
+as proof of genuine server-side staleness — **later reconsidered and
+retracted, see the correction further below**: this is at least as
+plausibly the account's one real shared listening queue genuinely not
+having moved between those captures (nothing else was played on any
+device in between, same day, short gap), not evidence of anything wrong.
 We loaded it (`"Loading new track: 46554934"`) and sat paused, exactly
 as designed.
 
@@ -550,27 +554,41 @@ log, pins this down precisely rather than leaving it a guess:
   through `QUEUE_TRACKS_LOADED` (instant load+play) instead of a bare
   "play", cleanly overriding the wrong restore before it was ever heard.
 
-So this isn't "usually accurate, occasionally drifts" — the restore can
-hand back a track with no relation at all to the real last session, and
-it happened on the very next restart after a genuinely correct one.
-`initialState` did not fix this (can't even confirm the server reads
-it — no diagnostic distinguishes "used my hint" from "ignored it").
-What actually makes the system robust is the earlier
-`QUEUE_TRACKS_LOADED` fix: a stale restore can no longer *stick* once
-any real tap arrives, because a tap now always supersedes it via a
-load+play message rather than a bare `SET_STATE{playingState: PLAYING}`
-that blindly trusts whatever's already loaded.
+**Correction (2026-09-13, same day): this was never staleness at all —
+the user's own read is the right one.** `SRVR_CTRL_SESSION_STATE`'s
+`queueVersion`/`trackIndex` are scoped to the *session*
+(`sessionUuid`), not to a specific renderer — there is one shared,
+account-level queue (matches hypothesis #1: one Connect session per
+user), and a Connect renderer is just one possible *output* for it, not
+a separate queue owner. The Qobuz app almost certainly doesn't run two
+playback engines, one for local listening and one for "Connect" — its
+normal player and its Connect queue are the same underlying object;
+selecting a Connect renderer just changes where the audio comes out.
+So playing something directly on the phone — no Connect renderer
+selected, or a different one — still advances the *same* shared session
+queue. When the proxy reconnects and gets reselected, the restore it
+receives is the session's genuinely current state, not a stale cache of
+*this renderer's* own history — there never was a renderer-scoped
+history separate from the session's to begin with. Session 2→3's
+"unrelated" restore almost certainly just reflects the user listening
+to something else directly on the phone during the ~30s the proxy was
+down — invisible to the proxy's own log by construction, since there
+was no WS connection during that gap to record anything.
 
-**The one gap that remains, now precisely identified rather than
-theoretical**: pressing plain "play" (not tapping a track) right after
-a restore is still exactly as fragile as the original bug — session 2
-only worked because the restore happened to be accurate that time,
-and session 3's restore proves the *same* staleness is still very much
-live and could hit that exact path on any given reconnect. `initialState`
-stays in (harmless either way), but the real fix — making the renderer
-itself distrust an unconfirmed restore rather than resuming it on a bare
-"play" — is still the outstanding, not-yet-attempted work described
-above.
+This retracts both "confirmed genuinely stale" claims above (the
+20:44 run's restore, and session 2→3's) — recorded as "stale" in real
+time without seriously considering this alternative, which fits the
+architecture and the evidence at least as well and requires no server
+misbehavior at all. **There is no known bug here any more.** Trusting
+the restore on a bare "play" is very plausibly *correct* behavior
+(resuming the account's real current queue), not a race to guard
+against — the "distrust the restore" fix floated above would mean
+deliberately ignoring accurate state, and should not be implemented on
+the strength of this investigation. `initialState` stays in (harmless,
+and its actual effect is still unconfirmed either way), but this
+specific line of investigation is closed pending actual counter-evidence
+— e.g. a restore that's wrong even when the phone demonstrably touched
+nothing in between.
 
 ## Open questions / not yet tested
 
