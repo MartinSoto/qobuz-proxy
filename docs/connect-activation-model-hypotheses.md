@@ -7,9 +7,13 @@ second web-player HAR captured from a genuinely fresh login
 from this proxy (`qobuz-player-take-from-proxy.har` + a matching
 `qobuz-queue.log`) — all 2026-09-13, via `scripts/qconnect_trace.py`.**
 The bug the third capture found (see "Fixes implemented" below) is now
-fixed and unit-tested, but not yet live-tested against a real household —
-this doc exists to hold the hypotheses and the evidence for/against each
-one steady across sessions, not to declare the investigation finished.
+fixed, unit-tested, and confirmed live: tap-to-play, seeking, and album
+switching all work with the controller role active. One further bug this
+surfaced (a fresh process's first tap playing a stale restored track
+instead) is also fixed — see "The first track after a fresh start didn't
+play" below. This doc exists to hold the hypotheses and the evidence
+for/against each one steady across sessions, not to declare the
+investigation finished.
 
 ## Context
 
@@ -371,8 +375,82 @@ in the same (default) group as `SET_STATE` in `speaker.py`'s
 registration — a rapid tap burst only ever runs its last one, same
 protection `_superseded_by_newer_command` already gives `SET_STATE`.
 Unit tests: `tests/playback/test_command_handler_queue_tracks_loaded.py`.
-Not yet live-tested — next step per the user's own plan is confirming
-this against a real play-from-tap, then seeking/gapless on top of it.
+
+**Confirmed live (2026-09-13):** tap-to-play, seeking, and switching
+albums all work as intended with this fix in place — see the next
+section for the one remaining gap it exposed.
+
+## The first track after a fresh start didn't play — `isActive` was the cause
+
+Everything above worked immediately except one case: the very first
+track selected right after a freshly started proxy process did nothing.
+The user's own diagnosis, checked directly against a fresh capture
+(`qobuz-queue.log`, 2026-09-13, 20:44 run) and confirmed correct:
+
+`WsManager._send_join_session()` claimed `isActive=true` unconditionally
+on *every* `JOIN_SESSION`, including a truly fresh process start with
+nothing of our own loaded yet. The server tracks its own last-known
+state per `deviceUuid` across reconnects, so an `isActive=true` join —
+whatever the reason — gets a restore `SET_STATE` handed straight back:
+`currentQueueItem` = queueItemId 1 / trackId 46554934, paused at 0ms —
+the *literal same* track/queueItemId every earlier capture that day had
+already restored, confirming it as genuinely stale, not this session's.
+We loaded it (`"Loading new track: 46554934"`) and sat paused, exactly
+as designed.
+
+Then, ~7s later, the user's actual tap arrived — but not as a
+`QUEUE_TRACKS_LOADED` the way every later tap in this same session
+would. It was a bare `SET_STATE{playingState: PLAYING_STATE_PLAYING}`,
+with no track info at all. Reading that as "resume whatever's already
+loaded" (correct, general behavior — see the omission-vs-sentinel
+handling elsewhere in `_handle_set_state`) meant starting the *stale*
+restored track instead: `"Starting playback: track 46554934"`, and
+indeed `"Playing: Andy Sheppard - Thirteen"` — a track from hours
+earlier, not whatever the user actually tapped. The app's own UI,
+seeing the server tell it Cuarto already had a track loaded, apparently
+trusted that and sent a plain "play" instead of a fresh queue load —
+the same trust that makes every *later* tap in this session correctly
+skip resending `currentQueueItem` once we're actually in sync (see the
+section above). The bug was self-inflicted: claiming `isActive` for a
+session with no real state manufactured a false "already in sync"
+belief on both sides right from the start.
+
+### Fix (implemented, 2026-09-13)
+
+`Player.has_resumable_playback()` (`player.py`) — true only while we're
+both already believed active (`is_active_renderer`, survives a
+reconnect) *and* actually holding a loaded track in `PLAYING`/`PAUSED`
+(the same "content of our own" test `claim_device()` already uses to
+decide whether it's safe to leave a device alone). False on a fresh
+process start, where nothing has ever been loaded.
+
+`WsManager._send_join_session()` now consults it (injected the same way
+`is_worth_keeping_alive` already is — see `speaker.py`'s `WsManager(...)`
+construction) instead of defaulting straight to `True`, *unless*
+`force_reconnect()`'s existing one-shot override has already forced
+`False` for hijack recovery — that override still wins outright,
+unchanged. A genuine WS blip or token-refresh reconnect mid-playback
+still claims active immediately, exactly as before; only a truly fresh
+start (or a reconnect after being told we're not active, or after our
+own `stop_playback()` — which deliberately leaves a stale
+`_current_track` behind, see its own docstring) now joins passively
+instead.
+
+Deliberately *not* implemented: also sending our own real state via
+`JOIN_SESSION`'s `initialState` field when we do claim active. Not
+required for this fix (once we only claim active when the server's own
+memory should already agree with ours, there's nothing to correct), and
+the field's exact shape is unconfirmed against any real capture —
+`RendererState` (`qconnect_common.proto`) has a `currentQueueIndex`
+field with a *commented-out* alternate `currentQueueItemId` right next
+to it, and no capture across this entire investigation has ever shown a
+real client sending `initialState` at all (every real client capture
+skips `JOIN_SESSION` entirely — see "A fresh login still sends no
+JOIN_SESSION at all" above). Left as a documented non-fix rather than a
+guess.
+
+Tests: `TestHasResumablePlayback` (`tests/playback/test_player.py`),
+`TestSendJoinSession`'s new cases (`tests/connect/test_ws_manager.py`).
 
 ## Open questions / not yet tested
 

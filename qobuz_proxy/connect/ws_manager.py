@@ -81,17 +81,19 @@ HIJACK_RECONNECT_HOLD_SECONDS = 8.0
 # Message handler callback type
 MessageHandler = Callable[[int, Any], None]
 
-# Server -> Controller queue/session message types the proxy never registers
-# a handler for — it's Renderer-only (see queue.py's module docstring: a
-# Renderer session is assumed to never receive these at all). A real capture
-# (qobuz-queue-1.log, 2026-09-12: four explicit track taps within one album
-# via SET_STATE, tracked with this very logging in place) saw none of
-# them arrive, consistent with that assumption rather than against it — kept
-# here anyway as a standing, zero-cost tripwire in case a different flow
-# (queue reorder, the app's own queue UI, autoplay) ever does trigger one.
-# Deliberately observation-only: no parsing, no state kept, just a clearly
-# labeled log line instead of letting them blend into the generic "no
-# handler" fallback below if/when they do show up.
+# Server -> Controller queue/session message types the proxy doesn't drive
+# playback from. Originally believed Renderer-unreachable entirely (see
+# queue.py's module docstring) — wrong, see command_handler.py's
+# MSG_TYPE_QUEUE_TRACKS_LOADED: type 91 both arrives (because of the dual
+# Renderer+Controller join) and turned out to be the real "play this
+# track" signal, confirmed live 2026-09-13
+# (docs/connect-activation-model-hypotheses.md) and now handled by
+# PlaybackCommandHandler — removed from this dict since a real handler is
+# registered for it and this fallback branch can no longer fire for it.
+# The rest are kept as a standing, zero-cost tripwire logging a clearly
+# labeled line (rather than blending into the generic "no handler"
+# fallback below) in case one of them turns out to matter too.
+# Deliberately observation-only otherwise: no parsing, no state kept.
 # Names mirror the QConnectMessageType enum (qconnect_payload.proto) — kept
 # as a plain literal dict rather than looked up via the generated pb2 module
 # (untyped: no stubs installed for google.protobuf, same gap protocol.py
@@ -101,7 +103,6 @@ _QUEUE_POSITION_MESSAGE_TYPES = {
     81: "SRVR_CTRL_SESSION_STATE",  # trackIndex
     89: "SRVR_CTRL_QUEUE_CLEARED",
     90: "SRVR_CTRL_QUEUE_STATE",  # full ordered queue snapshot
-    91: "SRVR_CTRL_QUEUE_TRACKS_LOADED",  # full queue + starting position
     92: "SRVR_CTRL_QUEUE_TRACKS_INSERTED",
     93: "SRVR_CTRL_QUEUE_TRACKS_ADDED",
     94: "SRVR_CTRL_QUEUE_TRACKS_REMOVED",
@@ -156,6 +157,7 @@ class WsManager:
         config: Config,
         api_client: Optional["QobuzAPIClient"] = None,
         is_worth_keeping_alive: Optional[Callable[[], bool]] = None,
+        has_resumable_playback: Optional[Callable[[], bool]] = None,
     ):
         """
         Initialize WebSocket manager.
@@ -175,10 +177,19 @@ class WsManager:
                 naturally instead of being kept alive forever in the
                 background. None (e.g. in tests, or when no such policy is
                 wired up) always keeps refreshing, matching prior behavior.
+            has_resumable_playback: Queried by every JOIN_SESSION (see
+                _send_join_session) to decide whether it should claim
+                isActive=true — lets the caller (Player, via
+                has_resumable_playback) say "yes, I genuinely have real
+                state of my own worth resuming" (a WS blip or token-
+                refresh reconnect mid-playback) as opposed to a fresh
+                process start with nothing loaded yet. None (e.g. in
+                tests) always claims active, matching prior behavior.
         """
         self.config = config
         self._api_client = api_client
         self._is_worth_keeping_alive = is_worth_keeping_alive
+        self._has_resumable_playback = has_resumable_playback
         self._device_uuid = self._uuid_to_bytes(config.device.uuid)
         self._codec = ProtocolCodec(self._device_uuid)
 
@@ -665,7 +676,19 @@ class WsManager:
             logger.error("No session UUID for join session")
             return
 
-        claims_active = self._next_join_claims_active
+        # force_reconnect()'s one-shot override always wins outright — a
+        # forced False must never be upgraded back to True by the resumable-
+        # playback check below (see force_reconnect's own docstring: the
+        # whole point is to deliberately *not* reclaim active status on
+        # this specific rejoin). Absent that override, default to whatever
+        # has_resumable_playback says instead of unconditionally True — see
+        # Player.has_resumable_playback's own docstring for why a plain
+        # default of True fed the server a stale restore on every fresh
+        # process start.
+        if self._next_join_claims_active:
+            claims_active = self._has_resumable_playback() if self._has_resumable_playback else True
+        else:
+            claims_active = False
         self._next_join_claims_active = True  # one-shot — restore the default for next time
 
         join_frame = self._codec.encode_join_session(

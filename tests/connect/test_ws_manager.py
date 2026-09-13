@@ -399,6 +399,57 @@ class TestSendJoinSession:
 
         ws_manager._ws.send.assert_not_called()
 
+    async def test_has_resumable_playback_false_does_not_claim_active(self, config: Config) -> None:
+        """Regression (2026-09-13, docs/connect-activation-model-hypotheses.md):
+        unconditionally claiming isActive on a fresh process start (nothing
+        of our own loaded yet) made the server hand back its own stale
+        last-known state for this deviceUuid, which then broke the first
+        real track selection after every fresh start."""
+        ws_manager = WsManager(config, has_resumable_playback=lambda: False)
+        ws_manager._session_uuid = b"0" * 16
+        ws_manager._ws = AsyncMock()
+
+        with patch.object(
+            ws_manager._codec, "encode_join_session", return_value=b"frame"
+        ) as mock_encode:
+            await ws_manager._send_join_session()
+
+        assert mock_encode.call_args.kwargs["is_active"] is False
+
+    async def test_has_resumable_playback_true_claims_active(self, config: Config) -> None:
+        # e.g. a WS blip or token-refresh reconnect mid-playback — must
+        # still claim active immediately, exactly as before this predicate
+        # existed.
+        ws_manager = WsManager(config, has_resumable_playback=lambda: True)
+        ws_manager._session_uuid = b"0" * 16
+        ws_manager._ws = AsyncMock()
+
+        with patch.object(
+            ws_manager._codec, "encode_join_session", return_value=b"frame"
+        ) as mock_encode:
+            await ws_manager._send_join_session()
+
+        assert mock_encode.call_args.kwargs["is_active"] is True
+
+    async def test_forced_override_wins_over_a_true_predicate(self, config: Config) -> None:
+        """force_reconnect()'s one-shot False must never be upgraded back
+        to True by has_resumable_playback — the whole point of that
+        override is to deliberately not reclaim active status on this
+        specific rejoin (see force_reconnect's own docstring), regardless
+        of what Player's own state says."""
+        ws_manager = WsManager(config, has_resumable_playback=lambda: True)
+        ws_manager._session_uuid = b"0" * 16
+        ws_manager._ws = AsyncMock()
+        ws_manager._next_join_claims_active = False
+
+        with patch.object(
+            ws_manager._codec, "encode_join_session", return_value=b"frame"
+        ) as mock_encode:
+            await ws_manager._send_join_session()
+
+        assert mock_encode.call_args.kwargs["is_active"] is False
+        assert ws_manager._next_join_claims_active is True  # still reset for next time
+
 
 class TestHandlerRegistration:
     """Tests for message handler registration."""
