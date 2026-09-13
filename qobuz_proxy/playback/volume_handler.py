@@ -72,19 +72,42 @@ class VolumeCommandHandler:
 
     async def _handle_volume_changed(self, message: Any) -> None:
         """
-        Handle SRVR_CTRL_VOLUME_CHANGED message.
+        Handle SRVR_CTRL_VOLUME_CHANGED (type 87).
 
-        This is a broadcast from server when another controller changed volume.
-        We apply it if the renderer ID matches ours.
+        Observation only — never re-applies the volume. This is a
+        Controller-facing broadcast ("some renderer's volume is now X",
+        for a UI to display), not a command; the actual command a
+        Renderer must act on is SRVR_RNDR_SET_VOLUME (type 42), handled
+        above. This proxy's own Controller join is deliberately
+        listen-only (see ws_manager.py's _send_ctrl_join_session).
+
+        Regression (2026-09-13, live-observed "volume knob jittering"):
+        this used to call player.set_volume(volume) unconditionally for
+        *any* rendererId — including our own. Since this proxy joins
+        Renderer and Controller on the same socket, every one of our own
+        outbound RNDR_SRVR_VOLUME_CHANGED reports gets broadcast straight
+        back to us on the Controller channel as this exact message,
+        carrying our own rendererId. Re-applying it as if it were a
+        fresh command turned our own report into another volume change,
+        which produced another report, which came back again — an
+        unbounded loop in principle, visibly bounded in practice only by
+        the same-value no-op guard and coalescing (see set_volume()'s own
+        comments) once two real, adjacent slider values were in flight:
+        confirmed directly in a capture as a repeating A/B oscillation
+        (e.g. 13/14, later 23/27/31) between recently-seen real values,
+        each one actually reaching the physical device before the next
+        overwrote it — exactly the "knob jumping back and forth"
+        symptom, and structurally the same shape as the original
+        SET_VOLUME echo/flood bug this proxy has already fixed once
+        under a different cause (see this module's sibling history and
+        docs/gapless-arming-and-token-expiry.md-adjacent volume notes).
         """
         if not message.HasField("srvrCtrlVolumeChanged"):
             return
 
         vol_msg = message.srvrCtrlVolumeChanged
-
-        # Note: In a full implementation, we would check rendererId
-        # For single-instance, we assume it's for us
         if vol_msg.HasField("volume"):
-            volume = vol_msg.volume
-            logger.debug(f"Received volume changed broadcast: {volume}")
-            await self.player.set_volume(volume)
+            logger.debug(
+                f"Observed SRVR_CTRL_VOLUME_CHANGED (rendererId={vol_msg.rendererId}, "
+                f"volume={vol_msg.volume}) — not applied, see this handler's own docstring"
+            )
