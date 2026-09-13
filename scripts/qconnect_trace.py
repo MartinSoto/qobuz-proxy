@@ -31,8 +31,10 @@ this imports the proxy's own compiled protobuf modules.
 
 import argparse
 import base64
+import hashlib
 import json
 import re
+import secrets
 import sys
 from pathlib import Path
 from typing import Iterator, Tuple
@@ -88,13 +90,46 @@ _ENVELOPE_TYPES = {
 _VOLATILE_SUFFIXES = ("id", "uuid", "time", "date")
 _VOLATILE_EXACT_NAMES = {"timestamp", "channels", "src", "dests", "jwt", "token"}
 
-_REDACTED_BYTES = b"<redacted>"
-_REDACTED_STRING = "<redacted>"
+# A fresh salt every run (2026-09-13) — deliberately *not* stable across
+# invocations. A masked value is a keyed hash of the real one, not a fixed
+# placeholder: every volatile value used to collapse to the exact same
+# "<redacted>" string, which threw away the one thing that's actually
+# useful to know about it — whether two occurrences are the *same*
+# identity or different ones (e.g. does a CtrlSrvrSetActiveRenderer's
+# rendererId match one already seen in an ADD_RENDERER broadcast). A
+# per-run salt means that comparison works *within* one trace, which is
+# all this tool ever needs, while a masked value from one run can't be
+# correlated against a masked value from another, later run — nobody
+# should be able to fingerprint a real deviceUuid/jwt/etc. by comparing
+# hashes across two trace files generated at different times.
+_RUN_SALT = secrets.token_bytes(16)
 
 
 def _is_volatile_field(name: str) -> bool:
     lname = name.lower()
     return lname in _VOLATILE_EXACT_NAMES or lname.endswith(_VOLATILE_SUFFIXES)
+
+
+def _digest(raw: bytes) -> bytes:
+    return hashlib.sha256(_RUN_SALT + raw).digest()
+
+
+def _masked_bytes(raw: bytes) -> bytes:
+    # Hex-encoded and re-encoded as ascii bytes (not the raw digest bytes)
+    # so text_format renders this as a clean, comparable quoted string
+    # instead of octal-escaped noise — protobuf only escapes non-printable
+    # bytes, and every hex digit is printable ASCII.
+    return _digest(raw).hex()[:12].encode("ascii")
+
+
+def _masked_string(raw: str) -> str:
+    return _digest(raw.encode("utf-8", "surrogateescape")).hex()[:12]
+
+
+def _masked_int(raw: int) -> int:
+    # Truncated to 31 bits so it fits any int32/uint32/int64/uint64/enum
+    # field without protobuf rejecting an out-of-range value.
+    return int.from_bytes(_digest(str(raw).encode()), "big") & 0x7FFFFFFF
 
 
 def normalize(msg: Message) -> Message:
@@ -103,7 +138,10 @@ def normalize(msg: Message) -> Message:
     (a field that was set stays set, just with its value replaced) —
     losing that distinction would hide a genuine "one side omits this
     field" difference, which is exactly the kind of thing this trace is
-    meant to catch."""
+    meant to catch. The replacement is a hash of the real value (see
+    _RUN_SALT), not a fixed placeholder — so two occurrences of the same
+    underlying id/uuid/jwt/etc. still visibly match each other in the
+    trace, which a fixed placeholder would erase."""
     for field, value in list(msg.ListFields()):
         if field.type == field.TYPE_MESSAGE:
             if field.is_repeated:
@@ -114,22 +152,22 @@ def normalize(msg: Message) -> Message:
         elif _is_volatile_field(field.name):
             if field.is_repeated:
                 seq = getattr(msg, field.name)
-                count = len(seq)
+                masked = (
+                    [_masked_bytes(v) for v in seq]
+                    if field.type == field.TYPE_BYTES
+                    else [_masked_string(v) for v in seq]
+                    if field.type == field.TYPE_STRING
+                    else [_masked_int(v) for v in seq]
+                )
                 del seq[:]
-                if field.type == field.TYPE_BYTES:
-                    seq.extend([_REDACTED_BYTES] * count)
-                elif field.type == field.TYPE_STRING:
-                    seq.extend([_REDACTED_STRING] * count)
-                else:
-                    seq.extend([0] * count)
+                seq.extend(masked)
             elif field.type == field.TYPE_BYTES:
-                setattr(msg, field.name, _REDACTED_BYTES)
+                setattr(msg, field.name, _masked_bytes(value))
             elif field.type == field.TYPE_STRING:
-                setattr(msg, field.name, _REDACTED_STRING)
+                setattr(msg, field.name, _masked_string(value))
             else:
-                # Numeric/enum/bool: 0 keeps the field "set" (HasField
-                # stays true) without leaking the real value.
-                setattr(msg, field.name, 0)
+                # Numeric/enum/bool.
+                setattr(msg, field.name, _masked_int(value))
     return msg
 
 

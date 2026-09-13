@@ -8,6 +8,7 @@ format, not an assumption about it.
 
 import base64
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -46,7 +47,7 @@ class TestIsVolatileField:
 
 
 class TestNormalize:
-    def test_masks_bytes_and_string_credential_fields(self) -> None:
+    def test_masks_credential_fields(self) -> None:
         codec = _codec()
         frame = codec.encode_authenticate("super-secret-jwt-value")
         # Parse it back the same way render_frame does, to test normalize
@@ -59,14 +60,15 @@ class TestNormalize:
 
         normalize(msg)
 
-        assert msg.jwt == "<redacted>"
+        assert msg.jwt != "super-secret-jwt-value"
         assert "super-secret-jwt-value" not in str(msg)
 
     def test_preserves_non_volatile_values(self) -> None:
         codec = _codec()
         session_uuid = uuid.uuid4().bytes
+        device_uuid = uuid.uuid4().bytes
         frame = codec.encode_join_session(
-            device_uuid=uuid.uuid4().bytes,
+            device_uuid=device_uuid,
             friendly_name="Kitchen",
             session_uuid=session_uuid,
         )
@@ -84,8 +86,49 @@ class TestNormalize:
 
         join = batch.messages[0].rndrSrvrJoinSession
         assert join.deviceInfo.friendlyName == "Kitchen"  # untouched
-        assert join.sessionUuid == b"<redacted>"  # masked
-        assert join.deviceInfo.deviceUuid == b"<redacted>"  # masked
+        assert join.sessionUuid != session_uuid  # masked
+        assert join.deviceInfo.deviceUuid != device_uuid  # masked
+
+    def test_masking_is_a_hash_not_a_fixed_placeholder(self) -> None:
+        """The whole point: two occurrences of the *same* real value must
+        still visibly match each other after masking, and two different
+        real values must still (virtually certainly) differ — a fixed
+        placeholder like the old "<redacted>" would collapse both cases
+        to the same output, losing exactly the "is this the same
+        identity" comparison this trace exists to support."""
+        codec = _codec()
+        shared_uuid = uuid.uuid4().bytes
+        other_uuid = uuid.uuid4().bytes
+        from qobuz_proxy.proto import common as common_pb2
+
+        a = common_pb2.DeviceInfo()
+        a.deviceUuid = shared_uuid
+        b = common_pb2.DeviceInfo()
+        b.deviceUuid = shared_uuid
+        c = common_pb2.DeviceInfo()
+        c.deviceUuid = other_uuid
+
+        normalize(a)
+        normalize(b)
+        normalize(c)
+
+        assert a.deviceUuid == b.deviceUuid  # same real value -> same mask
+        assert a.deviceUuid != c.deviceUuid  # different real value -> different mask
+        assert codec  # keep codec referenced (avoids an unused-var lint if reordered)
+
+    def test_masked_bytes_render_as_a_clean_string_not_octal_escapes(self) -> None:
+        """Masked bytes must be printable-ASCII (hex), or text_format
+        would render them as ugly octal escapes — exactly what made the
+        earlier fixed-placeholder trace hard to read, and what a hash of
+        arbitrary bytes would reproduce if not hex-encoded first."""
+        from qobuz_proxy.proto import common as common_pb2
+
+        msg = common_pb2.DeviceInfo()
+        msg.deviceUuid = uuid.uuid4().bytes
+
+        normalize(msg)
+
+        assert re.fullmatch(rb"[0-9a-f]{12}", msg.deviceUuid) is not None
 
 
 class TestRenderFrame:
@@ -97,7 +140,7 @@ class TestRenderFrame:
 
         assert "AUTHENTICATE" in text
         assert "super-secret-jwt-value" not in text
-        assert "<redacted>" in text
+        assert re.search(r'jwt: "[0-9a-f]{12}"', text) is not None
 
     def test_payload_frame_names_the_inner_message_type(self) -> None:
         codec = _codec()
