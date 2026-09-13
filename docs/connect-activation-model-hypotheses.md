@@ -1,11 +1,13 @@
 # Working hypotheses: how Connect renderer activation actually works
 
-**Status: work-in-progress, first pass checked against one web-player HAR
-capture (`qobuz-player.har`) and one proxy RAW_WS capture (`qobuz-queue.log`,
-2026-09-13, same day) via `scripts/qconnect_trace.py`.** Not yet implemented
-or live-tested against a real household — this doc exists to hold the
-hypotheses and the evidence for/against each one steady across sessions,
-not to declare the investigation finished.
+**Status: work-in-progress. Checked against one web-player HAR capture
+(`qobuz-player.har`), one proxy RAW_WS capture (`qobuz-queue.log`), and a
+second web-player HAR captured from a genuinely fresh login
+(`qobuz-player-full-login.har`) — all 2026-09-13, via
+`scripts/qconnect_trace.py`.** Not yet implemented or live-tested against a
+real household — this doc exists to hold the hypotheses and the evidence
+for/against each one steady across sessions, not to declare the
+investigation finished.
 
 ## Context
 
@@ -140,12 +142,49 @@ interaction with the Controller role somewhere — fixed defensively
 finding the actual trigger. Worth re-examining once activation itself is
 fixed, in case it was a symptom of the same underlying issue.
 
+## A fresh login still sends no JOIN_SESSION at all (2026-09-13, second capture)
+
+`qobuz-player-full-login.har` — a capture starting from actual login, not
+just a fresh page load — settles part of #4/#5 further and reopens the
+scope of the whole investigation. In this capture:
+
+- `AUTHENTICATE` + `SUBSCRIBE` fire, then `ADD_RENDERER` lists three
+  renderers **including "Web Player Chrome" already** — the same
+  persistent identity as the other capture, present *before* this login
+  session had done anything at all. It survives a real login/logout
+  cycle, not just a page reload.
+- The web player spends the entire capture acting purely as a
+  Controller — repeatedly sending `CTRL_SRVR_ASK_FOR_RENDERER_STATE` and
+  receiving state/volume/quality updates for the renderer that was
+  *already* active (this proxy's own Sonos group, already playing) — and
+  **never sends `RNDR_SRVR_JOIN_SESSION` or `CTRL_SRVR_JOIN_SESSION`
+  once, anywhere.**
+
+That's two independent captures now, in two different roles (pure
+Controller here; Controller-then-self-activated-Renderer in the other),
+neither ever sending `JOIN_SESSION`. `AUTHENTICATE`+`SUBSCRIBE` alone was
+sufficient both times to be a fully-functioning participant. This pushes
+harder on the open question below about what `JOIN_SESSION` is actually
+*for* — increasingly looks like it may not be needed at all for an
+identity the server already knows, which is the position every one of
+our own Sonos rooms is in from their second use onward (deterministic
+`deviceUuid` per `group_id`), yet this proxy sends it unconditionally on
+every single connect regardless.
+
 ## Open questions / not yet tested
 
 - What does a genuinely **first-ever** join (a brand-new deviceUuid,
-  never seen by the server before) actually look like end to end? No
-  capture has one — every capture so far, ours and the web player's,
-  reuses an identity the server already knew.
+  never seen by the server before) actually look like end to end? Still
+  no capture has one — every capture so far, three for three, reuses an
+  identity the server already knew, for both the web player and this
+  proxy's own Sonos rooms.
+- **The other side of a handoff, still uncaptured**: when a different
+  client takes over activation from a renderer that was already active
+  (e.g. the web player activating itself while this proxy's Sonos group
+  was already playing), what — if anything — arrives on the *displaced*
+  renderer's own connection? An explicit `SRVR_RNDR_SET_ACTIVE(false)`?
+  Nothing at all? This is the piece that would tell us how to correctly
+  react to losing activation, and nothing captured so far shows it.
 - Does `SRVR_CTRL_ACTIVE_RENDERER_CHANGED` actually get suppressed for
   the activating connection itself, or was its absence in the proxy
   capture just this one session's timing? Worth a second capture to
@@ -155,3 +194,9 @@ fixed, in case it was a symptom of the same underlying issue.
   in this proxy's own code assume activation happens synchronously with
   connect? (`_next_join_claims_active`, the hijack-recovery path in
   `force_reconnect()`, etc. — all built around the current model.)
+- Given two-for-two captures never sending `JOIN_SESSION` at all: is it
+  possible this proxy could skip sending it too, for a `deviceUuid` the
+  server already has on file, and just start authenticating + subscribing
+  + reporting/reacting instead? Untested, and a real architectural
+  change if it holds up — not something to try without thinking through
+  what currently assumes a synchronous join first (see the point above).
