@@ -107,22 +107,6 @@ _PLAYBACK_COALESCE_GROUP = "playback"
 # optimization.
 VOLUME_COALESCE_GROUP = "volume"
 
-# Hard safety ceiling (2026-09-13), replacing the earlier outright
-# backend-forwarding disable now that volume is being re-enabled for
-# testing: coalescing alone was not enough to stop a real, live volume
-# spike from reaching the physical speaker, and the root cause of that
-# echo/flood is still unknown (see git history and set_volume()'s own
-# comment for what's been ruled out so far). Rather than stay disabled
-# indefinitely, cap what set_volume() ever actually applies — to the
-# backend, to our own bookkeeping, and to what gets reported to the
-# app — at this value, regardless of what was requested. Testing in the
-# range below this is exactly as safe/normal as before; a request above
-# it (a deliberate high volume, or a repeat of the still-unexplained
-# spike) is silently ceilinged instead of ever reaching the device at
-# full force. Raise (or remove) only once the actual trigger is found
-# and fixed.
-_VOLUME_HARD_CAP = 35
-
 
 class _CommandQueueItem:
     """One entry in Player._command_queue — see Player.enqueue().
@@ -585,22 +569,12 @@ class QobuzPlayer:
 
         Args:
             level: Volume level (0-100), will be clamped to valid range
-                and then to _VOLUME_HARD_CAP (see its own comment)
 
         Returns:
-            Actual volume level applied, after clamping and capping —
-            may be lower than `level`
+            Actual volume level after clamping
         """
-        # Clamp to valid range, then to the hard safety ceiling — see
-        # _VOLUME_HARD_CAP's own comment. Capping here, before the
-        # same-value no-op check below, means a flood of different
-        # over-cap values (e.g. a repeat of the echo/flood bug this
-        # ceiling exists alongside) all collapse to the same capped
-        # value and get de-duped by that check too, not just limited.
+        # Clamp to valid range
         clamped = max(0, min(100, level))
-        if clamped > _VOLUME_HARD_CAP:
-            logger.warning(f"set_volume({clamped}): capped to {_VOLUME_HARD_CAP}")
-            clamped = _VOLUME_HARD_CAP
 
         if self._fixed_volume:
             logger.debug(f"Fixed volume mode: ignoring set_volume({level})")

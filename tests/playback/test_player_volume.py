@@ -32,19 +32,24 @@ the same day): a live volume spike still reached the physical speaker.
 set_volume() had its own emergency backend-forwarding disable
 (_VOLUME_BACKEND_DISABLED) as a second, independent safety net while
 the actual trigger was tracked down — since replaced (2026-09-13, still
-later the same day) by a hard safety ceiling, _VOLUME_HARD_CAP: rather
-than stay disabled indefinitely, cap what's ever actually applied — to
-the backend, our own bookkeeping, and the app-facing report — at a
-known-safe value, so testing below it stays exactly as normal as
-before instead of not working at all. Most tests below use volume
-values under the cap, so it never engages; TestVolumeHardCap covers the
-cap itself directly.
+later the same day) by a hard safety ceiling, _VOLUME_HARD_CAP, capping
+what's ever actually applied rather than staying disabled indefinitely.
+
+The actual trigger was found and fixed the same day, still later:
+VolumeCommandHandler._handle_volume_changed (SRVR_CTRL_VOLUME_CHANGED,
+a Controller-facing broadcast) was re-applying it as if it were a
+command, including for our own rendererId — since this proxy joins
+Renderer and Controller on the same socket, every one of our own
+volume reports echoed straight back to us as this exact message. See
+tests/playback/test_volume_handler.py. With the real cause fixed and
+confirmed live, _VOLUME_HARD_CAP was removed the same day —
+TestSetVolumeClamping covers the ordinary 0-100 range clamp that
+remains.
 """
 
 import functools
 from unittest.mock import AsyncMock
 
-import qobuz_proxy.playback.player as player_module
 from qobuz_proxy.playback.player import VOLUME_COALESCE_GROUP
 from tests.playback.test_player_serialization import _make_player
 
@@ -174,55 +179,31 @@ class TestVolumeCoalescing:
         backend.set_volume.assert_awaited_once_with(30)
 
 
-class TestVolumeHardCap:
-    """_VOLUME_HARD_CAP — a request above it is ceilinged everywhere
-    (backend, bookkeeping, app-facing report), not just refused, so a
-    request for e.g. 90 ends up looking and behaving exactly like a
-    request for the cap value. If this test needs updating, that's a
-    deliberate signal the cap value itself is being changed; make sure
-    that's really intended."""
+class TestSetVolumeClamping:
+    """set_volume()'s own 0-100 clamp. The temporary hard safety ceiling
+    that used to sit alongside this (_VOLUME_HARD_CAP, 2026-09-13) was
+    removed the same day once the actual spike trigger was found and
+    fixed (see this module's own docstring) — full range applies again."""
 
-    async def test_request_above_the_cap_is_ceilinged_everywhere(self) -> None:
-        player, backend = _make_player()
-        backend.set_volume = AsyncMock()  # type: ignore[method-assign]
-        report_callback = AsyncMock()
-        player.set_volume_report_callback(report_callback)
-        player._volume = 10
-        player._is_active_renderer = True  # reporting is gated on this
-
-        result = await player.set_volume(90)
-
-        assert result == player_module._VOLUME_HARD_CAP
-        assert player._volume == player_module._VOLUME_HARD_CAP
-        backend.set_volume.assert_awaited_once_with(player_module._VOLUME_HARD_CAP)
-        report_callback.assert_awaited_once_with(player_module._VOLUME_HARD_CAP)
-
-    async def test_request_at_or_below_the_cap_is_unaffected(self) -> None:
+    async def test_above_100_clamps_to_100(self) -> None:
         player, backend = _make_player()
         backend.set_volume = AsyncMock()  # type: ignore[method-assign]
         player._volume = 0
 
-        result = await player.set_volume(player_module._VOLUME_HARD_CAP - 1)
+        result = await player.set_volume(150)
 
-        assert result == player_module._VOLUME_HARD_CAP - 1
-        backend.set_volume.assert_awaited_once_with(player_module._VOLUME_HARD_CAP - 1)
+        assert result == 100
+        backend.set_volume.assert_awaited_once_with(100)
 
-    async def test_a_flood_of_different_over_cap_values_collapses_to_one_backend_call(
-        self,
-    ) -> None:
-        """The cap doubles as protection against a repeat of the
-        echo/flood bug this exists alongside (docs/... see this module's
-        own docstring): different over-cap values all clamp to the same
-        capped value, so the existing same-value no-op guard collapses
-        them after the first."""
+    async def test_below_0_clamps_to_0(self) -> None:
         player, backend = _make_player()
         backend.set_volume = AsyncMock()  # type: ignore[method-assign]
-        player._volume = 0
+        player._volume = 50
 
-        for value in (40, 41, 42, 43):
-            await player.set_volume(value)
+        result = await player.set_volume(-10)
 
-        backend.set_volume.assert_awaited_once_with(player_module._VOLUME_HARD_CAP)
+        assert result == 0
+        backend.set_volume.assert_awaited_once_with(0)
 
 
 class TestOnVolumeUpdate:
