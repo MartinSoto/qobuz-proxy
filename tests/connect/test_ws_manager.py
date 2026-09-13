@@ -21,6 +21,7 @@ from qobuz_proxy.connect.ws_manager import (
     WsManager,
     _log_raw_frame,
 )
+from qobuz_proxy.proto import common as common_pb2
 
 
 @pytest.fixture
@@ -398,6 +399,29 @@ class TestSendJoinSession:
         await ws_manager._send_join_session()  # must not raise
 
         ws_manager._ws.send.assert_not_called()
+
+    async def test_join_carries_an_explicit_stopped_initial_state(
+        self, ws_manager: WsManager
+    ) -> None:
+        """Experiment (2026-09-13, docs/connect-activation-model-hypotheses.md):
+        tell the server explicitly that we have nothing of our own
+        playing, rather than leaving initialState unset. Every field but
+        playingState stays unset (all are optional)."""
+        ws_manager._session_uuid = b"0" * 16
+        ws_manager._ws = AsyncMock()
+
+        with patch.object(
+            ws_manager._codec, "encode_join_session", return_value=b"frame"
+        ) as mock_encode:
+            await ws_manager._send_join_session()
+
+        initial_state = mock_encode.call_args.kwargs["initial_state"]
+        assert initial_state.playingState == common_pb2.PLAYING_STATE_STOPPED
+        assert not initial_state.HasField("bufferState")
+        assert not initial_state.HasField("currentPosition")
+        assert not initial_state.HasField("duration")
+        assert not initial_state.HasField("currentQueueIndex")
+        assert not initial_state.HasField("nextQueueItemId")
 
     # A has_resumable_playback-gated variant of is_active was tried and
     # reverted 2026-09-13 — see docs/connect-activation-model-hypotheses.md,

@@ -475,6 +475,58 @@ still-unconfirmed restore snapshot — wait for the real
 already relies on correctly. Not attempted yet; needs its own careful
 pass rather than a quick follow-up on the heels of this revert.
 
+### A second experiment: explicit `initialState` alongside `isActive: true` (2026-09-13, not yet live-tested)
+
+Rather than the distrust-the-restore rewrite above, a narrower first
+try: leave `isActive` unconditional (as reverted), but stop leaving
+`JOIN_SESSION`'s `initialState` unset — send an explicit
+`RendererState{playingState: STOPPED}` (every other field, all
+optional, left unset) on *every* join. The hope: telling the server
+outright "I have nothing of my own playing" might change what it hands
+back in the restore `SET_STATE`, without touching the activation
+mechanism the previous experiment broke.
+
+`RendererState` (`qconnect_common.proto`) — the message type behind
+`initialState` — is a smaller, distinct shape from `QueueRendererState`
+(the one our regular `RNDR_SRVR_STATE_UPDATED` reports already use):
+
+```protobuf
+message RendererState {
+  optional PlayingState playingState      = 1;
+  optional BufferState  bufferState       = 2;
+  optional Position     currentPosition   = 3;
+  optional uint32       duration          = 4;
+  optional uint32       currentQueueIndex = 5;  // a position, not an item id
+  // field 6 unused
+  optional int32        nextQueueItemId   = 7;
+}
+```
+
+Notably: no `currentQueueItemId` and no `queueVersion` field at all —
+unlike `QueueRendererState`, it structurally cannot say "the current
+track is item X", only a positional index into whatever the server
+thinks the queue is. Two commented-out alternates sit right on top of
+field 5 in the `.proto` file itself (`queueVersion` and
+`currentQueueItemId`), suggesting whoever reverse-engineered this tried
+more than one reading before landing on the index interpretation — and
+no capture across this entire investigation has ever shown a real
+client sending `initialState` at all (every real client capture skips
+`JOIN_SESSION` entirely), so there's no live reference to check that
+reading against.
+
+Implemented in `WsManager._send_join_session()`: builds
+`common_pb2.RendererState()` with only `playingState =
+PLAYING_STATE_STOPPED` set, passed as `encode_join_session`'s existing
+(previously always-`None`) `initial_state` parameter — on every join,
+unconditionally, not gated on any Player state. Test:
+`test_join_carries_an_explicit_stopped_initial_state`
+(`tests/connect/test_ws_manager.py`).
+
+Not yet live-tested. If the server ignores this field (plausible, given
+no client has ever been observed sending it), this experiment is a
+no-op and the distrust-the-restore approach above is still the more
+promising direction.
+
 ## Open questions / not yet tested
 
 - What does a genuinely **first-ever** join (a brand-new deviceUuid,

@@ -16,6 +16,7 @@ from websockets import ClientConnection
 
 from qobuz_proxy.auth.tokens import WSToken
 from qobuz_proxy.config import Config
+from qobuz_proxy.proto import common as common_pb2
 
 from .protocol import DecodedMessage, MessageType, ProtocolCodec
 from .types import ConnectTokens
@@ -682,10 +683,21 @@ class WsManager:
         claims_active = self._next_join_claims_active
         self._next_join_claims_active = True  # one-shot — restore the default for next time
 
+        # Experiment (2026-09-13, docs/connect-activation-model-hypotheses.md):
+        # tell the server explicitly that we have nothing of our own
+        # playing, rather than leaving initialState unset and letting the
+        # server hand back whatever it last remembers for this deviceUuid
+        # (the mechanism behind the stale-restore bug that section
+        # describes). Every other RendererState field is optional and
+        # deliberately left unset here — only playingState is populated.
+        initial_state = common_pb2.RendererState()
+        initial_state.playingState = common_pb2.PLAYING_STATE_STOPPED
+
         join_frame = self._codec.encode_join_session(
             device_uuid=self._device_uuid,
             friendly_name=self.config.device.name,
             session_uuid=self._session_uuid,
+            initial_state=initial_state,
             max_audio_quality=self._max_audio_quality,
             is_active=claims_active,
         )
