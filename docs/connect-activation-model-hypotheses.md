@@ -310,6 +310,62 @@ strength of this one capture; retest with more patience first.
 30-60s (past the ~17s worst case already seen once) before concluding
 nothing happened, and capture the log again either way.
 
+## Correction: the real signal was `QUEUE_TRACKS_LOADED`, not timing (2026-09-13)
+
+The "just needs more time" read above was wrong, or at least not the
+main story. The user's own read of the timestamps, checked directly
+against `qobuz-queue.log`'s real (unmasked) values, holds up:
+
+| time | message | queueVersion | queuePosition | track |
+|---|---|---|---|---|
+| 19:53:58 (connect) | `SET_STATE` (restore) | 14.1 | — | queueItemId=1, trackId=46554934 |
+| 19:54:08.783 | `QUEUE_TRACKS_LOADED` | 15.1 | *(absent → 0)* | trackId=46554933 |
+| 19:54:16.997 | `QUEUE_TRACKS_LOADED` | 16.1 | 1 | queueItemId=1, trackId=46554934 |
+| 19:54:28.780 | `QUEUE_TRACKS_LOADED` | 17.1 | 2 | queueItemId=2, trackId=46554935 |
+
+Three taps in the app, ~8-12s apart — playing the album from the start,
+then picking track 2, then track 3. **`SRVR_RNDR_SET_STATE` (type 41)
+never arrives again anywhere in this 33-second window** — the *only*
+server→us traffic across all three taps is these three
+`QUEUE_TRACKS_LOADED` broadcasts, each bumping `queueVersion` and
+`queuePosition`. If track selection were carried by `SET_STATE` the way
+`command_handler.py` currently assumes, three taps should have produced
+three of them. They didn't.
+
+This resolves the open question the earlier section in this doc
+deliberately left unanswered ("does the app ever resend `currentQueueItem`
+... or does it expect the renderer to already know 'what's current' from
+`QUEUE_TRACKS_LOADED`?") — the second one, corroborated directly.
+
+**It also fully explains the "stuck" symptom, independent of timing.**
+`command_handler.py`'s `_handle_set_state` is the *only* place
+`queue.set_version()` gets called, from a `SET_STATE`'s `queueVersion`
+field. With no `SET_STATE` arriving after the three taps, every
+`RNDR_SRVR_STATE_UPDATED` we sent kept echoing the connect-time restore
+back verbatim: checked directly, our own report sent at 19:55:13 (after
+reactivation, in response to the bare `SET_STATE{playingState: PAUSED}`
+from the earlier section) still carried `queueVersion: 14.1` and
+`currentQueueItemId` = the *original* restored track — 46+ seconds and
+two more taps after the app itself had moved to queueVersion 17.1. We
+told the server we were still on track 1 of a queue it had already
+advanced to track 3 of. That's a concrete, evidenced reason the server
+never sent anything resembling a play instruction, not (or not only) a
+timing gap. Matches what [[sonos-queue-version-never-echoed]] flagged as
+unconfirmed speculation — now confirmed.
+
+**Not yet implemented.** The fix requires wiring
+`SRVR_CTRL_QUEUE_TRACKS_LOADED` (currently only observed/logged, not
+consumed — see `queue_diagnostics.py`'s own docstring, written before
+this evidence existed) into `Player`: on receipt, while active, load
+`tracks[queuePosition]` and (per normal tap-to-play UX, and because no
+follow-up `SET_STATE` should be assumed to ever arrive) start it playing
+immediately, and echo the message's `queueVersion` back like `SET_STATE`
+already does. Needs the same atomic-apply care `apply_remote_state`
+already has (a burst of rapid taps is exactly the coalescing case
+`_superseded_by_newer_command` exists for) — likely belongs in
+`command_handler.py` alongside `_handle_set_state`, sharing
+`apply_remote_state` rather than duplicating its load/play logic.
+
 ## Open questions / not yet tested
 
 - What does a genuinely **first-ever** join (a brand-new deviceUuid,
