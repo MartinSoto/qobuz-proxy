@@ -10,13 +10,13 @@ The bug the third capture found (see "Fixes implemented" below) is now
 fixed, unit-tested, and confirmed live: tap-to-play, seeking, and album
 switching all work with the controller role active. One further bug this
 surfaced (a fresh process's first tap playing a stale restored track
-instead) is now confirmed robust in practice across three live proxy
-restarts, though not fully root-caused — a first attempted fix broke
-real device activation entirely and was reverted; see "The first track
-after a fresh start didn't play" below for the full arc, including why
-it now works anyway. This doc exists to hold the hypotheses and the
-evidence for/against each one steady across sessions, not to declare the
-investigation finished.
+instead) is masked for the tap-a-track case but **confirmed still live**
+for plain "press play" right after a reconnect — a first attempted fix
+(gating `isActive`) broke real device activation entirely and was
+reverted; see "The first track after a fresh start didn't play" below
+for the full arc, including exactly which path remains fragile and why.
+This doc exists to hold the hypotheses and the evidence for/against each
+one steady across sessions, not to declare the investigation finished.
 
 ## Context
 
@@ -528,34 +528,49 @@ unconditionally, not gated on any Player state. Test:
 22:06-22:11**: tracks played correctly every time, whether resuming
 where playback stopped or picking a fresh one, and real device
 activation kept working (confirming the `isActive: true` revert holds).
+The user's own account of each session's actions, matched against the
+log, pins this down precisely rather than leaving it a guess:
 
-But the trace shows this probably isn't *why* it works. Cross-referencing
-`Loading new track`/`Starting playback` across the three sessions:
+- **Session 1→2**: stopped the proxy mid-track, restarted, reselected
+  the room, then simply **pressed play** where playback had stopped —
+  no track/album tap, i.e. exactly the original bug's code path (a bare
+  `SET_STATE{playingState: PLAYING}` trusting whatever the restore
+  loaded). The restore loaded track 417618316 — the *exact* track
+  playing when session 1 shut down (`queue_item_id=5`). Accurate, so
+  pressing play correctly resumed it. **This is the original bug's exact
+  trigger succeeding only because the restore happened to be right.**
+- **Session 2→3**: identical setup (stop mid-track, restart, reselect),
+  but this time the user picked a **completely new album** instead of
+  pressing play. The restore loaded track 421967775
+  (`queue_item_id=3`) — confirmed, via the gapless-arm log entry just
+  before session 2's shutdown, to have **nothing to do with** what was
+  actually last playing (417618316, `queue_item_id=5`, never
+  transitioned off). Genuinely stale, not explained by anything either
+  side did. It just didn't matter, because picking a new album routed
+  through `QUEUE_TRACKS_LOADED` (instant load+play) instead of a bare
+  "play", cleanly overriding the wrong restore before it was ever heard.
 
-- Session 1→2: restore loads track 417618316 — the *exact* track
-  playing when session 1 shut down. Correct resume.
-- Session 2→3: restore loads track 421967775 — **does not match**
-  session 2's actual last track (417618316). Still stale, same failure
-  mode as the original bug. But the user tapped a new track before it
-  ever played, which came through as a proper `QUEUE_TRACKS_LOADED`
-  (instant load+play, no "paused, not started on backend" step) and
-  cleanly overrode it — no visible symptom.
+So this isn't "usually accurate, occasionally drifts" — the restore can
+hand back a track with no relation at all to the real last session, and
+it happened on the very next restart after a genuinely correct one.
+`initialState` did not fix this (can't even confirm the server reads
+it — no diagnostic distinguishes "used my hint" from "ignored it").
+What actually makes the system robust is the earlier
+`QUEUE_TRACKS_LOADED` fix: a stale restore can no longer *stick* once
+any real tap arrives, because a tap now always supersedes it via a
+load+play message rather than a bare `SET_STATE{playingState: PLAYING}`
+that blindly trusts whatever's already loaded.
 
-So the server's restore is still sometimes wrong; `initialState` may not
-have changed its behavior at all (can't tell from this trace — no
-diagnostic distinguishes "server used my initialState" from "server
-ignored it and got lucky/unlucky on its own"). What actually makes this
-robust now is almost certainly the earlier `QUEUE_TRACKS_LOADED` fix: a
-stale restore can no longer *stick*, because any real tap properly
-supersedes it via a load+play message instead of a bare
-`SET_STATE{playingState: PLAYING}` that trusts whatever's already
-loaded. The original bug specifically needed that bare-message path to
-fire *first* (right after the fresh-process restore, before any real
-tap), and it simply didn't recur in any of these three sessions — worth
-treating as "confirmed robust in practice", not "root cause fully
-understood": a bare-`SET_STATE`-first race could in principle still
-happen under different timing. `initialState` is harmless either way
-and stays in.
+**The one gap that remains, now precisely identified rather than
+theoretical**: pressing plain "play" (not tapping a track) right after
+a restore is still exactly as fragile as the original bug — session 2
+only worked because the restore happened to be accurate that time,
+and session 3's restore proves the *same* staleness is still very much
+live and could hit that exact path on any given reconnect. `initialState`
+stays in (harmless either way), but the real fix — making the renderer
+itself distrust an unconfirmed restore rather than resuming it on a bare
+"play" — is still the outstanding, not-yet-attempted work described
+above.
 
 ## Open questions / not yet tested
 
