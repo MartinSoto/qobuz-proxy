@@ -10,11 +10,13 @@ The bug the third capture found (see "Fixes implemented" below) is now
 fixed, unit-tested, and confirmed live: tap-to-play, seeking, and album
 switching all work with the controller role active. One further bug this
 surfaced (a fresh process's first tap playing a stale restored track
-instead) is still open — a first attempted fix broke real device
-activation entirely and was reverted; see "The first track after a
-fresh start didn't play" below. This doc exists to hold the hypotheses
-and the evidence for/against each one steady across sessions, not to
-declare the investigation finished.
+instead) is now confirmed robust in practice across three live proxy
+restarts, though not fully root-caused — a first attempted fix broke
+real device activation entirely and was reverted; see "The first track
+after a fresh start didn't play" below for the full arc, including why
+it now works anyway. This doc exists to hold the hypotheses and the
+evidence for/against each one steady across sessions, not to declare the
+investigation finished.
 
 ## Context
 
@@ -522,10 +524,38 @@ unconditionally, not gated on any Player state. Test:
 `test_join_carries_an_explicit_stopped_initial_state`
 (`tests/connect/test_ws_manager.py`).
 
-Not yet live-tested. If the server ignores this field (plausible, given
-no client has ever been observed sending it), this experiment is a
-no-op and the distrust-the-restore approach above is still the more
-promising direction.
+**Live-tested (2026-09-13), across three proxy restarts, `qobuz-queue.log`
+22:06-22:11**: tracks played correctly every time, whether resuming
+where playback stopped or picking a fresh one, and real device
+activation kept working (confirming the `isActive: true` revert holds).
+
+But the trace shows this probably isn't *why* it works. Cross-referencing
+`Loading new track`/`Starting playback` across the three sessions:
+
+- Session 1→2: restore loads track 417618316 — the *exact* track
+  playing when session 1 shut down. Correct resume.
+- Session 2→3: restore loads track 421967775 — **does not match**
+  session 2's actual last track (417618316). Still stale, same failure
+  mode as the original bug. But the user tapped a new track before it
+  ever played, which came through as a proper `QUEUE_TRACKS_LOADED`
+  (instant load+play, no "paused, not started on backend" step) and
+  cleanly overrode it — no visible symptom.
+
+So the server's restore is still sometimes wrong; `initialState` may not
+have changed its behavior at all (can't tell from this trace — no
+diagnostic distinguishes "server used my initialState" from "server
+ignored it and got lucky/unlucky on its own"). What actually makes this
+robust now is almost certainly the earlier `QUEUE_TRACKS_LOADED` fix: a
+stale restore can no longer *stick*, because any real tap properly
+supersedes it via a load+play message instead of a bare
+`SET_STATE{playingState: PLAYING}` that trusts whatever's already
+loaded. The original bug specifically needed that bare-message path to
+fire *first* (right after the fresh-process restore, before any real
+tap), and it simply didn't recur in any of these three sessions — worth
+treating as "confirmed robust in practice", not "root cause fully
+understood": a bare-`SET_STATE`-first race could in principle still
+happen under different timing. `initialState` is harmless either way
+and stays in.
 
 ## Open questions / not yet tested
 
