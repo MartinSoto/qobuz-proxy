@@ -590,6 +590,19 @@ specific line of investigation is closed pending actual counter-evidence
 — e.g. a restore that's wrong even when the phone demonstrably touched
 nothing in between.
 
+**Deliberately confirmed (2026-09-13, same session), not just
+reasoned through.** The user ran exactly that test: stopped the proxy,
+played track 4 of Gretchen Parlato's *The Wise Ones* directly on the
+phone (no Connect renderer selected), then restarted and reselected the
+room. The restore: `queue_item_id=3` (0-indexed — the 4th item),
+paused mid-track at 7523ms — a precise, direct match, not just a
+plausible one. 6.6s later the same album got explicitly re-picked from
+the app (`QUEUE_TRACKS_LOADED selects position 0`, `Playing: Gretchen
+Parlato - Capricorn [The Wise Ones]`) — same album, correctly restarted
+from track 1, exactly what tapping "play" on an album view does
+regardless of an in-progress resume. Both signals were accurate; this
+line of investigation is closed, not just deprioritized.
+
 ## Open questions / not yet tested
 
 - What does a genuinely **first-ever** join (a brand-new deviceUuid,
