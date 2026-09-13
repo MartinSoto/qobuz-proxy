@@ -56,6 +56,20 @@ logger = logging.getLogger(__name__)
 # constant polling. See docs/gapless-arming-and-token-expiry.md.
 STATE_POLL_INTERVAL_SECONDS = 2.0
 
+# How long after our own last commanded volume change to skip the poll
+# loop's external-volume-drift check (see _poll_state_loop). A poll
+# landing right after our own set_volume() call could otherwise read the
+# device before it's genuinely settled to what we just told it and
+# misreport that transient/stale reading as an external change that
+# never happened — a self-observation race, not the SET_VOLUME-echoed-
+# as-a-command bug already fixed in volume_handler.py (that one was a
+# protocol-level confusion between two distinct message types; this is
+# purely about timing a same-device read against our own recent write).
+# Generous relative to STATE_POLL_INTERVAL_SECONDS: a genuine external
+# change landing inside this window is only delayed one extra cycle, not
+# lost outright.
+VOLUME_POLL_GRACE_SECONDS = 3.0
+
 # Backing off the poll cadence itself once a device stops answering at all
 # (DLNAClient.consecutive_failures — see its own docstring), instead of
 # continuing to hammer it every STATE_POLL_INTERVAL_SECONDS regardless.
@@ -241,6 +255,9 @@ class DLNABackend(AudioBackend):
         self._fixed_volume = fixed_volume
         self._description_url = description_url
         self._hires_downsampling = hires_downsampling
+        # See VOLUME_POLL_GRACE_SECONDS. 0.0 (never commanded yet) means
+        # the very first poll after connect is never suppressed.
+        self._last_commanded_volume_at: float = 0.0
 
         self._client: Optional[DLNAClient] = None
         self._poll_task: Optional[asyncio.Task] = None
@@ -848,6 +865,10 @@ class DLNABackend(AudioBackend):
         if self._client:
             await self._client.set_volume(clamped)
             self._volume = clamped
+            # See VOLUME_POLL_GRACE_SECONDS — suppresses the poll loop's
+            # drift check for a bit so it can't misread the device before
+            # it's genuinely settled to what we just told it.
+            self._last_commanded_volume_at = time.monotonic()
 
     async def get_volume(self) -> int:
         """Get current volume (0-100)."""
@@ -1557,6 +1578,23 @@ class DLNABackend(AudioBackend):
                 if new_state != self._state:
                     logger.debug(f"State changed: {self._state} -> {new_state}")
                     self._notify_state_change(new_state)
+
+                # Detect volume changed externally (the Sonos app, the
+                # device's own physical controls, another DLNA controller,
+                # ...) — see VOLUME_POLL_GRACE_SECONDS for why this is
+                # suppressed for a bit after our own last commanded change.
+                # Independent of playing state — volume can change while
+                # paused/stopped too.
+                if not self._fixed_volume and (
+                    time.monotonic() - self._last_commanded_volume_at >= VOLUME_POLL_GRACE_SECONDS
+                ):
+                    old_volume = self._volume
+                    new_volume = await self.get_volume()
+                    if new_volume != old_volume:
+                        logger.info(
+                            f"[{self.name}] Volume changed externally: {old_volume} -> {new_volume}"
+                        )
+                        self._notify_volume_update(new_volume)
 
                 # Update position while playing
                 if new_state == PlaybackState.PLAYING:

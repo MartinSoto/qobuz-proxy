@@ -26,6 +26,7 @@ TrackEndedCallback = Callable[[], None]
 PlaybackErrorCallback = Callable[[str], None]  # error_message
 NextTrackStartedCallback = Callable[[], None]
 ExternalTakeoverCallback = Callable[[], None]
+VolumeUpdateCallback = Callable[[int], None]  # volume (0-100)
 
 
 class AudioBackend(ABC):
@@ -63,6 +64,7 @@ class AudioBackend(ABC):
         self._on_playback_error: Optional[PlaybackErrorCallback] = None
         self._on_next_track_started: Optional[NextTrackStartedCallback] = None
         self._on_external_takeover: Optional[ExternalTakeoverCallback] = None
+        self._on_volume_update: Optional[VolumeUpdateCallback] = None
 
     # =========================================================================
     # Playback Control - Required
@@ -310,6 +312,15 @@ class AudioBackend(ABC):
         output) never calls _notify_external_takeover()."""
         self._on_external_takeover = callback
 
+    def on_volume_update(self, callback: Optional[VolumeUpdateCallback]) -> None:
+        """Register callback for a volume change this backend didn't
+        itself just cause — the physical device's own controls, the
+        Sonos app, another DLNA controller, etc. Default: never fired —
+        a backend with no way to detect this (e.g. local audio output,
+        which owns the volume outright) never calls
+        _notify_volume_update()."""
+        self._on_volume_update = callback
+
     # =========================================================================
     # Event Notification Helpers
     # =========================================================================
@@ -371,6 +382,15 @@ class AudioBackend(ABC):
                 self._on_external_takeover()
             except Exception as e:
                 logger.error(f"External takeover callback error: {e}")
+
+    def _notify_volume_update(self, volume: int) -> None:
+        """Notify listeners of a volume change this backend didn't itself
+        just cause."""
+        if self._on_volume_update:
+            try:
+                self._on_volume_update(volume)
+            except Exception as e:
+                logger.error(f"Volume update callback error: {e}")
 
     # =========================================================================
     # Info

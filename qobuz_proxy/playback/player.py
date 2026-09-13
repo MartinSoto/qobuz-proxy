@@ -332,6 +332,7 @@ class QobuzPlayer:
         self.backend.on_next_track_started(self._on_next_track_started)
         self.backend.on_state_change(self._on_state_change)
         self.backend.on_external_takeover(self._on_external_takeover)
+        self.backend.on_volume_update(self._on_volume_update)
 
         logger.info("QobuzPlayer initialized")
 
@@ -1944,6 +1945,19 @@ class QobuzPlayer:
         self._set_position(position_ms)
         if not self._gapless_armed:
             self.enqueue(self._prepare_next_track_for_gapless)
+
+    def _on_volume_update(self, volume: int) -> None:
+        """Callback when the backend detects a volume change it didn't
+        itself cause — the Sonos app, the device's own physical controls,
+        another DLNA controller (see DLNABackend._poll_state_loop and
+        VOLUME_POLL_GRACE_SECONDS for how a self-observation race against
+        our own commanded changes is avoided). Updates bookkeeping
+        immediately (sync, matching _on_position_update's own pattern);
+        the actual report is async and gated on is_active_renderer (see
+        _report_volume_change), so it's enqueued rather than run inline.
+        """
+        self._volume = volume
+        self.enqueue(self._report_volume_change)
 
     # =========================================================================
     # Gapless Playback

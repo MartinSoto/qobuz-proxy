@@ -223,3 +223,47 @@ class TestVolumeHardCap:
             await player.set_volume(value)
 
         backend.set_volume.assert_awaited_once_with(player_module._VOLUME_HARD_CAP)
+
+
+class TestOnVolumeUpdate:
+    """Player._on_volume_update() — the backend's callback for a volume
+    change it didn't itself cause (see DLNABackend._poll_state_loop's
+    external-volume-drift detection). Regression for a real, pre-existing
+    gap (2026-09-13): changing volume directly on the physical device was
+    never noticed or reported to the app at all."""
+
+    async def test_updates_bookkeeping_synchronously(self) -> None:
+        player, _backend = _make_player()
+        player._volume = 20
+
+        player._on_volume_update(35)
+
+        assert player._volume == 35  # updated immediately, before the queue even runs
+
+    async def test_reports_the_change_once_the_queue_runs(self) -> None:
+        player, _backend = _make_player()
+        report_callback = AsyncMock()
+        player.set_volume_report_callback(report_callback)
+        player._is_active_renderer = True
+        await player.start()
+
+        player._on_volume_update(35)
+        await player._command_queue.join()
+        await player.stop()
+
+        report_callback.assert_awaited_once_with(35)
+
+    async def test_not_reported_while_not_the_active_renderer(self) -> None:
+        """Same gate _report_volume_change already has for every other
+        caller — see docs/connect-activation-model-hypotheses.md."""
+        player, _backend = _make_player()
+        report_callback = AsyncMock()
+        player.set_volume_report_callback(report_callback)
+        player._is_active_renderer = False
+        await player.start()
+
+        player._on_volume_update(35)
+        await player._command_queue.join()
+        await player.stop()
+
+        report_callback.assert_not_awaited()

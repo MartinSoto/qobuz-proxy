@@ -788,6 +788,15 @@ class TestPollStateLoop:
         backend._on_playback_error = None
         backend._on_next_track_started = None
         backend._on_external_takeover = None
+        backend._on_volume_update = None
+        backend._fixed_volume = False
+        backend._volume = 50
+        # Recent (not "well outside grace" like _playback_started_at above)
+        # — within VOLUME_POLL_GRACE_SECONDS by default, so the volume-drift
+        # check is skipped and these otherwise-unrelated tests don't also
+        # need to mock _client.get_volume(). See TestVolumeDriftDetection
+        # for tests that exercise the check itself.
+        backend._last_commanded_volume_at = time.monotonic()
         backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)
         backend.get_position = AsyncMock(return_value=0)
         # Default: device reports the same URI we set — "still ours", no
@@ -1751,3 +1760,82 @@ class TestSeekConfirmation:
         await backend.stop()
 
         assert backend._awaiting_seek_confirmation is False
+
+
+class TestVolumeDriftDetection:
+    """_poll_state_loop's external-volume-change detection. Regression
+    for a real, pre-existing gap (2026-09-13): nothing ever noticed a
+    volume change made directly on the physical device (the Sonos app,
+    its own controls, ...) and reported it to the Qobuz app."""
+
+    def _make_backend(self) -> DLNABackend:
+        return TestPollStateLoop()._make_backend()
+
+    async def _run_poll_cycles(self, backend: DLNABackend, cycles: int = 1) -> None:
+        await TestPollStateLoop()._run_poll_cycles(backend, cycles=cycles)
+
+    async def test_external_change_outside_the_grace_period_is_reported(self) -> None:
+        import time
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._volume = 20
+        backend._last_commanded_volume_at = time.monotonic() - 3600  # well outside grace
+        backend.get_volume = AsyncMock(return_value=35)
+        callback = MagicMock()
+        backend.on_volume_update(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_called_once_with(35)
+
+    async def test_same_volume_is_not_reported(self) -> None:
+        import time
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._volume = 20
+        backend._last_commanded_volume_at = time.monotonic() - 3600
+        backend.get_volume = AsyncMock(return_value=20)
+        callback = MagicMock()
+        backend.on_volume_update(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_not_called()
+
+    async def test_change_within_the_grace_period_is_not_reported(self) -> None:
+        """The self-observation-race guard: a poll landing shortly after
+        our own commanded change must not misread a transient value as
+        an external one — see VOLUME_POLL_GRACE_SECONDS."""
+        import time
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._volume = 20
+        backend._last_commanded_volume_at = time.monotonic()  # just now
+        backend.get_volume = AsyncMock(return_value=35)
+        callback = MagicMock()
+        backend.on_volume_update(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_not_called()
+        backend.get_volume.assert_not_awaited()  # skipped outright, not just ignored
+
+    async def test_fixed_volume_mode_never_checks(self) -> None:
+        import time
+        from unittest.mock import AsyncMock, MagicMock
+
+        backend = self._make_backend()
+        backend._fixed_volume = True
+        backend._volume = 100
+        backend._last_commanded_volume_at = time.monotonic() - 3600
+        backend.get_volume = AsyncMock(return_value=20)
+        callback = MagicMock()
+        backend.on_volume_update(callback)
+
+        await self._run_poll_cycles(backend)
+
+        callback.assert_not_called()
+        backend.get_volume.assert_not_awaited()
