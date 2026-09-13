@@ -157,7 +157,6 @@ class WsManager:
         config: Config,
         api_client: Optional["QobuzAPIClient"] = None,
         is_worth_keeping_alive: Optional[Callable[[], bool]] = None,
-        has_resumable_playback: Optional[Callable[[], bool]] = None,
     ):
         """
         Initialize WebSocket manager.
@@ -177,19 +176,10 @@ class WsManager:
                 naturally instead of being kept alive forever in the
                 background. None (e.g. in tests, or when no such policy is
                 wired up) always keeps refreshing, matching prior behavior.
-            has_resumable_playback: Queried by every JOIN_SESSION (see
-                _send_join_session) to decide whether it should claim
-                isActive=true — lets the caller (Player, via
-                has_resumable_playback) say "yes, I genuinely have real
-                state of my own worth resuming" (a WS blip or token-
-                refresh reconnect mid-playback) as opposed to a fresh
-                process start with nothing loaded yet. None (e.g. in
-                tests) always claims active, matching prior behavior.
         """
         self.config = config
         self._api_client = api_client
         self._is_worth_keeping_alive = is_worth_keeping_alive
-        self._has_resumable_playback = has_resumable_playback
         self._device_uuid = self._uuid_to_bytes(config.device.uuid)
         self._codec = ProtocolCodec(self._device_uuid)
 
@@ -676,19 +666,20 @@ class WsManager:
             logger.error("No session UUID for join session")
             return
 
-        # force_reconnect()'s one-shot override always wins outright — a
-        # forced False must never be upgraded back to True by the resumable-
-        # playback check below (see force_reconnect's own docstring: the
-        # whole point is to deliberately *not* reclaim active status on
-        # this specific rejoin). Absent that override, default to whatever
-        # has_resumable_playback says instead of unconditionally True — see
-        # Player.has_resumable_playback's own docstring for why a plain
-        # default of True fed the server a stale restore on every fresh
-        # process start.
-        if self._next_join_claims_active:
-            claims_active = self._has_resumable_playback() if self._has_resumable_playback else True
-        else:
-            claims_active = False
+        # REVERTED 2026-09-13 — see docs/connect-activation-model-hypotheses.md,
+        # "The isActive=false experiment broke real device selection
+        # entirely". A brief attempt gated this on Player.has_resumable_playback()
+        # to stop a fresh process start from getting fed a stale server-
+        # side restore. Confirmed live to be worse: with isActive=false,
+        # SRVR_RNDR_SET_ACTIVE never arrives at all — not for a fresh
+        # start, and not even for a brand-new device identity the app had
+        # just explicitly selected via connect-to-qconnect. Every prior
+        # capture that claimed isActive=true got SET_ACTIVE(true) back
+        # within ~50ms; this is apparently the actual mechanism by which
+        # the app's direct local-network device selection becomes a real
+        # activation, not just a courtesy "resume my last state" hint —
+        # there's no separate confirmation step to wait for instead.
+        claims_active = self._next_join_claims_active
         self._next_join_claims_active = True  # one-shot — restore the default for next time
 
         join_frame = self._codec.encode_join_session(

@@ -642,69 +642,12 @@ class TestIsWorthKeepingWsAlive:
         assert player.is_worth_keeping_ws_alive() is True
         assert player._non_playing_since is not None
 
-
-class TestHasResumablePlayback:
-    """Player.has_resumable_playback() — queried by WsManager on every
-    JOIN_SESSION (see ws_manager.py's _send_join_session) to decide
-    whether to claim isActive=true. Regression (2026-09-13,
-    docs/connect-activation-model-hypotheses.md): claiming it
-    unconditionally, including on a fresh process start with nothing
-    loaded, made the server hand back its own stale last-known state for
-    this deviceUuid, breaking the first real track selection after every
-    fresh start."""
-
-    def _track(self) -> QueueTrack:
-        return QueueTrack(queue_item_id=1, track_id="123", metadata={})
-
-    def test_fresh_player_has_nothing_to_resume(self) -> None:
-        player, _backend = _make_player()
-
-        assert player.has_resumable_playback() is False
-
-    def test_playing_with_a_loaded_track_and_believed_active_is_resumable(self) -> None:
-        # The case this must keep working: a WS blip or self-refresh
-        # reconnect mid-playback (see docs/gapless-arming-and-token-
-        # expiry.md) — must still claim active immediately.
-        player, _backend = _make_player()
-        player._is_active_renderer = True
-        player._current_track = self._track()
-        player._state = PlaybackState.PLAYING
-
-        assert player.has_resumable_playback() is True
-
-    def test_paused_with_a_loaded_track_and_believed_active_is_resumable(self) -> None:
-        player, _backend = _make_player()
-        player._is_active_renderer = True
-        player._current_track = self._track()
-        player._state = PlaybackState.PAUSED
-
-        assert player.has_resumable_playback() is True
-
-    def test_not_resumable_without_a_loaded_track_even_if_believed_active(self) -> None:
-        player, _backend = _make_player()
-        player._is_active_renderer = True
-        player._current_track = None
-        player._state = PlaybackState.PLAYING
-
-        assert player.has_resumable_playback() is False
-
-    def test_not_resumable_when_not_believed_active_even_with_a_loaded_track(self) -> None:
-        # A stale/leftover _current_track (never cleared by stop_playback —
-        # see its own docstring) must not count once we've been told we're
-        # not the active renderer.
-        player, _backend = _make_player()
-        player._is_active_renderer = False
-        player._current_track = self._track()
-        player._state = PlaybackState.PLAYING
-
-        assert player.has_resumable_playback() is False
-
-    def test_stopped_is_not_resumable_even_with_a_stale_loaded_track(self) -> None:
-        # stop_playback() deliberately leaves _current_track set (see its
-        # own docstring) — that leftover must not count as "resumable".
-        player, _backend = _make_player()
-        player._is_active_renderer = True
-        player._current_track = self._track()
-        player._state = PlaybackState.STOPPED
-
-        assert player.has_resumable_playback() is False
+    # Player.has_resumable_playback() and its use in WsManager's
+    # _send_join_session were tried and reverted 2026-09-13 — see
+    # docs/connect-activation-model-hypotheses.md, "The isActive=false
+    # experiment broke real device selection entirely". Confirmed live:
+    # with isActive=false, SRVR_RNDR_SET_ACTIVE never arrives at all, not
+    # even for a brand-new device identity the app had just explicitly
+    # selected via connect-to-qconnect — claiming isActive=true on every
+    # JOIN_SESSION really is how the app's direct local-network device
+    # selection becomes a real activation.

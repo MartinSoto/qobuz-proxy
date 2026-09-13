@@ -2308,38 +2308,6 @@ class QobuzPlayer:
         active playback target (see SrvrRndrSetActive in command_handler.py)."""
         return self._is_active_renderer
 
-    def has_resumable_playback(self) -> bool:
-        """Whether this Player genuinely has real, cached playback state of
-        its own worth resuming — queried by WsManager (see
-        _send_join_session) to decide whether a (re)connect's JOIN_SESSION
-        should claim isActive=true.
-
-        Confirmed live (2026-09-13,
-        docs/connect-activation-model-hypotheses.md): claiming isActive on
-        *every* join, including a truly fresh process start with nothing
-        of our own loaded, made the server hand back *its own* last-known
-        state for this deviceUuid — sometimes genuinely stale (a track
-        from an earlier, unrelated session) — which then fooled the app
-        into thinking nothing needed to change and it could just send a
-        bare "play", instead of a real SRVR_CTRL_QUEUE_TRACKS_LOADED. The
-        first tap after every fresh start failed this same way.
-
-        True only while we're both already believed active (survives a
-        reconnect — see is_active_renderer's own docstring — but not a
-        fresh process start, where it's always False) *and* actually
-        holding a loaded track in a state worth resuming — this is
-        deliberately the same "content of our own" test claim_device()
-        uses to decide whether it's safe to leave a device alone, not a
-        new one: a WS blip or self-refresh reconnect mid-playback (see
-        docs/gapless-arming-and-token-expiry.md) must still claim active
-        immediately, exactly as it already did before this method existed.
-        """
-        return (
-            self._is_active_renderer
-            and self._current_track is not None
-            and self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED)
-        )
-
     @property
     def current_track(self) -> Optional[QueueTrack]:
         """Get current track."""

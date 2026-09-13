@@ -10,10 +10,11 @@ The bug the third capture found (see "Fixes implemented" below) is now
 fixed, unit-tested, and confirmed live: tap-to-play, seeking, and album
 switching all work with the controller role active. One further bug this
 surfaced (a fresh process's first tap playing a stale restored track
-instead) is also fixed — see "The first track after a fresh start didn't
-play" below. This doc exists to hold the hypotheses and the evidence
-for/against each one steady across sessions, not to declare the
-investigation finished.
+instead) is still open — a first attempted fix broke real device
+activation entirely and was reverted; see "The first track after a
+fresh start didn't play" below. This doc exists to hold the hypotheses
+and the evidence for/against each one steady across sessions, not to
+declare the investigation finished.
 
 ## Context
 
@@ -415,42 +416,64 @@ section above). The bug was self-inflicted: claiming `isActive` for a
 session with no real state manufactured a false "already in sync"
 belief on both sides right from the start.
 
-### Fix (implemented, 2026-09-13)
+### Fix attempted, then reverted (2026-09-13) — the isActive=false experiment broke real device selection entirely
 
-`Player.has_resumable_playback()` (`player.py`) — true only while we're
-both already believed active (`is_active_renderer`, survives a
-reconnect) *and* actually holding a loaded track in `PLAYING`/`PAUSED`
-(the same "content of our own" test `claim_device()` already uses to
-decide whether it's safe to leave a device alone). False on a fresh
-process start, where nothing has ever been loaded.
+First attempt: `Player.has_resumable_playback()` (`player.py`) — true
+only while already believed active *and* actually holding a loaded
+track in `PLAYING`/`PAUSED`, false on a fresh start — consulted by
+`WsManager._send_join_session()` instead of defaulting straight to
+`True`. Landed, unit-tested, then tried live.
 
-`WsManager._send_join_session()` now consults it (injected the same way
-`is_worth_keeping_alive` already is — see `speaker.py`'s `WsManager(...)`
-construction) instead of defaulting straight to `True`, *unless*
-`force_reconnect()`'s existing one-shot override has already forced
-`False` for hijack recovery — that override still wins outright,
-unchanged. A genuine WS blip or token-refresh reconnect mid-playback
-still claims active immediately, exactly as before; only a truly fresh
-start (or a reconnect after being told we're not active, or after our
-own `stop_playback()` — which deliberately leaves a stale
-`_current_track` behind, see its own docstring) now joins passively
-instead.
+**Result: worse than the bug it fixed.** Live test immediately after:
+"I simply can't connect to the proxy." A fresh capture
+(`qobuz-queue.log`, 2026-09-13, 21:29 run) shows why, directly —
+`SRVR_RNDR_SET_ACTIVE` (type 43) **never arrives, not once, anywhere in
+the entire session**, for either of the two renderers that joined with
+`isActive: false`: the already-known `deviceUuid` for the Sonos group
+active at startup, *and* a brand-new, never-before-seen `deviceUuid` for
+a room ("Cuarto") that split off from that group mid-session — which the
+user then explicitly selected in the app (a fresh `connect-to-qconnect`
+POST, "Received connection from app", confirmed in the log). Neither
+ever got activated. Compare every single earlier capture in this whole
+investigation, where claiming `isActive: true` got `SET_ACTIVE(true)`
+back within ~50ms, no separate request needed.
 
-Deliberately *not* implemented: also sending our own real state via
-`JOIN_SESSION`'s `initialState` field when we do claim active. Not
-required for this fix (once we only claim active when the server's own
-memory should already agree with ours, there's nothing to correct), and
-the field's exact shape is unconfirmed against any real capture —
-`RendererState` (`qconnect_common.proto`) has a `currentQueueIndex`
-field with a *commented-out* alternate `currentQueueItemId` right next
-to it, and no capture across this entire investigation has ever shown a
-real client sending `initialState` at all (every real client capture
-skips `JOIN_SESSION` entirely — see "A fresh login still sends no
-JOIN_SESSION at all" above). Left as a documented non-fix rather than a
-guess.
+This means `isActive` on `JOIN_SESSION` isn't just a "resume my last
+state" courtesy hint that happens to also grant activation as a side
+effect — for the phone app's own direct local-network device selection
+flow (`connect-to-qconnect`), it looks like *the* activation mechanism
+itself. There's no separate confirmation step to wait for instead: not
+claiming it doesn't mean "wait for `SRVR_RNDR_SET_ACTIVE`/
+`CTRL_SRVR_SET_ACTIVE_RENDERER` shortly after", it means never getting
+activated at all. Every fresh `WsManager` start is structurally
+preceded by exactly this same `connect-to-qconnect` flow (that's how
+`speaker.py` wires `_on_app_connect` → `WsManager.start()` — a
+background reconnect is the only case that *isn't*), so "was this
+triggered by the app's own request" can't be used to distinguish the
+two scenarios post hoc the way the original bug report's framing
+suggested — it's true of every fresh join, including the exact one that
+went on to load a stale track.
 
-Tests: `TestHasResumablePlayback` (`tests/playback/test_player.py`),
-`TestSendJoinSession`'s new cases (`tests/connect/test_ws_manager.py`).
+**Reverted in full**: `_send_join_session()` back to unconditionally
+claiming `isActive` from `_next_join_claims_active` (still `True` by
+default, still forced `False` for one join by `force_reconnect()`'s
+hijack-recovery path — that part was never in question). `WsManager`'s
+`has_resumable_playback` constructor parameter and
+`Player.has_resumable_playback()` removed entirely, along with their
+tests — see git history around 2026-09-13 for the full diff if this
+needs revisiting.
+
+**The original bug (stale restore state feeding a bare "just play" SET_STATE
+a stale track) is real and still unfixed.** Given the above, the right
+fix has to leave `isActive` alone and instead make the *renderer*
+distrust its own connect-time restore: e.g. track whether `_current_track`
+came from the server's `JOIN_SESSION`-response restore versus a genuine
+`QUEUE_TRACKS_LOADED`/explicit `currentQueueItem`, and don't let a bare
+`SET_STATE{playingState: PLAYING}` with no track info resume a
+still-unconfirmed restore snapshot — wait for the real
+`QUEUE_TRACKS_LOADED` instead, the same signal every subsequent tap
+already relies on correctly. Not attempted yet; needs its own careful
+pass rather than a quick follow-up on the heels of this revert.
 
 ## Open questions / not yet tested
 
