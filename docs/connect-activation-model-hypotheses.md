@@ -171,6 +171,61 @@ our own Sonos rooms is in from their second use onward (deterministic
 `deviceUuid` per `group_id`), yet this proxy sends it unconditionally on
 every single connect regardless.
 
+## The other side of a handoff — captured (2026-09-13, third capture)
+
+`qobuz-player-take-from-proxy.har` + a matching proxy RAW_WS capture
+(`qobuz-queue.log`, same session): started playback on one of this
+proxy's own Sonos rooms first, then explicitly moved playback to the web
+player itself, capturing both sides. This resolves the open question
+above:
+
+- **The displaced renderer does get an explicit signal.** Our proxy's own
+  connection receives a second `SRVR_RNDR_SET_ACTIVE` — the first one
+  (at real activation) carries `active: true`; this one arrives with the
+  `active` field *absent entirely* (`srvrRndrSetActive {}`), which
+  proto2's optional-field semantics — and this codebase's own accessor
+  usage — correctly read as `false` with no special-casing needed.
+  Confirmed in the readable log: `Renderer set active: False` logs
+  correctly, immediately.
+- **But a real, distinct, newly-found bug sits right behind it.** Two
+  `Protocol error: ... Renderer state updated message received from non
+  active renderer` errors follow, ~1.2s and ~5.2s after deactivation,
+  before `Playback stopped` finally logs 5.4s after deactivation.
+
+Root cause, confirmed by reading the code, not inferred: `player.py`'s
+`deactivate_renderer()` deliberately debounces the *physical device*
+stop by `_DEACTIVATION_GRACE_SECONDS` — a real, already-documented fix
+for a different problem (a WS-reconnect race that used to interrupt
+playback on every token refresh). But `StateReporter`
+(`state_reporter.py`) has no `is_active_renderer` gate anywhere in its
+send paths (`_send_state_update`/`report_now`/the heartbeat loop) — it
+keeps reporting as long as `Player.state == PLAYING`, which it still is
+for that whole grace window, since the device hasn't been told to stop
+yet. Every report sent in that window is guaranteed rejected, because
+the server already stopped listening to this connection the instant it
+sent `SRVR_RNDR_SET_ACTIVE` with `active` unset.
+
+This is very plausibly the real, complete explanation for the "non
+active renderer" error recurring throughout this *entire* investigation
+— not only (or even mainly) the split-identity Controller-join confusion
+fixed earlier. Every deactivation, for any reason, leaves reporting
+running a few seconds past the point the server stopped listening.
+
+## Confirmed fixes, not yet implemented
+
+Tracked here so they survive to a future session rather than needing
+re-diagnosis — none of these are done yet.
+
+1. **Gate `StateReporter`'s outbound sends on `is_active_renderer`.**
+   Stop reporting immediately when deactivated, independent of the
+   existing (correct, keep as-is) device-stop debounce in
+   `deactivate_renderer()`. Two genuinely separate concerns — don't
+   collapse them back together when fixing this. Likely also needs
+   checking whether other ad-hoc outbound sends (volume-changed on a
+   stray post-deactivation command, e.g. `Volume set to 72` observed
+   4ms after deactivation in the capture above) need the same gate, not
+   just the heartbeat/state path.
+
 ## Open questions / not yet tested
 
 - What does a genuinely **first-ever** join (a brand-new deviceUuid,
@@ -178,13 +233,6 @@ every single connect regardless.
   no capture has one — every capture so far, three for three, reuses an
   identity the server already knew, for both the web player and this
   proxy's own Sonos rooms.
-- **The other side of a handoff, still uncaptured**: when a different
-  client takes over activation from a renderer that was already active
-  (e.g. the web player activating itself while this proxy's Sonos group
-  was already playing), what — if anything — arrives on the *displaced*
-  renderer's own connection? An explicit `SRVR_RNDR_SET_ACTIVE(false)`?
-  Nothing at all? This is the piece that would tell us how to correctly
-  react to losing activation, and nothing captured so far shows it.
 - Does `SRVR_CTRL_ACTIVE_RENDERER_CHANGED` actually get suppressed for
   the activating connection itself, or was its absence in the proxy
   capture just this one session's timing? Worth a second capture to
@@ -200,3 +248,15 @@ every single connect regardless.
   + reporting/reacting instead? Untested, and a real architectural
   change if it holds up — not something to try without thinking through
   what currently assumes a synchronous join first (see the point above).
+- **Can the web player activate one of our rooms that isn't already
+  live?** Reasoned answer, not yet live-tested: almost certainly not.
+  `discovery.py` sets no CORS headers at all, and across all three web-
+  player captures collected so far, not one single request targets a
+  local/private IP — the web player's own code never attempts LAN
+  contact, only the native app has ever been observed POSTing to a
+  room's local `connect-to-qconnect` endpoint. Switching *to* one of our
+  rooms from the web player should only work if that room already has a
+  live WS session; for any room that doesn't, it should look exactly
+  like the stale-entry symptom investigated earlier — visible in the
+  picker, silently does nothing when picked. Cheap to confirm live
+  whenever convenient, just not yet done.
