@@ -5,7 +5,9 @@ Handles connection lifecycle, authentication, and message routing.
 """
 
 import asyncio
+import base64
 import logging
+import time
 import uuid
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
@@ -106,6 +108,32 @@ _QUEUE_POSITION_MESSAGE_TYPES = {
     95: "SRVR_CTRL_QUEUE_TRACKS_REORDERED",
     105: "SRVR_CTRL_QUEUE_VERSION_CHANGED",
 }
+
+# TEMP, investigative (2026-09-13) — a dedicated logger for the raw bytes
+# of every WS frame this proxy sends or receives, one line each, so a
+# capture from a real session can be diffed against a browser HAR of the
+# web player over the same protocol — see scripts/qconnect_trace.py,
+# which decodes both into the same normalized, diff-friendly text format.
+# A separate logger (rather than reusing `logger` above) so this can be
+# silenced independently if it gets too noisy; propagates to the root
+# logger by default, so it lands in the normal log output unless
+# something explicitly configures it otherwise. Deliberately raw: no
+# decoding here, just base64(frame bytes) — decoding on the way in would
+# risk hiding exactly the kind of malformed-or-unexpected frame this
+# exists to catch.
+_raw_trace_logger = logging.getLogger("qobuz_proxy.connect.ws_manager.raw")
+
+
+def _log_raw_frame(direction: str, data: bytes) -> None:
+    """Emit one RAW_WS line for `data` — see _raw_trace_logger's own
+    comment. `direction` is "SEND" or "RECV". Format:
+    ``RAW_WS <direction> <epoch_ms> <base64>`` — parsed back out by
+    scripts/qconnect_trace.py's --proxy-log mode via a plain regex, so
+    keep this exact shape (three space-separated fields after "RAW_WS")
+    if it ever needs to change."""
+    epoch_ms = int(time.time() * 1000)
+    encoded = base64.b64encode(data).decode("ascii")
+    _raw_trace_logger.info(f"RAW_WS {direction} {epoch_ms} {encoded}")
 
 
 class TokenRefreshRequired(Exception):
@@ -272,6 +300,17 @@ class WsManager:
                 pass
         logger.info("WebSocket manager stopped")
 
+    async def _raw_send(self, data: bytes) -> None:
+        """The one chokepoint every outgoing frame goes through — see
+        _log_raw_frame's own comment. Every self._ws.send(...) call site
+        in this class goes through here instead of calling send()
+        directly, so the raw-trace log is complete: nothing this proxy
+        sends is invisible to it. Assumes self._ws is set; callers that
+        already check for None (most of them do, for their own reasons)
+        keep doing so before calling this."""
+        _log_raw_frame("SEND", data)
+        await self._ws.send(data)
+
     async def _send_disconnect(self) -> None:
         """Tell the server this connection is going away for good, right
         before closing it — see ProtocolCodec.encode_disconnect for why
@@ -282,7 +321,7 @@ class WsManager:
         if not self._ws:
             return
         try:
-            await self._ws.send(self._codec.encode_disconnect(reconnect=False))
+            await self._raw_send(self._codec.encode_disconnect(reconnect=False))
             logger.info("Sent DISCONNECT (reconnect=False)")
         except Exception as e:
             logger.debug(f"Failed to send DISCONNECT before close: {e}")
@@ -349,7 +388,7 @@ class WsManager:
         """
         if self._ws and self._is_connected:
             try:
-                await self._ws.send(data)
+                await self._raw_send(data)
                 return True
             except Exception as e:
                 logger.error(f"Failed to send message: {e}")
@@ -605,7 +644,7 @@ class WsManager:
         if not self._ws_token:
             return False
         auth_frame = self._codec.encode_authenticate(self._ws_token.jwt)
-        await self._ws.send(auth_frame)
+        await self._raw_send(auth_frame)
         logger.debug("Sent AUTHENTICATE")
         return True
 
@@ -616,7 +655,7 @@ class WsManager:
             return False
 
         sub_frame = self._codec.encode_subscribe(self._session_uuid)
-        await self._ws.send(sub_frame)
+        await self._raw_send(sub_frame)
         logger.debug("Sent SUBSCRIBE")
         return True
 
@@ -636,7 +675,7 @@ class WsManager:
             max_audio_quality=self._max_audio_quality,
             is_active=claims_active,
         )
-        await self._ws.send(join_frame)
+        await self._raw_send(join_frame)
         logger.debug(
             f"Sent JOIN_SESSION with max_quality={self._max_audio_quality}, "
             f"is_active={claims_active}"
@@ -676,7 +715,7 @@ class WsManager:
             friendly_name=self.config.device.name,
             max_audio_quality=self._max_audio_quality,
         )
-        await self._ws.send(join_frame)
+        await self._raw_send(join_frame)
         logger.info("Sent CTRL_SRVR_JOIN_SESSION with no sessionUuid, same deviceUuid as Renderer")
 
     async def _receive_loop(self) -> None:
@@ -687,6 +726,7 @@ class WsManager:
                     self._ws.recv(),
                     timeout=RECV_TIMEOUT,
                 )
+                _log_raw_frame("RECV", data.encode() if isinstance(data, str) else data)
                 await self._handle_message(data)
 
             except asyncio.TimeoutError:
@@ -746,7 +786,7 @@ class WsManager:
         logger.debug(f"Flushing {len(self._pending_messages)} pending messages")
         for data in self._pending_messages:
             try:
-                await self._ws.send(data)
+                await self._raw_send(data)
             except Exception as e:
                 logger.error(f"Failed to flush message: {e}")
 

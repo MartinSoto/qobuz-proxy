@@ -1,6 +1,10 @@
 """Tests for WebSocket manager."""
 
 import asyncio
+import base64
+import logging
+import re
+import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +19,7 @@ from qobuz_proxy.connect.ws_manager import (
     MAX_RECONNECT_DELAY,
     RECONNECT_BACKOFF_MULTIPLIER,
     WsManager,
+    _log_raw_frame,
 )
 
 
@@ -556,6 +561,78 @@ class TestMessageQueueing:
         await ws_manager.send_device_info_updated("Kitchen, Living Room")
 
         assert ws_manager.config.device.name == "Kitchen, Living Room"
+
+
+class TestRawFrameLogging:
+    """The RAW_WS trace log — every frame this proxy sends or receives,
+    one line each, base64-encoded — is what scripts/qconnect_trace.py's
+    --proxy-log mode parses to build a trace comparable against a
+    browser HAR capture (see the Controller-role dual-join
+    investigation). See _log_raw_frame's own comment for the exact line
+    format this locks in — scripts/qconnect_trace.py's regex must keep
+    matching it."""
+
+    _RAW_WS_RE = re.compile(r"RAW_WS (SEND|RECV) (\d+) (\S+)")
+
+    def test_log_raw_frame_emits_a_parseable_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="qobuz_proxy.connect.ws_manager.raw"):
+            _log_raw_frame("SEND", b"\x01\x02\x03")
+
+        [record] = caplog.records
+        match = self._RAW_WS_RE.match(record.message)
+        assert match is not None
+        direction, epoch_ms, b64 = match.groups()
+        assert direction == "SEND"
+        assert base64.b64decode(b64) == b"\x01\x02\x03"
+        # Recent enough to be "now", not a stale/garbage placeholder.
+        assert abs(int(time.time() * 1000) - int(epoch_ms)) < 5000
+
+    def test_log_raw_frame_round_trips_arbitrary_bytes(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Including bytes that would break a naive string encoding —
+        base64 must be what actually carries this, not repr() or similar."""
+        raw = bytes(range(256))
+        with caplog.at_level(logging.INFO, logger="qobuz_proxy.connect.ws_manager.raw"):
+            _log_raw_frame("RECV", raw)
+
+        [record] = caplog.records
+        match = self._RAW_WS_RE.match(record.message)
+        assert match is not None
+        assert base64.b64decode(match.group(3)) == raw
+
+    @pytest.mark.asyncio
+    async def test_raw_send_logs_then_sends(
+        self, ws_manager: WsManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mock_ws = AsyncMock()
+        ws_manager._ws = mock_ws
+
+        with caplog.at_level(logging.INFO, logger="qobuz_proxy.connect.ws_manager.raw"):
+            await ws_manager._raw_send(b"\xaa\xbb\xcc")
+
+        mock_ws.send.assert_awaited_once_with(b"\xaa\xbb\xcc")
+        [record] = caplog.records
+        match = self._RAW_WS_RE.match(record.message)
+        assert match is not None
+        assert match.group(1) == "SEND"
+        assert base64.b64decode(match.group(3)) == b"\xaa\xbb\xcc"
+
+    @pytest.mark.asyncio
+    async def test_send_message_traced_goes_through_raw_send(
+        self, ws_manager: WsManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Every public send path funnels through _raw_send — spot-check
+        one (send_message) rather than every call site individually."""
+        mock_ws = AsyncMock()
+        ws_manager._ws = mock_ws
+        ws_manager._is_connected = True
+
+        with caplog.at_level(logging.INFO, logger="qobuz_proxy.connect.ws_manager.raw"):
+            await ws_manager.send_message(b"hello")
+
+        [record] = caplog.records
+        assert self._RAW_WS_RE.match(record.message) is not None
 
 
 class TestStartStop:
