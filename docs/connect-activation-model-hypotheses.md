@@ -143,14 +143,30 @@ command itself. Nothing new implied.
 
 ### #8 — originate reports only for externally-caused state changes
 
-**Consistent with the existing architecture already** (`state_reporter.py`
-polls the physical device and reports drift; volume changes detected from
-the device get reported outward). Caveat: the volume-echo-loop bug from
-2026-09-12/13 shows this reporting path still has an unresolved
-interaction with the Controller role somewhere — fixed defensively
-(same-value no-op, coalescing, backend-forwarding disabled) without ever
-finding the actual trigger. Worth re-examining once activation itself is
-fixed, in case it was a symptom of the same underlying issue.
+**Half right when first written, corrected 2026-09-13.** Playback
+state/position genuinely does work this way — `_poll_state_loop`
+(`dlna/backend.py`) polls the physical device and reports drift
+(hijacks, external stops, natural track-end). Volume did not: this was
+asserted here as "consistent with the existing architecture already"
+without actually checking, and was wrong — nothing polled the device's
+volume or reported drift at all before 2026-09-13 (confirmed live: the
+user noticed changing volume on the Sonos side never reflected in the
+app). Now fixed the same way position/state already worked: see
+`AudioBackend.on_volume_update`/`DLNABackend._poll_state_loop`'s
+volume-drift check.
+
+Separately: the volume-echo-loop bug from 2026-09-12/13 showed this
+reporting path had an unresolved interaction with the Controller role —
+fixed defensively at the time (same-value no-op, coalescing, backend-
+forwarding disabled) without finding the actual trigger. The real
+trigger was found and fixed 2026-09-13:
+`VolumeCommandHandler._handle_volume_changed` was re-applying
+`SRVR_CTRL_VOLUME_CHANGED` (a Controller-facing broadcast) as if it
+were a command, including for our own rendererId — since this proxy
+joins Renderer and Controller on the same socket, every one of our own
+volume reports echoed straight back to us as this exact message,
+creating a bounded but visible oscillation ("the volume knob jumping
+back and forth", live-confirmed). Now observation-only.
 
 ## A fresh login still sends no JOIN_SESSION at all (2026-09-13, second capture)
 
