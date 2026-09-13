@@ -29,45 +29,37 @@ had for playback-directing commands.
 
 Coalescing alone still turned out not to be enough (2026-09-13, later
 the same day): a live volume spike still reached the physical speaker.
-set_volume() now has its own emergency backend-forwarding disable
-(_VOLUME_BACKEND_DISABLED, on by default — see its own comment) as a
-second, independent safety net while the actual trigger is still being
-tracked down. Every test below forces it off via setup_method so it
-exercises the permanent, real behavior (does the backend actually get
-called) independent of that flag's current on/off state.
+set_volume() had its own emergency backend-forwarding disable
+(_VOLUME_BACKEND_DISABLED) as a second, independent safety net while
+the actual trigger was tracked down — since replaced (2026-09-13, still
+later the same day) by a hard safety ceiling, _VOLUME_HARD_CAP: rather
+than stay disabled indefinitely, cap what's ever actually applied — to
+the backend, our own bookkeeping, and the app-facing report — at a
+known-safe value, so testing below it stays exactly as normal as
+before instead of not working at all. Most tests below use volume
+values under the cap, so it never engages; TestVolumeHardCap covers the
+cap itself directly.
 """
 
 import functools
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import qobuz_proxy.playback.player as player_module
 from qobuz_proxy.playback.player import VOLUME_COALESCE_GROUP
 from tests.playback.test_player_serialization import _make_player
 
 
-class _BackendForwardingEnabled:
-    """Mixin: forces _VOLUME_BACKEND_DISABLED off for the duration of each
-    test, restoring it afterward — see this module's own docstring."""
-
-    def setup_method(self) -> None:
-        self._patcher = patch.object(player_module, "_VOLUME_BACKEND_DISABLED", False)
-        self._patcher.start()
-
-    def teardown_method(self) -> None:
-        self._patcher.stop()
-
-
-class TestSetVolumeNoOp(_BackendForwardingEnabled):
+class TestSetVolumeNoOp:
     async def test_same_value_is_a_noop(self) -> None:
         player, backend = _make_player()
         backend.set_volume = AsyncMock()  # type: ignore[method-assign]
         report_callback = AsyncMock()
         player.set_volume_report_callback(report_callback)
-        player._volume = 50
+        player._volume = 20
 
-        result = await player.set_volume(50)
+        result = await player.set_volume(20)
 
-        assert result == 50
+        assert result == 20
         backend.set_volume.assert_not_awaited()
         report_callback.assert_not_awaited()
 
@@ -76,15 +68,15 @@ class TestSetVolumeNoOp(_BackendForwardingEnabled):
         backend.set_volume = AsyncMock()  # type: ignore[method-assign]
         report_callback = AsyncMock()
         player.set_volume_report_callback(report_callback)
-        player._volume = 50
+        player._volume = 20
         player._is_active_renderer = True  # reporting is gated on this
 
-        result = await player.set_volume(60)
+        result = await player.set_volume(30)
 
-        assert result == 60
-        assert player._volume == 60
-        backend.set_volume.assert_awaited_once_with(60)
-        report_callback.assert_awaited_once_with(60)
+        assert result == 30
+        assert player._volume == 30
+        backend.set_volume.assert_awaited_once_with(30)
+        report_callback.assert_awaited_once_with(30)
 
     async def test_repeated_same_value_command_only_ever_applies_once(self) -> None:
         """Reproduces the actual failure shape: the same value arriving
@@ -94,7 +86,7 @@ class TestSetVolumeNoOp(_BackendForwardingEnabled):
         backend.set_volume = AsyncMock()  # type: ignore[method-assign]
         report_callback = AsyncMock()
         player.set_volume_report_callback(report_callback)
-        player._volume = 50
+        player._volume = 20
         player._is_active_renderer = True  # reporting is gated on this
 
         await player.set_volume(23)
@@ -105,7 +97,7 @@ class TestSetVolumeNoOp(_BackendForwardingEnabled):
         report_callback.assert_awaited_once_with(23)
 
 
-class TestVolumeReportGatedOnActive(_BackendForwardingEnabled):
+class TestVolumeReportGatedOnActive:
     """Regression: a stray post-deactivation volume change (observed live —
     "Volume set to 72" 4ms after deactivation, see
     docs/connect-activation-model-hypotheses.md) must not be reported —
@@ -118,18 +110,18 @@ class TestVolumeReportGatedOnActive(_BackendForwardingEnabled):
         backend.set_volume = AsyncMock()  # type: ignore[method-assign]
         report_callback = AsyncMock()
         player.set_volume_report_callback(report_callback)
-        player._volume = 50
+        player._volume = 20
         player._is_active_renderer = False
 
-        result = await player.set_volume(72)
+        result = await player.set_volume(25)
 
-        assert result == 72
-        assert player._volume == 72  # bookkeeping still updates
-        backend.set_volume.assert_awaited_once_with(72)  # device still gets it
+        assert result == 25
+        assert player._volume == 25  # bookkeeping still updates
+        backend.set_volume.assert_awaited_once_with(25)  # device still gets it
         report_callback.assert_not_awaited()  # but the app isn't told
 
 
-class TestVolumeCoalescing(_BackendForwardingEnabled):
+class TestVolumeCoalescing:
     """Reproduces the actual live failure shape a same-value check alone
     can't catch: a burst cycling through several *different* values
     rather than repeating one. Uses player.enqueue() directly, the same
@@ -170,7 +162,7 @@ class TestVolumeCoalescing(_BackendForwardingEnabled):
             coalesce=True,
         )
         player.enqueue(
-            functools.partial(player.set_volume, 42),
+            functools.partial(player.set_volume, 30),
             coalesce=True,
             coalesce_group=VOLUME_COALESCE_GROUP,
         )
@@ -179,28 +171,55 @@ class TestVolumeCoalescing(_BackendForwardingEnabled):
         await player.stop()
 
         assert backend.played == ["1"]
-        backend.set_volume.assert_awaited_once_with(42)
+        backend.set_volume.assert_awaited_once_with(30)
 
 
-class TestVolumeBackendEmergencyDisable:
-    """No mixin here — this exercises the actual shipped default of
-    _VOLUME_BACKEND_DISABLED, not a forced value. If this test needs
-    updating, that's a deliberate signal the flag's default is being
-    flipped; make sure that's really intended."""
+class TestVolumeHardCap:
+    """_VOLUME_HARD_CAP — a request above it is ceilinged everywhere
+    (backend, bookkeeping, app-facing report), not just refused, so a
+    request for e.g. 90 ends up looking and behaving exactly like a
+    request for the cap value. If this test needs updating, that's a
+    deliberate signal the cap value itself is being changed; make sure
+    that's really intended."""
 
-    async def test_backend_disabled_by_default_but_bookkeeping_and_report_still_run(
-        self,
-    ) -> None:
+    async def test_request_above_the_cap_is_ceilinged_everywhere(self) -> None:
         player, backend = _make_player()
         backend.set_volume = AsyncMock()  # type: ignore[method-assign]
         report_callback = AsyncMock()
         player.set_volume_report_callback(report_callback)
-        player._volume = 50
+        player._volume = 10
         player._is_active_renderer = True  # reporting is gated on this
 
-        result = await player.set_volume(60)
+        result = await player.set_volume(90)
 
-        assert result == 60
-        assert player._volume == 60  # bookkeeping still updates
-        backend.set_volume.assert_not_awaited()  # but never reaches the real device
-        report_callback.assert_awaited_once_with(60)  # app still sees the change
+        assert result == player_module._VOLUME_HARD_CAP
+        assert player._volume == player_module._VOLUME_HARD_CAP
+        backend.set_volume.assert_awaited_once_with(player_module._VOLUME_HARD_CAP)
+        report_callback.assert_awaited_once_with(player_module._VOLUME_HARD_CAP)
+
+    async def test_request_at_or_below_the_cap_is_unaffected(self) -> None:
+        player, backend = _make_player()
+        backend.set_volume = AsyncMock()  # type: ignore[method-assign]
+        player._volume = 0
+
+        result = await player.set_volume(player_module._VOLUME_HARD_CAP - 1)
+
+        assert result == player_module._VOLUME_HARD_CAP - 1
+        backend.set_volume.assert_awaited_once_with(player_module._VOLUME_HARD_CAP - 1)
+
+    async def test_a_flood_of_different_over_cap_values_collapses_to_one_backend_call(
+        self,
+    ) -> None:
+        """The cap doubles as protection against a repeat of the
+        echo/flood bug this exists alongside (docs/... see this module's
+        own docstring): different over-cap values all clamp to the same
+        capped value, so the existing same-value no-op guard collapses
+        them after the first."""
+        player, backend = _make_player()
+        backend.set_volume = AsyncMock()  # type: ignore[method-assign]
+        player._volume = 0
+
+        for value in (40, 41, 42, 43):
+            await player.set_volume(value)
+
+        backend.set_volume.assert_awaited_once_with(player_module._VOLUME_HARD_CAP)
