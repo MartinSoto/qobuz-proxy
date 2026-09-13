@@ -77,6 +77,7 @@ class TestSetVolumeNoOp(_BackendForwardingEnabled):
         report_callback = AsyncMock()
         player.set_volume_report_callback(report_callback)
         player._volume = 50
+        player._is_active_renderer = True  # reporting is gated on this
 
         result = await player.set_volume(60)
 
@@ -94,6 +95,7 @@ class TestSetVolumeNoOp(_BackendForwardingEnabled):
         report_callback = AsyncMock()
         player.set_volume_report_callback(report_callback)
         player._volume = 50
+        player._is_active_renderer = True  # reporting is gated on this
 
         await player.set_volume(23)
         for _ in range(50):
@@ -101,6 +103,30 @@ class TestSetVolumeNoOp(_BackendForwardingEnabled):
 
         backend.set_volume.assert_awaited_once_with(23)
         report_callback.assert_awaited_once_with(23)
+
+
+class TestVolumeReportGatedOnActive(_BackendForwardingEnabled):
+    """Regression: a stray post-deactivation volume change (observed live —
+    "Volume set to 72" 4ms after deactivation, see
+    docs/connect-activation-model-hypotheses.md) must not be reported —
+    the server has already told us we're not the active renderer and just
+    rejects it. Bookkeeping/backend forwarding are unaffected; only the
+    app-facing report is gated."""
+
+    async def test_volume_change_while_not_active_is_not_reported(self) -> None:
+        player, backend = _make_player()
+        backend.set_volume = AsyncMock()  # type: ignore[method-assign]
+        report_callback = AsyncMock()
+        player.set_volume_report_callback(report_callback)
+        player._volume = 50
+        player._is_active_renderer = False
+
+        result = await player.set_volume(72)
+
+        assert result == 72
+        assert player._volume == 72  # bookkeeping still updates
+        backend.set_volume.assert_awaited_once_with(72)  # device still gets it
+        report_callback.assert_not_awaited()  # but the app isn't told
 
 
 class TestVolumeCoalescing(_BackendForwardingEnabled):
@@ -170,6 +196,7 @@ class TestVolumeBackendEmergencyDisable:
         report_callback = AsyncMock()
         player.set_volume_report_callback(report_callback)
         player._volume = 50
+        player._is_active_renderer = True  # reporting is gated on this
 
         result = await player.set_volume(60)
 

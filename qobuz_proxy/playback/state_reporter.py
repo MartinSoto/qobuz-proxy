@@ -204,7 +204,29 @@ class StateReporter:
                 await asyncio.sleep(1.0)  # Brief pause before retry
 
     async def _send_state_update(self) -> None:
-        """Build and send state update."""
+        """Build and send state update.
+
+        Skipped outright while we're not the active renderer. This is
+        deliberately independent of Player's own device-stop debounce
+        (`_DEACTIVATION_GRACE_SECONDS` in deactivate_renderer) — that grace
+        period exists to protect the *physical device* from a spurious
+        WS-reconnect race, and keeps `state` reporting PLAYING for the
+        whole window on purpose. But nothing says a report sent during
+        that window is welcome: the server has already told us we're not
+        active, and every one of those reports comes back rejected
+        ("Renderer state updated message received from non active
+        renderer"). Two separate concerns — don't fold this check into the
+        debounce, and don't let a future change to one quietly affect the
+        other.
+        """
+        if not self._player.is_active_renderer:
+            logger.debug("Not the active renderer, skipping state update")
+            # Still reset the watchdog clock — otherwise the heartbeat loop
+            # (which gates on `state`, not on active-renderer status, and
+            # can see PLAYING throughout the whole deactivation grace
+            # window) would recompute a zero wait_time forever and spin.
+            self._last_report_at = time.monotonic()
+            return
         try:
             report = await self._build_state_report()
             await self._send_callback(report)

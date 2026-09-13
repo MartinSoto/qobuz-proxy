@@ -661,8 +661,19 @@ class QobuzPlayer:
         return self._volume
 
     async def _report_volume_change(self) -> None:
-        """Send volume change notification to app."""
+        """Send volume change notification to app.
+
+        Gated on `is_active_renderer` for the same reason StateReporter is
+        (see its `_send_state_update` docstring): a stray post-deactivation
+        volume poll must not send a report the server will just reject.
+        Safe for `broadcast_current_volume()`'s own legitimate call too —
+        `_handle_set_active` always sets `_is_active_renderer = True` before
+        calling it, so this never blocks that case.
+        """
         if not self._volume_report_callback:
+            return
+        if not self._is_active_renderer:
+            logger.debug("Not the active renderer, skipping volume report")
             return
 
         try:
@@ -1690,8 +1701,12 @@ class QobuzPlayer:
             # Log now playing with actual quality (0 = unavailable)
             self.metadata.log_now_playing_info(backend_meta, result.format_id or None)
 
-            # Report file quality if callback is set
-            if self._file_quality_report_callback:
+            # Report file quality if callback is set. Gated on
+            # is_active_renderer for the same reason _report_volume_change
+            # and StateReporter are — a report sent while we're not active
+            # (e.g. during the deactivation grace window, where playback
+            # continues on purpose) just comes back rejected.
+            if self._file_quality_report_callback and self._is_active_renderer:
                 logger.debug(f"Track {track.track_id} actual_quality={result.format_id}")
                 if result.format_id:
                     await self._file_quality_report_callback(result.format_id)
@@ -2096,7 +2111,7 @@ class QobuzPlayer:
         backend_meta = next_info.get("backend_meta")
         if backend_meta:
             self.metadata.log_now_playing_info(backend_meta, actual_quality or None)
-        if self._file_quality_report_callback and actual_quality:
+        if self._file_quality_report_callback and actual_quality and self._is_active_renderer:
             await self._file_quality_report_callback(actual_quality)
 
         # Report the play swap: ends the previous track, starts this one.

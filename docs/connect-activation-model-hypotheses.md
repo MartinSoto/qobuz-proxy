@@ -1,13 +1,15 @@
 # Working hypotheses: how Connect renderer activation actually works
 
 **Status: work-in-progress. Checked against one web-player HAR capture
-(`qobuz-player.har`), one proxy RAW_WS capture (`qobuz-queue.log`), and a
+(`qobuz-player.har`), one proxy RAW_WS capture (`qobuz-queue.log`), a
 second web-player HAR captured from a genuinely fresh login
-(`qobuz-player-full-login.har`) — all 2026-09-13, via
-`scripts/qconnect_trace.py`.** Not yet implemented or live-tested against a
-real household — this doc exists to hold the hypotheses and the evidence
-for/against each one steady across sessions, not to declare the
-investigation finished.
+(`qobuz-player-full-login.har`), and a third pair capturing a handoff away
+from this proxy (`qobuz-player-take-from-proxy.har` + a matching
+`qobuz-queue.log`) — all 2026-09-13, via `scripts/qconnect_trace.py`.**
+The bug the third capture found (see "Fixes implemented" below) is now
+fixed and unit-tested, but not yet live-tested against a real household —
+this doc exists to hold the hypotheses and the evidence for/against each
+one steady across sessions, not to declare the investigation finished.
 
 ## Context
 
@@ -211,20 +213,39 @@ active renderer" error recurring throughout this *entire* investigation
 fixed earlier. Every deactivation, for any reason, leaves reporting
 running a few seconds past the point the server stopped listening.
 
-## Confirmed fixes, not yet implemented
+## Fixes implemented
 
-Tracked here so they survive to a future session rather than needing
-re-diagnosis — none of these are done yet.
+1. **Gate `StateReporter`'s outbound sends on `is_active_renderer`**
+   (2026-09-13). `StateReporter._send_state_update()` — the single choke
+   point both `report_now()` and the heartbeat watchdog go through — now
+   returns immediately, without building or sending a report, whenever
+   `Player.is_active_renderer` is false. Deliberately independent of the
+   existing (correct, unchanged) device-stop debounce in
+   `deactivate_renderer()`: that debounce still lets `Player.state` read
+   PLAYING for the whole grace window, on purpose, to protect the
+   physical device from the WS-reconnect race it was built for — this is
+   a separate gate on top, not a replacement. The skip path still resets
+   the heartbeat's `_last_report_at` clock, so the watchdog doesn't
+   busy-loop for the rest of that window.
 
-1. **Gate `StateReporter`'s outbound sends on `is_active_renderer`.**
-   Stop reporting immediately when deactivated, independent of the
-   existing (correct, keep as-is) device-stop debounce in
-   `deactivate_renderer()`. Two genuinely separate concerns — don't
-   collapse them back together when fixing this. Likely also needs
-   checking whether other ad-hoc outbound sends (volume-changed on a
-   stray post-deactivation command, e.g. `Volume set to 72` observed
-   4ms after deactivation in the capture above) need the same gate, not
-   just the heartbeat/state path.
+   The same gap existed in two more ad-hoc report paths and got the same
+   gate: `Player._report_volume_change()` (the exact "Volume set to 72"
+   case observed 4ms after deactivation in the capture above) and both
+   `_file_quality_report_callback` call sites (`play_track`'s initial
+   report and the gapless-transition report — a transition can itself
+   land inside the deactivation grace window, since playback keeps
+   running through it by design). `broadcast_current_volume()`'s
+   legitimate activation-time re-broadcast is unaffected — verified
+   against `command_handler.py`'s `_handle_set_active`, which always sets
+   `is_active_renderer = True` before calling it.
+
+   Regression tests: `TestActiveRendererGate` in
+   `tests/playback/test_state_reporter.py`,
+   `TestVolumeReportGatedOnActive` in `tests/playback/test_player_volume.py`.
+
+   Not yet live-tested against a real household — next step is testing
+   track switching with the controller role active, per the user's own
+   plan.
 
 ## Open questions / not yet tested
 

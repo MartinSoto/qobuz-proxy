@@ -156,3 +156,45 @@ class TestHeartbeatWatchdog:
         await reporter.report_now()
 
         assert reporter._last_report_at == before
+
+
+class TestActiveRendererGate:
+    """Regression for the recurring "Renderer state updated message
+    received from non active renderer" server rejection: reporting must
+    stop the instant we're not the active renderer, independent of
+    Player's own (correct, deliberately debounced) device-stop grace
+    period — see deactivate_renderer()'s own docstring. During that grace
+    window `player.state` still reads PLAYING on purpose, so the gate has
+    to be on is_active_renderer specifically, not on playback state."""
+
+    async def test_report_now_is_a_noop_while_not_active(self) -> None:
+        reporter, send_callback = _make_reporter()
+        reporter._player.is_active_renderer = False
+
+        await reporter.report_now()
+
+        send_callback.assert_not_awaited()
+
+    async def test_heartbeat_stays_quiet_while_playing_but_not_active(self) -> None:
+        import asyncio
+        from unittest.mock import patch
+
+        reporter, send_callback = _make_reporter(state=PlaybackState.PLAYING)
+        reporter._player.is_active_renderer = False
+
+        with patch("qobuz_proxy.playback.state_reporter.STATE_HEARTBEAT_TIMEOUT_SECONDS", 0.02):
+            await reporter.start()
+            await asyncio.sleep(0.08)
+            await reporter.stop()
+
+        send_callback.assert_not_awaited()
+
+    async def test_becoming_active_again_lets_reports_resume(self) -> None:
+        reporter, send_callback = _make_reporter()
+        reporter._player.is_active_renderer = False
+
+        await reporter.report_now()
+        reporter._player.is_active_renderer = True
+        await reporter.report_now()
+
+        send_callback.assert_awaited_once()
