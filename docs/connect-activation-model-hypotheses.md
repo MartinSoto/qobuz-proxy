@@ -247,6 +247,69 @@ running a few seconds past the point the server stopped listening.
    track switching with the controller role active, per the user's own
    plan.
 
+## A failed live test (2026-09-13, `qobuz-queue.log`) — most likely just timing
+
+Tried playing from the app after the fix above landed: no sound, Sonos app
+showed the player paused, not obviously on the track that was picked.
+`qobuz-queue.log` (Cuarto's WS session — the only speaker that shows any
+`command_handler` activity in this log; the other 4 rooms were never even
+`SET_ACTIVE`d) shows, in order:
+
+1. **Connect (t=0.05s).** The server immediately restores a stale prior
+   session: `SET_ACTIVE(true)` + `SET_STATE(PAUSED, currentQueueItem=X,
+   position=5629ms, ...)`. We load track X (`"Loading new track: 46554934"`)
+   but never start it on the backend (paused, never played) — a genuine
+   leftover from a previous run, not this test.
+2. **t≈10-30s.** Three `SRVR_CTRL_QUEUE_TRACKS_LOADED` broadcasts arrive
+   (Controller-role — we receive these now because of the dual join),
+   `queuePosition` advancing 1, then 2 — almost certainly the user
+   browsing the app. We don't act on these at all; see
+   `queue_diagnostics.py`'s own docstring, already investigating exactly
+   this message.
+3. **t=41.07s.** We get deactivated (`SET_ACTIVE{}`, active absent) —
+   another renderer becomes active. After the grace period,
+   `stop_playback()` resets position to 0 and state to STOPPED, but —
+   correctly, per `stop_playback`'s own contract — leaves
+   `self._current_track` alone, still pointing at stale track X.
+4. **t=58.38s.** We get reactivated (`SET_ACTIVE(true)`) — the user
+   picked Cuarto again. We claim the device and re-broadcast volume, per
+   `_handle_set_active`. Nothing else.
+5. **t=74.35s (16s after reactivation).** The *only* command that ever
+   arrives: a bare `SET_STATE{playingState: PAUSED}` — no
+   `currentQueueItem`, no `currentPosition`. Per the deliberate
+   omission-means-"don't touch" semantics in `_handle_set_state`, this
+   correctly leaves `_current_track` untouched — but "untouched" here
+   means "still the stale track from step 1," at position 0, never
+   started. Logged exactly as expected:
+   `"Track loaded paused at 0ms (not started on backend)"`.
+6. **t=77.6s — 3.3s later.** The user gave up and killed the app.
+   Nothing else ever arrived.
+
+**Most likely explanation: not enough time was given.** This matches
+[[sonos-load-then-play-app-delay]] exactly in shape — the app splits a
+renderer (re)activation across multiple WS messages and has been directly
+observed elsewhere taking up to ~17s between a load-only message and the
+actual play instruction, unrelated to anything the renderer does. Step 5
+already arrived 16s after reactivation; only 3 more seconds passed before
+the app was killed — well short of the ~17s worst case seen before. No
+code bug is implicated by this capture: `is_active_renderer` gating,
+deactivation debounce, and the omission-vs-sentinel handling all behaved
+exactly as designed throughout.
+
+**A real, separate, still-unconfirmed question this capture reopens, but
+does not answer:** does the app ever resend `currentQueueItem` when
+reselecting an already-current queue position on a different renderer, or
+does it just expect the renderer to already know "what's current" from
+the `SRVR_CTRL_QUEUE_TRACKS_LOADED` broadcasts sent while it was inactive
+(step 2)? This capture ended too early (step 6) to tell — the real
+"play this" `SET_STATE` may simply not have arrived yet. Don't build
+`queue_diagnostics.py`'s scaffolding into real queue-tracking on the
+strength of this one capture; retest with more patience first.
+
+**Recommended retest:** activate Cuarto from the app, then wait at least
+30-60s (past the ~17s worst case already seen once) before concluding
+nothing happened, and capture the log again either way.
+
 ## Open questions / not yet tested
 
 - What does a genuinely **first-ever** join (a brand-new deviceUuid,
