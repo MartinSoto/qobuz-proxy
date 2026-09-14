@@ -9,6 +9,7 @@ from qobuz_proxy.config import (
     SpeakerConfig,
 )
 from qobuz_proxy.connect.types import ConnectTokens, JWTConnectToken
+from qobuz_proxy.proto import payload as payload_pb2
 from qobuz_proxy.speaker import Speaker
 
 
@@ -540,6 +541,71 @@ class TestSpeakerWebSocket:
 
         assert len(setup_calls) == 1
         assert setup_calls[0] is tokens
+
+
+class TestSpeakerProtocolErrorHandling:
+    """_handle_protocol_error — code "1001" is the one class of protocol
+    error observed to mean "your cached session_uuid is no good any
+    more" (e.g. "session data is missing" / "sessionUuid mismatch"); see
+    WsManager.invalidate_session()'s own docstring for why retrying with
+    it is pointless and _STALE_SESSION_ERROR_CODE's comment for how
+    narrowly this is scoped."""
+
+    def _make_speaker_with_ws_manager(self) -> tuple[Speaker, MagicMock]:
+        speaker = Speaker(
+            config=_make_speaker_config(),
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
+        ws_manager = MagicMock()
+        speaker._ws_manager = ws_manager
+        return speaker, ws_manager
+
+    def test_stale_session_error_invalidates_the_session(self):
+        speaker, ws_manager = self._make_speaker_with_ws_manager()
+        msg = payload_pb2.QConnectMessage()
+        msg.error.code = "1001"
+        msg.error.message = "sessionUuid mismatch"
+
+        speaker._handle_protocol_error(1, msg)
+
+        ws_manager.invalidate_session.assert_called_once_with("sessionUuid mismatch")
+
+    def test_unrelated_error_code_does_not_invalidate_the_session(self):
+        """code "1" covers a different, playback-level class of error
+        (e.g. "Current track not found in queue nor autoplay") — must
+        never be treated as a stale-session signal."""
+        speaker, ws_manager = self._make_speaker_with_ws_manager()
+        msg = payload_pb2.QConnectMessage()
+        msg.error.code = "1"
+        msg.error.message = "Current track not found in queue nor autoplay"
+
+        speaker._handle_protocol_error(1, msg)
+
+        ws_manager.invalidate_session.assert_not_called()
+
+    def test_missing_error_field_does_not_raise(self):
+        speaker, ws_manager = self._make_speaker_with_ws_manager()
+        msg = payload_pb2.QConnectMessage()  # no `error` field set at all
+
+        speaker._handle_protocol_error(1, msg)  # must not raise
+
+        ws_manager.invalidate_session.assert_not_called()
+
+    def test_stale_session_error_without_a_ws_manager_does_not_raise(self):
+        speaker = Speaker(
+            config=_make_speaker_config(),
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
+        assert speaker._ws_manager is None
+        msg = payload_pb2.QConnectMessage()
+        msg.error.code = "1001"
+        msg.error.message = "session data is missing"
+
+        speaker._handle_protocol_error(1, msg)  # must not raise
 
 
 class TestSpeakerQualityChange:

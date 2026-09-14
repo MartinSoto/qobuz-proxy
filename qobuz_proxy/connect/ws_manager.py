@@ -142,6 +142,14 @@ class TokenRefreshRequired(Exception):
     """Raised when the WebSocket must wait for refreshed tokens from the app."""
 
 
+class IdleShutdownRequired(Exception):
+    """Raised from within an open connection's receive loop once playback
+    has been idle past Player.is_worth_keeping_ws_alive()'s window — see
+    that method and _WS_IDLE_TIMEOUT_SECONDS. Closes the socket ourselves
+    instead of holding it open until the token happens to lapse on its
+    own (which, with self-refresh, could otherwise be never)."""
+
+
 class WsManager:
     """
     Manages WebSocket connection to Qobuz servers.
@@ -248,7 +256,7 @@ class WsManager:
         )
         if tokens_changed and self._ws and self._should_run:
             logger.info("Received refreshed WebSocket tokens, reconnecting")
-            asyncio.create_task(self._close_for_token_refresh())
+            asyncio.create_task(self._close_current_connection())
 
     def set_max_audio_quality(self, quality: int) -> None:
         """
@@ -377,6 +385,40 @@ class WsManager:
             await self._ws.close()
         except Exception as e:
             logger.debug(f"Failed to close WebSocket for forced reconnect: {e}")
+
+    def invalidate_session(self, reason: str) -> None:
+        """
+        Discard the cached Connect session identity and close the current
+        connection, if any — see speaker.py's _handle_protocol_error,
+        which calls this for a server-side error meaning "this
+        session_uuid is no longer any good" (observed live as code 1001,
+        "session data is missing" / "sessionUuid mismatch" — see
+        docs/gapless-arming-and-token-expiry.md's WS-idle-timeout section
+        for how a session ends up stale like this in the first place:
+        after being fully disconnected for a while, the server has
+        apparently moved on to a different identity for this device
+        without telling us).
+
+        Unlike force_reconnect(), which closes and holds off for a fixed
+        duration before retrying with the *same* identity, there is no
+        useful retry here: _send_join_session()/_subscribe() both refuse
+        to run at all without a session_uuid, and the Connect session
+        identity itself can only ever come from the app (see
+        _refresh_token_from_api's own docstring) — retrying with the
+        identity the server just disowned would only reproduce the exact
+        same rejection. Clearing it here makes the next
+        _wait_for_valid_token() call fall straight into the same
+        indefinite "waiting for the app" path used when there has never
+        been a session at all, instead of hammering the server with
+        doomed reconnects on a growing backoff until the app happens to
+        reconnect on its own anyway.
+        """
+        if self._session_uuid is None:
+            return
+        logger.warning(f"Invalidating Connect session ({reason}) — waiting for the app")
+        self._session_uuid = None
+        if self._ws is not None:
+            asyncio.create_task(self._close_current_connection())
 
     async def send_message(self, data: bytes) -> bool:
         """
@@ -560,7 +602,7 @@ class WsManager:
             should_backoff = True
             try:
                 await self._connect_and_run()
-            except TokenRefreshRequired:
+            except (TokenRefreshRequired, IdleShutdownRequired):
                 should_backoff = False
             except Exception as e:
                 logger.error(f"Connection error: {e}")
@@ -631,7 +673,7 @@ class WsManager:
                 # Message receive loop
                 await self._receive_loop()
 
-        except TokenRefreshRequired:
+        except (TokenRefreshRequired, IdleShutdownRequired):
             raise
         except websockets.ConnectionClosed as e:
             logger.warning(f"Connection closed: {e.code} {e.reason}")
@@ -760,6 +802,20 @@ class WsManager:
                 if self._ws_token and self._ws_token.is_expired(TOKEN_REFRESH_BUFFER):
                     logger.warning("Token expiring soon, need refresh")
                     raise TokenRefreshRequired()
+                # Check whether playback is still worth holding this
+                # connection open for — see IdleShutdownRequired. Only
+                # relevant once a connection actually exists to close;
+                # _wait_for_valid_token already refuses to open a new one
+                # in the same situation, so this only ever fires against
+                # a connection that was already live when playback went
+                # idle (e.g. self-refresh had kept it alive for under an
+                # hour before playback stopped).
+                if self._is_worth_keeping_alive is not None and not self._is_worth_keeping_alive():
+                    logger.info(
+                        "Playback idle past the keep-alive window — closing the "
+                        "control WebSocket ourselves instead of holding it open unused"
+                    )
+                    raise IdleShutdownRequired()
 
             except websockets.ConnectionClosed:
                 raise
@@ -835,12 +891,30 @@ class WsManager:
         api_client wired up, or we've never had a session at all yet: the
         very first token can only ever come from the app) or keeps
         failing.
+
+        Also refuses to report a token "valid" — even one that hasn't
+        technically expired — while either of these hold, in both cases
+        deliberately falling into the same wait-for-the-app loop used
+        when there's no token at all rather than opening a connection
+        that can only fail or immediately need closing again:
+        - playback has been idle past is_worth_keeping_alive()'s window
+          (see IdleShutdownRequired — closing proactively there would be
+          undone instantly if this just reconnected with the same
+          still-valid token)
+        - the Connect session identity was invalidated (see
+          invalidate_session()) — reconnecting with no session_uuid at
+          all fails _subscribe()/_send_join_session() outright, and
+          retrying it on a growing backoff would just repeat that forever
+          instead of waiting for the app to hand us a real one.
         """
         logged_wait = False
 
         while self._should_run:
+            worth_it = self._is_worth_keeping_alive is None or self._is_worth_keeping_alive()
             if (
-                self._ws_token
+                worth_it
+                and self._session_uuid is not None
+                and self._ws_token
                 and self._ws_token.is_valid()
                 and not self._ws_token.is_expired(buffer_s)
             ):
@@ -850,7 +924,15 @@ class WsManager:
                 continue
 
             if not logged_wait:
-                logger.warning("Token expired, waiting for refreshed token from Qobuz app")
+                if not worth_it:
+                    logger.info(
+                        "Playback idle past the keep-alive window — control WebSocket "
+                        "stays closed until playback resumes or the app reconnects"
+                    )
+                elif self._session_uuid is None:
+                    logger.warning("No valid Connect session — waiting for the app to reconnect")
+                else:
+                    logger.warning("Token expired, waiting for refreshed token from Qobuz app")
                 logged_wait = True
 
             token_version = self._token_version
@@ -907,8 +989,11 @@ class WsManager:
         logger.info("Refreshed WebSocket token directly from Qobuz API")
         return True
 
-    async def _close_for_token_refresh(self) -> None:
-        """Close the current connection so refreshed tokens are used immediately."""
+    async def _close_current_connection(self) -> None:
+        """Close the current connection, if any, so the next connect cycle
+        picks up whatever changed (refreshed tokens — see set_tokens() —
+        or an invalidated session — see invalidate_session()) immediately
+        instead of waiting for it to notice on its own."""
         if not self._ws:
             return
 

@@ -742,3 +742,73 @@ hardware even by Sonos's own standards — and not treated as a remaining
 instance of this bug; nothing suggests it's hitting the same overload
 pattern as badly as before, just that it's the weakest device in the
 household relative to everything else that's now solid.
+
+## Proactively closing the idle WS, and recovering from a stale session identity (2026-09-14)
+
+Reported directly, from a several-hour run's log: playback resumed from
+the Sonos side after a long (~5.5h) idle stretch, but the Qobuz app had
+by then lost its own connection entirely. Rejoining from the app took
+around 40 seconds and initially failed outright (falling back to phone
+playback), a second attempt reconnected but several taps to select/play
+a track did nothing, and only after another couple of minutes did
+playback actually recover — landing back on the very same track/position
+it had been idled on, not a new selection as it appeared from the app
+side.
+
+Traced from the log rather than guessed: exactly as "Letting the WS
+session idle out on its own" above describes, the control WebSocket had
+gone completely dark 3h41m before any of this — `Token expiring soon` /
+`Token expired, waiting for refreshed token from Qobuz app`, then
+nothing at all (not even the ~5s keepalive traffic visible everywhere
+else in the log) until the resume attempt. That part is working exactly
+as designed: `is_worth_keeping_ws_alive()` correctly stopped renewing
+after an hour of continuous pause, and the connection was fully closed,
+not left open unused.
+
+The actual problem starts on reconnect: `WsManager` had cached a
+session_uuid the server no longer recognized (it had, unsurprisingly,
+moved on after hours of silence), and every one of ~7 back-to-back
+reconnect attempts — each on the normal 1s-growing backoff — repeated the
+exact same rejection (`Protocol error: code=1001, message=session data
+is missing`, then `sessionUuid mismatch [...]`) before the *app's own*
+independent reconnect happened to hand over a fresh session. Nothing in
+the reconnect loop recognized "this identity is permanently bad, stop
+retrying it" — it just kept hammering the server with a doomed request
+on a fixed schedule until rescued by a completely unrelated code path.
+
+**Fixed, three pieces**:
+
+1. `is_worth_keeping_ws_alive()` returning false now closes an
+   already-open connection proactively (`IdleShutdownRequired`, raised
+   from `_receive_loop`'s existing periodic timeout check, right next to
+   the token-expiry check it already had) instead of only ever
+   withholding a renewal and waiting for the token to lapse on its own
+   boundary — which, now that self-refresh exists, could in principle
+   never happen at all if a token's lifetime ever outlived the idle
+   window. Token-expiry still takes priority when both are true at once,
+   so self-refresh gets first chance.
+2. `_wait_for_valid_token`'s "already good, reconnect now" check now also
+   requires `is_worth_keeping_alive()` and a live `session_uuid` — not
+   just a technically-unexpired token — so closing proactively (1) or
+   invalidating the session (3) actually sticks instead of being undone
+   the instant the connection loop asks again.
+3. New `WsManager.invalidate_session()`, called from
+   `_handle_protocol_error` whenever the server sends error code `1001`
+   (observed, not documented, to mean exactly this class of rejection —
+   every other observed code is a different, playback-level error and
+   must not trigger it). Clears the stale `session_uuid` and force-closes
+   the connection; per (2), the next `_wait_for_valid_token` call then
+   falls straight into the same indefinite "waiting for the app" path
+   already used when there's never been a session at all, instead of
+   retrying an identity that can only ever be rejected again — only the
+   app can hand over a new one (see `_refresh_token_from_api`'s own
+   docstring).
+
+Not yet confirmed live whether this fully resolves the reported sequence
+— the mechanism matches the log precisely, but the fix hasn't been
+observed going through the same long-idle-then-resume cycle yet. Watch
+for whether a future idle-resume ever again needs a *second* app-side
+reconnect attempt before recovering, and whether `Invalidating Connect
+session` ever fires for a code `1001` that turns out to be unrelated to
+session identity (the narrowing comment on `_STALE_SESSION_ERROR_CODE`
+in speaker.py flags exactly this risk).

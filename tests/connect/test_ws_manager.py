@@ -13,11 +13,14 @@ import pytest
 from qobuz_proxy.config import Config
 from qobuz_proxy.connect.protocol import MessageType
 from qobuz_proxy.connect.types import ConnectTokens, JWTConnectToken
+from qobuz_proxy.connect import ws_manager as ws_manager_module
 from qobuz_proxy.connect.ws_manager import (
     HIJACK_RECONNECT_HOLD_SECONDS,
     INITIAL_RECONNECT_DELAY,
     MAX_RECONNECT_DELAY,
     RECONNECT_BACKOFF_MULTIPLIER,
+    IdleShutdownRequired,
+    TokenRefreshRequired,
     WsManager,
     _log_raw_frame,
 )
@@ -297,6 +300,154 @@ class TestSelfRefreshWsToken:
         assert await ws_manager._refresh_token_from_api(buffer_s=60) is True
 
 
+class TestWaitForValidTokenGating:
+    """_wait_for_valid_token's eager "already good, connect now" check
+    must not fire just because the token itself happens to still be
+    valid — it also has to agree the connection is worth holding open at
+    all, or IdleShutdownRequired's proactive close (see
+    TestReceiveLoopIdleShutdown below) would be undone the instant the
+    connection loop asked again, and invalidate_session()'s whole point
+    (stop retrying a session_uuid the server already rejected) would be
+    defeated the same way."""
+
+    async def test_idle_playback_blocks_even_with_a_valid_token(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
+        await asyncio.sleep(0)
+
+        assert wait_task.done() is False
+        wait_task.cancel()
+
+    async def test_invalidated_session_blocks_even_with_a_valid_token(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        ws_manager = WsManager(config)
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+        ws_manager.invalidate_session("test")
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
+        await asyncio.sleep(0)
+
+        assert wait_task.done() is False
+        wait_task.cancel()
+
+    async def test_resuming_playback_unblocks_once_the_app_reconnects(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        """Mirrors the real recovery path: is_worth_keeping_alive flips
+        True (a resume), but there's no separate "wake up, resume
+        happened" signal into this loop — same pre-existing shape as
+        test_wait_for_valid_token_blocks_until_refresh, just gated on the
+        idle flag instead of token expiry."""
+        worth_it = False
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: worth_it)
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
+        await asyncio.sleep(0)
+        assert wait_task.done() is False
+
+        worth_it = True
+        ws_manager.set_tokens(valid_tokens)  # app-style nudge, unblocks the wait
+
+        assert await asyncio.wait_for(wait_task, timeout=1.0) is True
+
+
+class TestReceiveLoopIdleShutdown:
+    """_receive_loop's own idle check — the counterpart to
+    _wait_for_valid_token's gating above. An *already open* connection
+    only ever finds out playback went idle by hitting this check on its
+    next receive-timeout tick, since nothing else interrupts a live
+    connection just because Player's state changed underneath it."""
+
+    @staticmethod
+    def _make_timing_out_ws() -> AsyncMock:
+        """recv() that never returns — the real target of _receive_loop's
+        asyncio.wait_for(..., timeout=RECV_TIMEOUT), so the TimeoutError
+        branch under test fires deterministically instead of racing a
+        short real message."""
+        ws = AsyncMock()
+
+        async def hang_forever() -> bytes:
+            await asyncio.sleep(3600)
+            return b""  # pragma: no cover - never reached
+
+        ws.recv = hang_forever
+        return ws
+
+    @pytest.fixture(autouse=True)
+    def fast_recv_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every test in this class hits the TimeoutError branch on
+        purpose — no need to actually burn RECV_TIMEOUT's real second
+        getting there."""
+        monkeypatch.setattr(ws_manager_module, "RECV_TIMEOUT", 0.01)
+
+    async def test_raises_when_idle_past_the_keep_alive_window(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+        ws_manager._ws = self._make_timing_out_ws()
+
+        with pytest.raises(IdleShutdownRequired):
+            await ws_manager._receive_loop()
+
+    async def test_does_not_raise_while_still_worth_keeping_alive(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: True)
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+        ws_manager._ws = self._make_timing_out_ws()
+
+        task = asyncio.create_task(ws_manager._receive_loop())
+        await asyncio.sleep(0.05)
+        assert task.done() is False
+        task.cancel()
+
+    async def test_no_callback_never_raises_idle_shutdown(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        """None (no policy wired up) must keep the pre-existing
+        behavior — never proactively closing — exactly like
+        _refresh_token_from_api's own no-callback case."""
+        ws_manager = WsManager(config)
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+        ws_manager._ws = self._make_timing_out_ws()
+
+        task = asyncio.create_task(ws_manager._receive_loop())
+        await asyncio.sleep(0.05)
+        assert task.done() is False
+        task.cancel()
+
+    async def test_token_expiry_takes_priority_over_idle_shutdown(self, config: Config) -> None:
+        """Both conditions can be true on the same tick (a long-expired
+        token on a connection that also happens to be idle) —
+        TokenRefreshRequired must win so self-refresh still gets a
+        chance rather than the connection being written off as merely
+        idle."""
+        expiring_tokens = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(jwt="expiring", exp=1, endpoint="wss://x/ws"),
+        )
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
+        ws_manager.set_tokens(expiring_tokens)
+        ws_manager._should_run = True
+        ws_manager._ws = self._make_timing_out_ws()
+
+        with pytest.raises(TokenRefreshRequired):
+            await ws_manager._receive_loop()
+
+
 class TestForceReconnect:
     """force_reconnect() — used when a renderer detects an external
     takeover (see Player.is_playing_our_content()). The protocol has no
@@ -358,6 +509,78 @@ class TestForceReconnect:
         ws_manager._ws.close.side_effect = OSError("already gone")
 
         await ws_manager.force_reconnect("test reason")  # must not raise
+
+
+class TestInvalidateSession:
+    """invalidate_session() — called by speaker.py's _handle_protocol_error
+    when the server rejects our cached session_uuid outright (observed
+    live as error code 1001, "session data is missing" /
+    "sessionUuid mismatch"). Unlike force_reconnect(), there's no hold to
+    wait out and rejoin after — the identity itself is gone, so the next
+    connection attempt has to wait for the app instead of retrying it."""
+
+    async def test_clears_the_session_uuid(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        ws_manager.set_tokens(valid_tokens)
+        assert ws_manager._session_uuid is not None
+
+        ws_manager.invalidate_session("sessionUuid mismatch")
+
+        assert ws_manager._session_uuid is None
+
+    async def test_closes_the_current_connection(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._ws = AsyncMock()
+
+        ws_manager.invalidate_session("session data is missing")
+        await asyncio.sleep(0)  # let the spawned close task run
+
+        ws_manager._ws.close.assert_awaited_once()
+
+    async def test_is_a_noop_without_a_prior_session(self, ws_manager: WsManager) -> None:
+        """Nothing to invalidate yet (e.g. before the app has ever
+        connected) — must not touch a connection that isn't ours to close
+        for this reason."""
+        assert ws_manager._session_uuid is None
+        ws_manager._ws = AsyncMock()
+
+        ws_manager.invalidate_session("test reason")
+        await asyncio.sleep(0)
+
+        ws_manager._ws.close.assert_not_awaited()
+
+    async def test_is_a_noop_without_a_live_connection(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._ws = None
+
+        ws_manager.invalidate_session("test reason")  # must not raise
+
+        assert ws_manager._session_uuid is None
+
+    async def test_next_reconnect_waits_for_the_app_instead_of_retrying(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """End-to-end with _wait_for_valid_token: invalidating a session
+        with an otherwise still-valid token must not immediately hand
+        back a green light to reconnect with — see
+        TestWaitForValidTokenGating."""
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+
+        ws_manager.invalidate_session("sessionUuid mismatch")
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
+        await asyncio.sleep(0)
+        assert wait_task.done() is False
+
+        ws_manager.set_tokens(valid_tokens)  # the app reconnects with a fresh session
+
+        assert await asyncio.wait_for(wait_task, timeout=1.0) is True
 
 
 class TestSendJoinSession:

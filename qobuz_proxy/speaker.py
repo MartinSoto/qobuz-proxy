@@ -46,6 +46,19 @@ from qobuz_proxy.backends.dlna import AudioProxyServerProtocol, DLNABackend
 
 logger = logging.getLogger(__name__)
 
+# Observed live, not documented anywhere in the protocol: the server uses
+# this specific error code for "the session_uuid you're using is no good
+# any more" ("session data is missing" / "sessionUuid mismatch" are the
+# two message texts seen so far — see
+# docs/gapless-arming-and-token-expiry.md's WS-idle-timeout section for
+# how a session ends up stale like this in the first place). Every other
+# observed code (e.g. "1", "Current track not found in queue nor
+# autoplay") is a different, playback-level class of error and must not
+# trigger invalidate_session() — if a future capture ever shows this code
+# used for something else too, _handle_protocol_error below needs to
+# narrow on the message text as well, not just the code.
+_STALE_SESSION_ERROR_CODE = "1001"
+
 
 class Speaker:
     """
@@ -751,6 +764,12 @@ class Speaker:
             logger.error(
                 f"[{self.name}] Protocol error: code={error.code}, message={error.message}"
             )
+            if error.code == _STALE_SESSION_ERROR_CODE and self._ws_manager:
+                # Retrying with this same session_uuid can only ever repeat
+                # this same rejection — see invalidate_session()'s own
+                # docstring for why this discards it instead of letting the
+                # normal reconnect-with-backoff path spin on it forever.
+                self._ws_manager.invalidate_session(error.message)
         else:
             logger.error(f"[{self.name}] Protocol error message received (type {msg_type})")
 
