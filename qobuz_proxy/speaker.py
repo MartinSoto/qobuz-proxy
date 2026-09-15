@@ -506,6 +506,13 @@ class Speaker:
         )
         if isinstance(backend, DLNABackend):
             self._player.set_fixed_volume_mode(self._config.dlna_fixed_volume)
+            # Same idle signal WsManager already uses to decide whether the
+            # control WebSocket is worth proactively keeping alive — see
+            # DLNABackend.set_idle_check's own docstring for why the poll
+            # loop needs to agree with it too, instead of hammering the
+            # device at full speed for hours after the control channel has
+            # already gone quiet.
+            backend.set_idle_check(self._player.is_worth_keeping_ws_alive)
 
     async def stop(self, send_device_stop: bool = True) -> None:
         """

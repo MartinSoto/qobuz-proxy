@@ -261,6 +261,46 @@ class TestSpeakerLifecycle:
         mock_backend.create_proxy_server.assert_called_once()
         mock_backend.set_proxy_server.assert_called_once_with(mock_proxy)
 
+    async def test_start_with_dlna_backend_wires_the_idle_poll_check(self):
+        """DLNABackend.set_idle_check() must be wired to the same
+        is_worth_keeping_ws_alive() query WsManager already uses, so the
+        DLNA poll loop's own idle backoff (see backend.py's
+        IDLE_POLL_INTERVAL_SECONDS) agrees with the control WebSocket's
+        idle-close about what "idle" means."""
+        from qobuz_proxy.backends.dlna import DLNABackend
+
+        config = _make_speaker_config()
+        speaker = Speaker(
+            config=config,
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
+
+        mock_backend = MagicMock(spec=DLNABackend)
+        mock_backend.name = "Mock DLNA"
+        mock_backend.get_recommended_quality.return_value = 7
+        mock_proxy = MagicMock()
+        mock_proxy.start = AsyncMock()
+        mock_backend.create_proxy_server.return_value = mock_proxy
+
+        with (
+            patch(
+                "qobuz_proxy.speaker.BackendFactory.create_from_config",
+                new_callable=AsyncMock,
+                return_value=mock_backend,
+            ),
+            patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc_cls,
+        ):
+            mock_disc_cls.return_value.start = AsyncMock()
+
+            await speaker.start()
+
+        assert speaker._player is not None
+        mock_backend.set_idle_check.assert_called_once_with(
+            speaker._player.is_worth_keeping_ws_alive
+        )
+
     async def test_start_auto_quality_dlna_uses_recommended(self):
         """AUTO_QUALITY with DLNA should resolve to get_recommended_quality()."""
         from qobuz_proxy.backends.dlna import DLNABackend

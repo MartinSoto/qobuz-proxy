@@ -922,3 +922,38 @@ Confirmed against the overnight log's exact shape in
 yet re-confirmed live against a real idle-close-then-reconnect cycle —
 watch for whether an app reconnect after a proactive idle close still
 ever needs a second attempt.
+
+### 3. The DLNA poll loop had no notion of "idle" at all
+
+Asked directly, after both fixes above: if the control WebSocket closes
+itself once idle, why was `DLNABackend._poll_state_loop` still hitting
+the physical device every `STATE_POLL_INTERVAL_SECONDS` (2s) hours later,
+with no Connect session for any of it to serve? Fair question — it had
+no such gate. `_poll_state_loop` starts on `connect()` and only ever
+stops on `disconnect()` (or the existing `set_active(False)` path for a
+Sonos-auto-discovered room nobody has ever selected — see
+`b10bf47`, unrelated: this speaker *was* the selected one). Once
+selected, it polls at full, fixed cadence for as long as the physical
+connection lives, entirely independent of whether the control channel
+to Qobuz is alive or anyone's listening.
+
+Polling can't just stop outright while idle, though: it's the *only*
+thing that ever notices a device-side resume (Play pressed directly on
+the Sonos app/remote) and flips `Player` back to `PLAYING` —
+`is_worth_keeping_ws_alive()` reads exactly that to decide the WS is
+worth reconnecting on its own. Stop polling entirely while idle, and a
+device-side resume would never reach the Qobuz app until something else
+reopened it.
+
+**Added**: `DLNABackend.set_idle_check()`, wired up by `Speaker` to the
+same `Player.is_worth_keeping_ws_alive` query `WsManager` already uses —
+both idle notions finally agree. `_poll_interval()` now backs off toward
+`IDLE_POLL_INTERVAL_SECONDS` (30s) once that query says no, independent
+of (and combining with, via `max()`) the pre-existing device-failure
+backoff. Deliberately not a full stop, unlike the never-selected-room
+case — this renderer is still the one Qobuz considers active, so a
+device-side resume still has to be noticed, just not within 2 seconds.
+As a side effect this also narrows the exposure window for section 1's
+class of bug (a passing device hiccup has 15x fewer chances per minute
+to be read as something meaningful) — belt-and-suspenders on top of the
+actual fix there, not a substitute for it.

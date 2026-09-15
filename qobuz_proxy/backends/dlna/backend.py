@@ -7,7 +7,7 @@ Implements AudioBackend interface for DLNA/UPnP renderers.
 import asyncio
 import logging
 import time
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 from qobuz_proxy.backends.base import AudioBackend
 from qobuz_proxy.backends.types import (
@@ -85,6 +85,27 @@ VOLUME_POLL_GRACE_SECONDS = 3.0
 POLL_BACKOFF_FAILURE_THRESHOLD = 3  # consecutive failures before backing off at all
 POLL_BACKOFF_MAX_INTERVAL_SECONDS = 10.0
 POLL_BACKOFF_MULTIPLIER = 2.0
+
+# Backing off the poll cadence for a different reason: nothing has been
+# worth polling *for* in a while, not the device being uncooperative (see
+# _is_worth_polling_at_full_speed / set_idle_check()). This backend has no
+# notion of "session" of its own — Speaker wires in the same signal
+# WsManager already uses to decide whether the control WebSocket is worth
+# proactively keeping alive (Player.is_worth_keeping_ws_alive), so the two
+# finally agree on what "idle" means instead of the control channel going
+# quiet while this loop keeps hammering the device every
+# STATE_POLL_INTERVAL_SECONDS regardless. Confirmed live (2026-09-15
+# overnight): full-speed polling continuing for hours after the WS had
+# already idle-closed is exactly what let a passing network outage look
+# like a real external takeover in the first place — see
+# docs/gapless-arming-and-token-expiry.md. Deliberately much slower than
+# POLL_BACKOFF_MAX_INTERVAL_SECONDS (this is "nobody's listening", not "the
+# device might be struggling") but not a full stop: unlike set_active(False)
+# (a room nobody has ever selected, polling stopped outright), this
+# renderer is still the one Qobuz considers active — a resume from the
+# device's own controls must still be noticed and reported, just without
+# needing to hear about it within 2 seconds.
+IDLE_POLL_INTERVAL_SECONDS = 30.0
 
 # While playing, how many poll cycles between hijack checks (is another
 # source now playing to this renderer instead of us — see
@@ -265,6 +286,13 @@ class DLNABackend(AudioBackend):
         # cadence — just so the transition either way gets logged once,
         # not every single poll cycle while it lasts.
         self._poll_backoff_active: bool = False
+        # See set_idle_check() / IDLE_POLL_INTERVAL_SECONDS. None (the
+        # default, e.g. in tests that never call set_idle_check()) means
+        # always worth polling at full speed — the pre-existing behavior.
+        self._is_worth_polling_at_full_speed: Optional[Callable[[], bool]] = None
+        # Mirrors _poll_backoff_active but for the idle reason — logged
+        # separately so the two causes stay distinguishable in the log.
+        self._poll_idle_active: bool = False
 
         self._current_metadata: Optional[BackendTrackMetadata] = None
         self._position_ms: int = 0
@@ -1171,16 +1199,45 @@ class DLNABackend(AudioBackend):
     # Internal
     # =========================================================================
 
+    def set_idle_check(self, callback: Optional[Callable[[], bool]]) -> None:
+        """Register the signal _poll_interval() uses to back off the poll
+        cadence once nothing has been worth polling *for* in a while — see
+        IDLE_POLL_INTERVAL_SECONDS. Wired up by Speaker to
+        Player.is_worth_keeping_ws_alive(), the same query WsManager
+        already uses to decide whether the control WebSocket is worth
+        proactively keeping alive, so both finally agree on what "idle"
+        means. None (the default, e.g. in tests, or a DLNABackend used
+        outside a full Speaker) keeps polling at full speed always,
+        matching the pre-existing behavior.
+        """
+        self._is_worth_polling_at_full_speed = callback
+
     def _poll_interval(self) -> float:
         """How long to sleep before the next poll cycle — the normal
-        cadence, backed off once the device has stopped answering
-        anything at all (DLNAClient.consecutive_failures — see its own
-        docstring, and POLL_BACKOFF_FAILURE_THRESHOLD's, for why).
-        Recomputed fresh from the client's own persistent counter every
-        time this is called rather than tracked as loop state, so it's
-        correct regardless of which of _poll_state_loop's many `continue`
-        paths ran last cycle. Snaps straight back to the base cadence the
-        moment any SOAP call succeeds again, from polling or a command.
+        cadence, backed off for either (or both) of two independent
+        reasons, the slower of the two winning:
+
+        - the device has stopped answering anything at all
+          (DLNAClient.consecutive_failures — see its own docstring, and
+          POLL_BACKOFF_FAILURE_THRESHOLD's, for why).
+        - nothing has been worth polling *for* in a while (see
+          set_idle_check() / IDLE_POLL_INTERVAL_SECONDS) — this renderer
+          is still the one Qobuz considers active, but playback has been
+          idle long enough that the control WebSocket itself already
+          isn't being kept alive either; polling on regardless at full
+          speed only pays for a device round trip every
+          STATE_POLL_INTERVAL_SECONDS with nothing to show for it except
+          a wider window for a passing device hiccup to look like
+          something meaningful (confirmed live, see
+          IDLE_POLL_INTERVAL_SECONDS's own comment).
+
+        Recomputed fresh from the client's own persistent counter (and
+        the idle callback) every time this is called rather than tracked
+        as loop state, so it's correct regardless of which of
+        _poll_state_loop's many `continue` paths ran last cycle. Snaps
+        straight back to the base cadence the moment any SOAP call
+        succeeds again (from polling or a command) or the idle window
+        ends, whichever governed last.
 
         Never raises: this runs before this loop's own first `await` each
         cycle, so an exception here (e.g. a test double standing in for
@@ -1201,13 +1258,33 @@ class DLNABackend(AudioBackend):
                 )
             else:
                 logger.info(f"[{self.name}] Device reachable again — resuming normal poll cadence")
-        if not backed_off:
-            return STATE_POLL_INTERVAL_SECONDS
-        backoff_steps = failures - POLL_BACKOFF_FAILURE_THRESHOLD + 1
-        return min(
-            STATE_POLL_INTERVAL_SECONDS * (POLL_BACKOFF_MULTIPLIER**backoff_steps),
-            POLL_BACKOFF_MAX_INTERVAL_SECONDS,
-        )
+        failure_interval = STATE_POLL_INTERVAL_SECONDS
+        if backed_off:
+            backoff_steps = failures - POLL_BACKOFF_FAILURE_THRESHOLD + 1
+            failure_interval = min(
+                STATE_POLL_INTERVAL_SECONDS * (POLL_BACKOFF_MULTIPLIER**backoff_steps),
+                POLL_BACKOFF_MAX_INTERVAL_SECONDS,
+            )
+
+        # getattr, not direct access: a backend built via __new__ (every
+        # test in this file that isn't exercising __init__ itself) never
+        # ran __init__, so this attribute doesn't exist yet either — same
+        # regression class _poll_backoff_active already has to guard
+        # against above.
+        check = getattr(self, "_is_worth_polling_at_full_speed", None)
+        idle = check is not None and not check()
+        if idle != getattr(self, "_poll_idle_active", False):
+            self._poll_idle_active = idle
+            if idle:
+                logger.info(
+                    f"[{self.name}] Idle past the keep-alive window — polling less "
+                    "often until playback resumes"
+                )
+            else:
+                logger.info(f"[{self.name}] No longer idle — resuming normal poll cadence")
+        idle_interval = IDLE_POLL_INTERVAL_SECONDS if idle else STATE_POLL_INTERVAL_SECONDS
+
+        return max(failure_interval, idle_interval)
 
     async def _poll_state_loop(self) -> None:
         """Poll device state periodically.

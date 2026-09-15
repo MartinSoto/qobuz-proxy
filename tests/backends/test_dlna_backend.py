@@ -1675,6 +1675,61 @@ class TestPollInterval:
 
         assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
 
+    def test_never_raises_when_the_idle_check_was_never_registered(self) -> None:
+        """set_idle_check() is opt-in (only Speaker, wiring up a DLNA
+        backend, ever calls it) — a backend built via __new__ never ran
+        __init__, so _is_worth_polling_at_full_speed doesn't exist as an
+        instance attribute at all. Same regression class as
+        _poll_backoff_active above."""
+        backend = self._backend()
+        assert not hasattr(backend, "_is_worth_polling_at_full_speed")
+
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_no_idle_check_registered_polls_at_full_speed(self) -> None:
+        """set_idle_check(None) — or never calling it at all — must keep
+        the pre-existing always-full-speed behavior, same convention as
+        every other optional callback in this codebase."""
+        backend = self._backend()
+        backend.set_idle_check(None)
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_backs_off_once_the_idle_check_says_not_worth_it(self) -> None:
+        backend = self._backend()
+        backend.set_idle_check(lambda: False)
+        assert backend._poll_interval() > STATE_POLL_INTERVAL_SECONDS
+
+    def test_stays_at_base_cadence_while_the_idle_check_says_worth_it(self) -> None:
+        backend = self._backend()
+        backend.set_idle_check(lambda: True)
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_snaps_back_to_base_the_moment_the_idle_check_flips(self) -> None:
+        worth_it = False
+        backend = self._backend()
+        backend.set_idle_check(lambda: worth_it)
+        assert backend._poll_interval() > STATE_POLL_INTERVAL_SECONDS
+
+        worth_it = True
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_idle_and_device_failure_backoff_combine_to_the_slower_of_the_two(self) -> None:
+        """The two backoff reasons are independent — whichever currently
+        wants the longer sleep wins, so neither masks the other."""
+        backend = self._backend(consecutive_failures=POLL_BACKOFF_FAILURE_THRESHOLD)
+        backend.set_idle_check(lambda: True)  # not idle — failure backoff alone
+        failure_only = backend._poll_interval()
+        assert failure_only > STATE_POLL_INTERVAL_SECONDS
+
+        backend._client.consecutive_failures = 0
+        backend.set_idle_check(lambda: False)  # idle — idle backoff alone
+        idle_only = backend._poll_interval()
+        assert idle_only > STATE_POLL_INTERVAL_SECONDS
+
+        backend._client.consecutive_failures = POLL_BACKOFF_FAILURE_THRESHOLD
+        # both active at once: at least as slow as either alone
+        assert backend._poll_interval() >= max(failure_only, idle_only)
+
 
 class TestSeekConfirmation:
     """seek() has to notify the app optimistically for instant UI feedback,
