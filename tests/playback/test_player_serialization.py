@@ -84,6 +84,15 @@ def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:
     queue = MagicMock()
     queue.get_track_metadata = MagicMock(side_effect=lambda track: _coro(None))
     queue.set_track_stream_info = MagicMock(side_effect=_set_stream_info)
+    # Queue membership/version bookkeeping (see QobuzQueue) — fire-and-
+    # forget from every command handler's perspective, so a plain
+    # AsyncMock is enough; nothing here asserts on queue state itself.
+    queue.set_version = AsyncMock()
+    queue.replace_queue_tracks = AsyncMock()
+    queue.add_queue_tracks = AsyncMock()
+    queue.remove_queue_tracks = AsyncMock()
+    queue.clear_queue_tracks = AsyncMock()
+    queue.current_track_ids = AsyncMock(return_value=None)
     player = QobuzPlayer(queue=queue, metadata_service=metadata, backend=backend)
     return player, backend
 

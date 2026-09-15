@@ -5,24 +5,27 @@ A Qobuz Connect session has two distinct client roles: **Renderer** (what
 this app is — RNDR_SRVR_*/SRVR_RNDR_* messages) and **Controller** (the
 Qobuz app's own queue UI, and any other controlling client on the account
 — CTRL_SRVR_*/SRVR_CTRL_* messages). The full ordered queue — load, insert,
-remove, reorder, ask-for-full-state — is exclusively a Controller concern;
-a Renderer is simply told, one SET_STATE at a time, "this is current, this
-is next" (currentQueueItem/nextQueueItem/queueVersion). This app never
-plays a Controller role, so it never receives the messages
-(SRVR_CTRL_QUEUE_STATE/QUEUE_TRACKS_LOADED) that would populate an ordered
-track list — confirmed both by the protocol's own role separation and by
-their handlers never firing across real captured sessions. See
-docs/playback-concurrency.md, "Does Player need a Queue component at all?"
+remove, reorder, ask-for-full-state — is nominally a Controller concern; a
+Renderer alone would only ever be told, one SET_STATE at a time, "this is
+current, this is next" (currentQueueItem/nextQueueItem/queueVersion). This
+app now also joins as a Controller (see ws_manager.py's dual
+Renderer+Controller join), so it does receive the queue messages a pure
+Renderer never would — SRVR_CTRL_QUEUE_STATE/QUEUE_TRACKS_LOADED (full
+snapshots) and QUEUE_TRACKS_ADDED/INSERTED/REMOVED/REORDERED/CLEARED
+(incremental deltas on top of one) — confirmed live 2026-09-15 (see
+command_handler.py's handlers for all of them).
 
-What's left here is what a Renderer session actually needs, all of it fed
-directly by SET_STATE rather than derived from a track list this app never
-has: the repeat mode (read by Player on natural track end) and the queue
-version stamp (echoed back in outbound state reports, purely for the
-server's own synchronization bookkeeping — nothing here reconciles against
-it). Plus track metadata caching (needs no track list at all — Player
-hands it the exact QueueTrack to cache onto) and the blob/actual_quality
-a backend resolved for a track (see set_track_stream_info) — streaming URL
-resolution itself lives entirely in the backend now (see
+What's here beyond the plain Renderer bookkeeping (repeat mode, the queue
+version stamp echoed back in outbound state reports) is QueueMembership:
+just enough of that Controller-role queue traffic to answer "which tracks
+are in the queue right now", for backends/dlna/sonos/gain.py's
+approximated-album-gain grouping — deliberately not a full ordered
+track list (nothing needs one yet; see git history for the fuller
+"does Player need a Queue component at all?" reasoning this superseded).
+Track metadata caching (needs no track list at all — Player hands it the
+exact QueueTrack to cache onto) and the blob/actual_quality a backend
+resolved for a track (see set_track_stream_info) round out what's left —
+streaming URL resolution itself lives entirely in the backend now (see
 backends.dlna.proxy_server.resolve_track), not here.
 """
 
@@ -114,6 +117,31 @@ class QueueState:
     repeat_mode: RepeatMode
 
 
+@dataclass
+class QueueMembership:
+    """The current manual queue's track membership — replaced wholesale by
+    a full snapshot (SrvrCtrlQueueTracksLoaded/QueueState) and patched by
+    the incremental deltas (Added/Inserted/Removed/Cleared) on top of one;
+    see command_handler.py's handlers for each.
+
+    Order is deliberately not tracked: nothing that reads this needs it —
+    Reordered is a pure membership no-op — and the one consumer today
+    (Sonos's approximated-album-gain grouping, backends/dlna/sonos/
+    gain.py) was confirmed live not to require completeness or original
+    order, only that every track currently queued shares one album.
+
+    `trustworthy` is False until a full snapshot has been seen for the
+    current session generation. A Renderer-only session can otherwise
+    only ever see deltas layered on a queue whose starting contents it
+    never received (e.g. joining mid-session, or the version-went-
+    backward case QobuzQueue.set_version handles) — without this,
+    membership would be silently wrong rather than merely incomplete.
+    """
+
+    by_item: dict[int, str] = field(default_factory=dict)  # queue_item_id -> track_id
+    trustworthy: bool = False
+
+
 # Type alias for callbacks
 MetadataCallback = Callable[[str], Coroutine[Any, Any, Optional[dict[str, Any]]]]
 
@@ -135,6 +163,9 @@ class QobuzQueue:
 
         # Callback for fetching metadata
         self._get_metadata_callback: Optional[MetadataCallback] = None
+
+        # See QueueMembership.
+        self._membership: QueueMembership = QueueMembership()
 
         self._lock = asyncio.Lock()
 
@@ -206,6 +237,67 @@ class QobuzQueue:
             return self._version
 
     async def set_version(self, version: QueueVersion) -> None:
-        """Update queue version."""
+        """Update queue version.
+
+        Queue-generation counters only ever restart from 1 when a brand
+        new session starts, which itself only happens once every client
+        has been disconnected for a while (confirmed live) — so a version
+        going *backward* is exactly that signal, and any queue membership
+        reconstructed so far belongs to a session that's gone. Discarding
+        it here — rather than only ever replacing it wholesale on the
+        next full snapshot — means a delta message that arrives for the
+        new session before its first full snapshot can't silently patch
+        state left over from the old one.
+        """
         async with self._lock:
+            if version.major < self._version.major:
+                logger.info(
+                    f"Queue version went backward ({self._version} -> {version}); "
+                    "assuming a new session, discarding queue membership"
+                )
+                self._membership = QueueMembership()
             self._version = version
+
+    # =========================================================================
+    # Queue Membership (see QueueMembership)
+    # =========================================================================
+
+    async def replace_queue_tracks(self, items: list[tuple[int, str]]) -> None:
+        """A full snapshot arrived (SrvrCtrlQueueTracksLoaded/QueueState) —
+        replace known membership outright and mark it trustworthy.
+
+        Args:
+            items: (queue_item_id, track_id) pairs, in whatever order the
+                message carried them (order isn't kept — see
+                QueueMembership).
+        """
+        async with self._lock:
+            self._membership = QueueMembership(by_item=dict(items), trustworthy=True)
+
+    async def add_queue_tracks(self, items: list[tuple[int, str]]) -> None:
+        """Tracks were added or inserted (SrvrCtrlQueueTracksAdded/
+        Inserted) — membership-wise these are identical: where they land
+        doesn't matter here, only that they're now present."""
+        async with self._lock:
+            self._membership.by_item.update(items)
+
+    async def remove_queue_tracks(self, queue_item_ids: list[int]) -> None:
+        """Tracks were removed (SrvrCtrlQueueTracksRemoved)."""
+        async with self._lock:
+            for item_id in queue_item_ids:
+                self._membership.by_item.pop(item_id, None)
+
+    async def clear_queue_tracks(self) -> None:
+        """The queue was emptied (SrvrCtrlQueueCleared) — a fully known
+        (trustworthy) empty state, not "unknown"."""
+        async with self._lock:
+            self._membership = QueueMembership(trustworthy=True)
+
+    async def current_track_ids(self) -> Optional[frozenset[str]]:
+        """The current queue's track ids, or None if membership isn't
+        trustworthy yet (see QueueMembership) — the one consumer today is
+        backends/dlna/sonos/gain.py's approximated-album-gain grouping."""
+        async with self._lock:
+            if not self._membership.trustworthy:
+                return None
+            return frozenset(self._membership.by_item.values())

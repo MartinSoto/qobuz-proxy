@@ -155,3 +155,99 @@ class TestQobuzQueue:
         assert state.version.major == 3
         assert state.version.minor == 2
         assert state.repeat_mode == RepeatMode.ALL
+
+
+class TestQueueMembership:
+    """QobuzQueue's tracking of which tracks are in the current manual
+    queue — fed by full snapshots (SrvrCtrlQueueTracksLoaded/QueueState)
+    and incremental deltas (Added/Inserted/Removed/Cleared) on top of one;
+    see command_handler.py's handlers. The one consumer today is Sonos's
+    approximated-album-gain grouping (backends/dlna/sonos/gain.py)."""
+
+    @pytest.fixture
+    def queue(self) -> QobuzQueue:
+        return QobuzQueue()
+
+    @pytest.mark.asyncio
+    async def test_untrustworthy_before_any_full_snapshot(self, queue: QobuzQueue) -> None:
+        """A fresh queue has never seen a full snapshot — current_track_ids
+        must say "unknown", not "empty", so a caller doesn't mistake never
+        having heard from the queue for it genuinely being empty."""
+        assert await queue.current_track_ids() is None
+
+    @pytest.mark.asyncio
+    async def test_replace_queue_tracks_becomes_trustworthy(self, queue: QobuzQueue) -> None:
+        await queue.replace_queue_tracks([(1, "A"), (2, "B")])
+
+        assert await queue.current_track_ids() == frozenset({"A", "B"})
+
+    @pytest.mark.asyncio
+    async def test_add_queue_tracks_is_a_delta_on_top_of_a_snapshot(
+        self, queue: QobuzQueue
+    ) -> None:
+        """Confirmed live (2026-09-15): Added/Inserted carry only the new
+        track(s), not the whole queue — add_queue_tracks must not replace
+        what's already known."""
+        await queue.replace_queue_tracks([(1, "A")])
+
+        await queue.add_queue_tracks([(2, "B")])
+
+        assert await queue.current_track_ids() == frozenset({"A", "B"})
+
+    @pytest.mark.asyncio
+    async def test_remove_queue_tracks_removes_by_queue_item_id(self, queue: QobuzQueue) -> None:
+        await queue.replace_queue_tracks([(1, "A"), (2, "B"), (3, "C")])
+
+        await queue.remove_queue_tracks([2])
+
+        assert await queue.current_track_ids() == frozenset({"A", "C"})
+
+    @pytest.mark.asyncio
+    async def test_remove_unknown_queue_item_id_is_a_no_op(self, queue: QobuzQueue) -> None:
+        await queue.replace_queue_tracks([(1, "A")])
+
+        await queue.remove_queue_tracks([999])
+
+        assert await queue.current_track_ids() == frozenset({"A"})
+
+    @pytest.mark.asyncio
+    async def test_clear_queue_tracks_is_a_known_empty_state(self, queue: QobuzQueue) -> None:
+        await queue.replace_queue_tracks([(1, "A")])
+
+        await queue.clear_queue_tracks()
+
+        assert await queue.current_track_ids() == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_reordering_two_tracks_at_the_same_ids_keeps_membership(
+        self, queue: QobuzQueue
+    ) -> None:
+        """Reordered carries no track data at all (see QueueMembership) —
+        membership must be unaffected by anything other than the four
+        methods that actually change it."""
+        await queue.replace_queue_tracks([(1, "A"), (2, "B")])
+
+        assert await queue.current_track_ids() == frozenset({"A", "B"})
+
+    @pytest.mark.asyncio
+    async def test_version_going_backward_discards_membership(self, queue: QobuzQueue) -> None:
+        """Queue-generation counters only restart from 1 when a brand new
+        session starts (confirmed live) — membership reconstructed under
+        the old generation must not silently persist into the new one."""
+        await queue.set_version(QueueVersion(major=8, minor=1))
+        await queue.replace_queue_tracks([(1, "A")])
+
+        await queue.set_version(QueueVersion(major=1, minor=1))
+
+        assert await queue.current_track_ids() is None
+
+    @pytest.mark.asyncio
+    async def test_version_advancing_within_a_session_keeps_membership(
+        self, queue: QobuzQueue
+    ) -> None:
+        await queue.set_version(QueueVersion(major=1, minor=1))
+        await queue.replace_queue_tracks([(1, "A")])
+
+        await queue.set_version(QueueVersion(major=1, minor=2))
+
+        assert await queue.current_track_ids() == frozenset({"A"})

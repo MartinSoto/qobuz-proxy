@@ -38,6 +38,20 @@ MSG_TYPE_SET_AUTOPLAY_MODE = 47  # SrvrRndrSetAutoplayMode
 # (wrongly, see queue_diagnostics.py) to never reach a renderer socket.
 MSG_TYPE_QUEUE_TRACKS_LOADED = 91  # SrvrCtrlQueueLoadTracks
 
+# The rest of the Controller-role queue-editing traffic — reachable for
+# the same dual-join reason as QUEUE_TRACKS_LOADED above. Confirmed live
+# (2026-09-15, container capture) that QUEUE_STATE/QUEUE_TRACKS_LOADED are
+# full snapshots but Added/Inserted/Removed/Reordered are genuine
+# incremental deltas: e.g. QueueTracksAdded carries only the one newly
+# added track, not the whole queue — see queue.py's QueueMembership,
+# which these all feed.
+MSG_TYPE_QUEUE_CLEARED = 89  # SrvrCtrlQueueCleared
+MSG_TYPE_QUEUE_STATE = 90  # SrvrCtrlQueueState — full snapshot, purely descriptive
+MSG_TYPE_QUEUE_TRACKS_INSERTED = 92  # SrvrCtrlQueueTracksInserted
+MSG_TYPE_QUEUE_TRACKS_ADDED = 93  # SrvrCtrlQueueTracksAdded
+MSG_TYPE_QUEUE_TRACKS_REMOVED = 94  # SrvrCtrlQueueTracksRemoved
+MSG_TYPE_QUEUE_TRACKS_REORDERED = 95  # SrvrCtrlQueueTracksReordered — membership no-op
+
 # The server signals "no current/next track" with an all-bits-set
 # QueueTrackRef rather than omitting the field — HasField() is still True,
 # so these sentinel values must be checked explicitly. Widths match the
@@ -96,7 +110,13 @@ class PlaybackCommandHandler:
             MSG_TYPE_SET_LOOP_MODE,
             MSG_TYPE_SET_SHUFFLE_MODE,
             MSG_TYPE_SET_AUTOPLAY_MODE,
+            MSG_TYPE_QUEUE_CLEARED,
+            MSG_TYPE_QUEUE_STATE,
             MSG_TYPE_QUEUE_TRACKS_LOADED,
+            MSG_TYPE_QUEUE_TRACKS_INSERTED,
+            MSG_TYPE_QUEUE_TRACKS_ADDED,
+            MSG_TYPE_QUEUE_TRACKS_REMOVED,
+            MSG_TYPE_QUEUE_TRACKS_REORDERED,
         ]
 
     async def handle_message(self, msg_type: int, message: Any) -> None:
@@ -119,6 +139,18 @@ class PlaybackCommandHandler:
                 await self._handle_set_autoplay_mode(message)
             elif msg_type == MSG_TYPE_QUEUE_TRACKS_LOADED:
                 await self._handle_queue_tracks_loaded(message)
+            elif msg_type == MSG_TYPE_QUEUE_STATE:
+                await self._handle_queue_state(message)
+            elif msg_type == MSG_TYPE_QUEUE_TRACKS_ADDED:
+                await self._handle_queue_tracks_added(message)
+            elif msg_type == MSG_TYPE_QUEUE_TRACKS_INSERTED:
+                await self._handle_queue_tracks_inserted(message)
+            elif msg_type == MSG_TYPE_QUEUE_TRACKS_REMOVED:
+                await self._handle_queue_tracks_removed(message)
+            elif msg_type == MSG_TYPE_QUEUE_TRACKS_REORDERED:
+                await self._handle_queue_tracks_reordered(message)
+            elif msg_type == MSG_TYPE_QUEUE_CLEARED:
+                await self._handle_queue_cleared(message)
             else:
                 logger.warning(f"Unhandled playback message type: {msg_type}")
         except Exception as e:
@@ -287,6 +319,12 @@ class PlaybackCommandHandler:
                 QueueVersion(major=loaded.queueVersion.major, minor=loaded.queueVersion.minor)
             )
 
+        # Full snapshot — feed queue membership regardless of activation
+        # state, same reasoning as the version bookkeeping just above.
+        await self.queue.replace_queue_tracks(
+            [(t.queueItemId, str(t.trackId)) for t in loaded.tracks]
+        )
+
         if not self.player.is_active_renderer:
             logger.debug("Not the active renderer, ignoring QUEUE_TRACKS_LOADED")
             return
@@ -356,6 +394,87 @@ class PlaybackCommandHandler:
     def set_on_next_track_changed(self, callback: Optional[Callable[[], Awaitable[None]]]) -> None:
         """Set callback for when next track info changes (for gapless re-arming)."""
         self._on_next_track_changed = callback
+
+    async def _handle_queue_state(self, message: Any) -> None:
+        """Handle SrvrCtrlQueueState (type 90) — a full, unprompted queue
+        snapshot (observed live after another client (re)joins the
+        session). Never seen carrying a queuePosition or driving playback
+        the way QUEUE_TRACKS_LOADED does, so this only feeds queue
+        membership/version bookkeeping."""
+        if not message.HasField("srvrCtrlQueueState"):
+            return
+        state = message.srvrCtrlQueueState
+        if state.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=state.queueVersion.major, minor=state.queueVersion.minor)
+            )
+        await self.queue.replace_queue_tracks(
+            [(t.queueItemId, str(t.trackId)) for t in state.tracks]
+        )
+
+    async def _handle_queue_tracks_added(self, message: Any) -> None:
+        """Handle SrvrCtrlQueueTracksAdded (type 93) — a genuine
+        incremental delta (confirmed live 2026-09-15): only the newly
+        added track(s) are carried, not the whole queue."""
+        if not message.HasField("srvrCtrlQueueTracksAdded"):
+            return
+        added = message.srvrCtrlQueueTracksAdded
+        if added.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=added.queueVersion.major, minor=added.queueVersion.minor)
+            )
+        await self.queue.add_queue_tracks([(t.queueItemId, str(t.trackId)) for t in added.tracks])
+
+    async def _handle_queue_tracks_inserted(self, message: Any) -> None:
+        """Handle SrvrCtrlQueueTracksInserted (type 92) — membership-wise
+        identical to Added: where the track lands (insertAfter) isn't
+        tracked, only that it's now present (see QueueMembership)."""
+        if not message.HasField("srvrCtrlQueueTracksInserted"):
+            return
+        inserted = message.srvrCtrlQueueTracksInserted
+        if inserted.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=inserted.queueVersion.major, minor=inserted.queueVersion.minor)
+            )
+        await self.queue.add_queue_tracks(
+            [(t.queueItemId, str(t.trackId)) for t in inserted.tracks]
+        )
+
+    async def _handle_queue_tracks_removed(self, message: Any) -> None:
+        """Handle SrvrCtrlQueueTracksRemoved (type 94) — a delta carrying
+        only the removed item(s)' queueItemIds."""
+        if not message.HasField("srvrCtrlQueueTracksRemoved"):
+            return
+        removed = message.srvrCtrlQueueTracksRemoved
+        if removed.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=removed.queueVersion.major, minor=removed.queueVersion.minor)
+            )
+        await self.queue.remove_queue_tracks(list(removed.queueItemIds))
+
+    async def _handle_queue_tracks_reordered(self, message: Any) -> None:
+        """Handle SrvrCtrlQueueTracksReordered (type 95) — a pure
+        ordering change (queueItemIds + insertAfter anchor); membership is
+        unaffected, so only version bookkeeping is worth doing here (see
+        QueueMembership for why order isn't tracked at all)."""
+        if not message.HasField("srvrCtrlQueueTracksReordered"):
+            return
+        reordered = message.srvrCtrlQueueTracksReordered
+        if reordered.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=reordered.queueVersion.major, minor=reordered.queueVersion.minor)
+            )
+
+    async def _handle_queue_cleared(self, message: Any) -> None:
+        """Handle SrvrCtrlQueueCleared (type 89)."""
+        if not message.HasField("srvrCtrlQueueCleared"):
+            return
+        cleared = message.srvrCtrlQueueCleared
+        if cleared.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=cleared.queueVersion.major, minor=cleared.queueVersion.minor)
+            )
+        await self.queue.clear_queue_tracks()
 
     async def _handle_set_active(self, message: Any) -> None:
         """
