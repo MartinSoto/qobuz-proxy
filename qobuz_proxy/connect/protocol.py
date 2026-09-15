@@ -56,10 +56,13 @@ class QConnectMessageType(IntEnum):
     SRVR_RNDR_SET_SHUFFLE_MODE = 46
     SRVR_RNDR_SET_AUTOPLAY_MODE = 47
 
-    # Controller -> Server — see ProtocolCodec.encode_ctrl_join_session.
-    # Listen-only: this proxy never sends any other CtrlSrvr* command, so
-    # it's not a full Controller implementation.
+    # Controller -> Server — see ProtocolCodec.encode_ctrl_join_session and
+    # encode_ask_for_queue_state. This proxy sends only these two CtrlSrvr*
+    # commands, never any other (queue editing, volume, mode changes) — it
+    # isn't a full Controller implementation, just enough to always know
+    # the current queue (see encode_ask_for_queue_state's own docstring).
     CTRL_SRVR_JOIN_SESSION = 61
+    CTRL_SRVR_ASK_FOR_QUEUE_STATE = 76
 
     # Server -> Controller
     SRVR_CTRL_QUEUE_STATE = 90
@@ -432,6 +435,43 @@ class ProtocolCodec:
         qc_msg = payload_pb2.QConnectMessage()
         qc_msg.messageType = QConnectMessageType.CTRL_SRVR_JOIN_SESSION
         qc_msg.ctrlSrvrJoinSession.CopyFrom(join)
+
+        batch = payload_pb2.QConnectBatch()
+        batch.messagesTime = self._now_ms()
+        batch.messagesId = self._next_msg_id()
+        batch.messages.append(qc_msg)
+
+        return self.encode_payload(batch.SerializeToString())
+
+    def encode_ask_for_queue_state(self) -> bytes:
+        """
+        Ask the server for a full SRVR_CTRL_QUEUE_STATE snapshot right
+        now, on the Controller channel joined via encode_ctrl_join_session.
+
+        Without this, a full queue snapshot only ever arrives when the
+        server happens to volunteer one (confirmed live: unreliable —
+        of four reconnects captured back to back, only one produced a
+        QueueState push, and it coincided with an unrelated edit anyway;
+        a fresh connect that lands mid-an-existing-queue's-life can get
+        nothing but current/next from SET_STATE, forever, until some
+        unrelated queue edit happens to arrive). Sending this explicitly
+        on every connect (see ws_manager.py's _connect_and_run) instead
+        means QobuzQueue's membership tracking (see playback/queue.py) is
+        never left permanently unresolved.
+
+        Both `queueVersion` and `queueUuid` are left unset — deliberately,
+        like encode_ctrl_join_session leaves sessionUuid unset: this always
+        asks for the current state from scratch rather than a delta
+        against a version this proxy would have to already trust.
+
+        Returns:
+            Encoded frame bytes
+        """
+        ask = payload_pb2.CtrlSrvrAskForQueueState()
+
+        qc_msg = payload_pb2.QConnectMessage()
+        qc_msg.messageType = QConnectMessageType.CTRL_SRVR_ASK_FOR_QUEUE_STATE
+        qc_msg.ctrlSrvrAskForQueueState.CopyFrom(ask)
 
         batch = payload_pb2.QConnectBatch()
         batch.messagesTime = self._now_ms()

@@ -253,6 +253,39 @@ class TestEncoding:
         assert device_info.type == common_pb2.DEVICE_TYPE_SPEAKER
         assert device_info.model == "Python"
 
+    def test_encode_ask_for_queue_state(self, codec: ProtocolCodec) -> None:
+        """Sent right after CTRL_SRVR_JOIN_SESSION on every connect (see
+        ws_manager.py's _send_ask_for_queue_state) so a full queue
+        snapshot is never left to chance."""
+        frame = codec.encode_ask_for_queue_state()
+
+        assert isinstance(frame, bytes)
+        assert len(frame) > 0
+        assert frame[0] == MessageType.PAYLOAD
+
+        decoded = codec.decode_frame(frame)
+        assert decoded is not None
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        assert batch is not None
+        msg = batch.messages[0]
+        assert msg.messageType == QConnectMessageType.CTRL_SRVR_ASK_FOR_QUEUE_STATE
+        assert msg.HasField("ctrlSrvrAskForQueueState")
+
+    def test_encode_ask_for_queue_state_omits_version_and_uuid(self, codec: ProtocolCodec) -> None:
+        """Deliberately asks for the current state from scratch rather
+        than a delta against a version this proxy would have to already
+        trust — same reasoning as omitting sessionUuid on the Controller
+        join."""
+        frame = codec.encode_ask_for_queue_state()
+
+        decoded = codec.decode_frame(frame)
+        assert decoded is not None
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        assert batch is not None
+        ask = batch.messages[0].ctrlSrvrAskForQueueState
+        assert not ask.HasField("queueVersion")
+        assert not ask.queueUuid
+
     def test_encode_device_info_updated(self, codec: ProtocolCodec, device_uuid: bytes) -> None:
         """Test device info updated (rename) message encoding."""
         frame = codec.encode_device_info_updated(

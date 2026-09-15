@@ -662,6 +662,11 @@ class WsManager:
                 # own docstring for why this is needed at all.
                 await self._send_ctrl_join_session()
 
+                # And ask it for the current queue right away — see
+                # _send_ask_for_queue_state's own docstring for why this
+                # can't just wait for the server to volunteer one.
+                await self._send_ask_for_queue_state()
+
                 self._is_connected = True
                 self._reconnect_delay = INITIAL_RECONNECT_DELAY  # Reset backoff
                 logger.info("Connected and authenticated")
@@ -788,6 +793,26 @@ class WsManager:
         )
         await self._raw_send(join_frame)
         logger.info("Sent CTRL_SRVR_JOIN_SESSION with no sessionUuid, same deviceUuid as Renderer")
+
+    async def _send_ask_for_queue_state(self) -> None:
+        """Ask for a full SRVR_CTRL_QUEUE_STATE snapshot right after
+        joining the Controller role — see encode_ask_for_queue_state's
+        own docstring for why this can't just wait for the server to
+        volunteer one on its own.
+
+        Sent unconditionally on every connect (fresh or reconnect), not
+        only when playback.queue.QobuzQueue's own membership tracking
+        already knows it's untrustworthy — a brand new connection has no
+        queue information at all yet either way, and this component has
+        no reference to that queue to check in the first place (by
+        design: PlaybackCommandHandler/Player/QobuzQueue sit a layer
+        above the WS connection itself)."""
+        if not self._ws:
+            return
+
+        ask_frame = self._codec.encode_ask_for_queue_state()
+        await self._raw_send(ask_frame)
+        logger.info("Sent CTRL_SRVR_ASK_FOR_QUEUE_STATE")
 
     async def _receive_loop(self) -> None:
         """Receive and dispatch messages."""
