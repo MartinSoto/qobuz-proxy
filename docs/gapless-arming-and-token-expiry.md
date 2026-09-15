@@ -840,23 +840,36 @@ existing unconfirmed-stop timeout commits to `Trusting STOPPED` →
 directly: this is what woke the user at 3am; they stopped it manually
 from the Qobuz app a minute later (`Playback paused`, `01:04:06`).
 
-The underlying mechanism (hijack/unconfirmed-stop detection, "Sonos
-hijack proxy-origin check" et al.) can't currently distinguish a genuine
-external takeover from a Sonos group transiently resetting itself after
-a network blip on our own end — both look identical from the transport
-URI alone. `_UNCONFIRMED_STOP_TIMEOUT_SECONDS`'s 10s window exists
-precisely to let a transient blip self-heal before committing to
-"stopped", but a *sustained* multi-minute outage (as here — LAN
-unreachable for ~2 minutes, later even DNS failing) outlasts it easily.
-Not fixed this pass — flagging the interaction (existing hijack/stop
-detection + a real, multi-minute network outage) as the concrete
-scenario to design a fix around, rather than a one-off.
+**Corrected, both points pushed back on directly and confirmed right —
+see the fix in the next commit/section:**
 
-The user's report also independently confirmed the WS *should* still
-have been alive at 3am, since something was still actively playing —
-correct: `is_worth_keeping_ws_alive()` only starts its idle clock once
-`PAUSED`/`STOPPED`, so a (wrongly) resumed `PLAYING` state keeping the
-control WebSocket connected is expected here, not a bug.
+- This outage recurs at the *same* time every night — a nightly router
+  reboot is programmed for ~01:00 UTC, not a rare fluke — so "not fixed
+  this pass, watch for it" was the wrong call; it's guaranteed to recur
+  nightly until actually fixed. **Now fixed** — see
+  `qobuz_proxy/backends/dlna/backend.py`'s `_poll_state_loop`: the root
+  cause wasn't really "hijack detection can't tell a network blip from a
+  real takeover" (framed too narrowly first pass) — it's that a
+  *correctly*-detected takeover still got silently undone two seconds
+  later by an unrelated generic state-change check reporting the same
+  device's raw PLAYING reading as an unprompted resume of *our* content.
+  A real hijack must leave the device alone entirely; auto-advancing to
+  the next track was never correct behavior for one, network-outage-
+  triggered or not.
+- The claim that the WS "should still have been alive... expected here,
+  not a bug" was also wrong, and for a simple reason: it wasn't
+  continuously alive at all. The log's own `Playback idle past the
+  keep-alive window` lines show it had already correctly proactively
+  closed hours earlier (`23:05`/`23:38` the previous evening — the
+  proxy had genuinely been idle 2+ hours by the time this outage
+  started, exactly as expected). The WS reconnect seen *during* the
+  incident (`01:03:18`, `Refreshed WebSocket token directly from Qobuz
+  API`) wasn't independent evidence of anything — it's the same bug
+  above: the wrongful PLAYING notification flipped `Player` back into a
+  playing state, which is the *only* thing `is_worth_keeping_ws_alive()`
+  reads, so self-refresh dutifully reconnected a WS that had every right
+  to stay closed. Fixing the notification fixes this for free — no
+  separate WS-side change was needed.
 
 ### 2. The idle-close fix from the section above could deadlock a reconnect entirely
 
