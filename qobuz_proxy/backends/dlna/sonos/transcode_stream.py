@@ -83,6 +83,7 @@ class TranscodeStreamHandler:
         track_id: str,
         format_id: int,
         transcode_to_sample_rate: int,
+        gain_db: float = 0.0,
     ) -> web.StreamResponse:
         """Serve a track downsampled to transcode_to_sample_rate as
         PCM/WAV — see TranscodingFlacReader. A fresh reader (and
@@ -92,9 +93,14 @@ class TranscodeStreamHandler:
         The actual CDN bytes behind it, though, do go through self._cache
         (shared across every request this handler serves) — URL
         resolution, retry-on-expiry, and block reuse all happen there.
+
+        gain_db: Linear gain applied to every decoded sample before
+            resampling — see proxy_server.py's SonosAudioProxyServer
+            (hires_downsampling_gain) for where this comes from. 0.0 (the
+            default) applies no adjustment.
         """
         try:
-            reader = await self._open_reader(track_id, format_id, transcode_to_sample_rate)
+            reader = await self._open_reader(track_id, format_id, transcode_to_sample_rate, gain_db)
         except Exception as e:
             logger.error(f"Failed to open transcoding source for track {track_id}: {e}")
             return web.Response(status=502, text="Failed to open source stream")
@@ -183,7 +189,11 @@ class TranscodeStreamHandler:
         return response
 
     async def _open_reader(
-        self, track_id: str, format_id: int, transcode_to_sample_rate: int
+        self,
+        track_id: str,
+        format_id: int,
+        transcode_to_sample_rate: int,
+        gain_db: float = 0.0,
     ) -> TranscodingFlacReader:
         loop = asyncio.get_event_loop()
         return await asyncio.to_thread(
@@ -193,6 +203,7 @@ class TranscodeStreamHandler:
             format_id,
             transcode_to_sample_rate,
             loop,
+            gain_db=gain_db,
         )
 
 

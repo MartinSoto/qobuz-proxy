@@ -8,13 +8,17 @@ from qobuz_proxy.backends.dlna.sonos.controller import SonosController
 from qobuz_proxy.backends.dlna.sonos.discovery_manager import DepartedMember, SonosRoom
 
 
-def _make_controller() -> SonosController:
+def _make_controller(
+    hires_downsampling: bool = False, hires_downsampling_gain: bool = False
+) -> SonosController:
     return SonosController(
         api_client=MagicMock(),
         app_id="test-app-id",
         webui_http_port=8689,
         event_subscriber=MagicMock(),
         stream_resolver=MagicMock(),
+        hires_downsampling=hires_downsampling,
+        hires_downsampling_gain=hires_downsampling_gain,
     )
 
 
@@ -29,6 +33,47 @@ def _mock_speaker(name: str = "Kitchen", starts: bool = True) -> MagicMock:
 
 
 ROOM = SonosRoom(uuid="RINCON_A", name="Kitchen", ip="10.0.1.30", port=1400, is_stereo_pair=False)
+
+
+class TestHiresDownsamplingGainThreading:
+    """Auto-discovered rooms have no per-room config of their own — both
+    flags are forwarded uniformly to every SpeakerConfig this controller
+    builds. config.py's "gain implies downsampling" normalization only
+    ever runs over config.speakers (empty in auto-discover mode), so it's
+    enforced again here, locally — see SonosController.__init__."""
+
+    async def test_gain_flag_reaches_every_discovered_speakers_config(self) -> None:
+        controller = _make_controller(hires_downsampling=True, hires_downsampling_gain=True)
+
+        speaker = _mock_speaker("Kitchen")
+        with patch("qobuz_proxy.speaker.Speaker", return_value=speaker) as MockSpeaker:
+            await controller._on_room_found(ROOM)
+
+        built_config = MockSpeaker.call_args.kwargs["config"]
+        assert built_config.dlna_hires_downsampling_gain is True
+        assert built_config.dlna_hires_downsampling is True
+
+    async def test_gain_without_explicit_downsampling_still_implies_it(self) -> None:
+        controller = _make_controller(hires_downsampling=False, hires_downsampling_gain=True)
+
+        speaker = _mock_speaker("Kitchen")
+        with patch("qobuz_proxy.speaker.Speaker", return_value=speaker) as MockSpeaker:
+            await controller._on_room_found(ROOM)
+
+        built_config = MockSpeaker.call_args.kwargs["config"]
+        assert built_config.dlna_hires_downsampling_gain is True
+        assert built_config.dlna_hires_downsampling is True
+
+    async def test_defaults_leave_both_off(self) -> None:
+        controller = _make_controller()
+
+        speaker = _mock_speaker("Kitchen")
+        with patch("qobuz_proxy.speaker.Speaker", return_value=speaker) as MockSpeaker:
+            await controller._on_room_found(ROOM)
+
+        built_config = MockSpeaker.call_args.kwargs["config"]
+        assert built_config.dlna_hires_downsampling_gain is False
+        assert built_config.dlna_hires_downsampling is False
 
 
 class TestRoomFoundAndLost:

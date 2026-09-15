@@ -69,6 +69,15 @@ class QobuzStreamResolver:
         self._api = api_client
         self._cache: dict[tuple[str, int], ResolvedStream] = {}
 
+    @property
+    def api_client(self) -> "QobuzAPIClient":
+        """The underlying API client — exposed so a consumer that needs
+        Qobuz calls this resolver doesn't already make (e.g. Sonos's
+        QueueGainResolver, see dlna/sonos/gain.py) can share the same
+        authenticated client instead of needing its own reference
+        threaded all the way down separately."""
+        return self._api
+
     async def resolve(
         self, track_id: str, format_id: int, force: bool = False
     ) -> Optional[ResolvedStream]:

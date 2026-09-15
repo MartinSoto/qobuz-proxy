@@ -61,11 +61,13 @@ from ..capabilities import (
 )
 from ..proxy_server import ResolvedTrack
 from .cdn_block_cache import CDNBlockCache
+from .gain import QueueGainResolver
 from .passthrough_stream import PassthroughStreamHandler
 from .transcode_stream import TranscodeStreamHandler
 from .transcoding_reader import BYTES_PER_SAMPLE_24BIT
 
 if TYPE_CHECKING:
+    from qobuz_proxy.playback.queue import QobuzQueue
     from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver, ResolvedStream
     from ..capabilities import DLNACapabilities
 
@@ -101,6 +103,8 @@ class SonosAudioProxyServer:
         self,
         resolver: "QobuzStreamResolver",
         hires_downsampling: bool = False,
+        hires_downsampling_gain: bool = False,
+        queue: Optional["QobuzQueue"] = None,
         host: str = "0.0.0.0",
         port: int = 7120,
     ) -> None:
@@ -112,6 +116,20 @@ class SonosAudioProxyServer:
                 instead of falling back to CD quality. False (the
                 default) keeps the old, conservative behavior: nothing is
                 ever transcoded.
+            hires_downsampling_gain: Experimental, opt-in. When True,
+                every track (not just ones exceeding the device's cap) is
+                routed through the transcode/decode pipeline below so
+                playback gain can be applied consistently — see
+                resolve_track and gain.py. Implies hires_downsampling is
+                meaningful; the caller (see config.py's
+                build_speaker_configs) is expected to have already turned
+                it on too.
+            queue: This speaker's QobuzQueue, consulted (only when
+                hires_downsampling_gain is set) to approximate album gain
+                when every track currently queued shares one album — see
+                gain.py's QueueGainResolver. None disables that grouping
+                (plain per-track gain only), same as an empty/untrustworthy
+                queue would.
             host: Host to bind to
             port: Port to listen on
         """
@@ -119,6 +137,12 @@ class SonosAudioProxyServer:
         self._hires_downsampling = hires_downsampling
         self._host = host
         self._port = port
+
+        self._gain_resolver: Optional[QueueGainResolver] = (
+            QueueGainResolver(api_client=resolver.api_client, queue=queue)
+            if hires_downsampling_gain
+            else None
+        )
 
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
@@ -216,7 +240,19 @@ class SonosAudioProxyServer:
         (capabilities.max_bit_depth >= 24, already true of every Sonos
         device — see sonos/capabilities.py); anything that also fails on
         bit depth (or supports_flac at all) genuinely can't be served
-        better than CD, same as any other DLNA device."""
+        better than CD, same as any other DLNA device.
+
+        When a QueueGainResolver is active (hires_downsampling_gain),
+        every track that *could* go through the transcode pipeline is
+        forced through it even if it would otherwise fit the device as-is
+        — so playback gain gets applied consistently across a whole
+        album/queue instead of only to the tracks that happened to need
+        downsampling anyway. The one exception is a track Qobuz only has
+        as MP3 (capabilities.supports_flac False, or the track itself is
+        MP3-only): there's no decode path for that format here at all
+        (TranscodingFlacReader decodes FLAC only), so it always still
+        passes straight through, gain or not.
+        """
         ceiling = (
             forced_format_id
             if forced_format_id is not None
@@ -226,17 +262,33 @@ class SonosAudioProxyServer:
         if stream is None:
             return None
 
-        if self._fits_device(stream, capabilities):
+        force_transcode = self._gain_resolver is not None and stream.format_id != QOBUZ_QUALITY_MP3
+
+        if self._fits_device(stream, capabilities) and not force_transcode:
             return self._resolved_track(track_id, stream, proxy_key)
 
         if (
-            self._hires_downsampling
+            (self._hires_downsampling or force_transcode)
             and capabilities is not None
             and capabilities.supports_flac
             and capabilities.max_bit_depth >= 24
         ):
+            # min(), not a flat capabilities.max_sample_rate: when this
+            # branch is only reached because of force_transcode (the
+            # track already fit), there's nothing to actually downsample —
+            # transcode it at its own native rate instead of gratuitously
+            # resampling up to the device's ceiling. For a track that
+            # doesn't fit, stream.sample_rate > max_sample_rate always
+            # (that's what "doesn't fit" means), so this is exactly
+            # max_sample_rate — unchanged from before.
+            target_rate = min(stream.sample_rate, capabilities.max_sample_rate)
+            gain_db = await self._gain_resolver.resolve(track_id) if self._gain_resolver else 0.0
             return self._resolved_track(
-                track_id, stream, proxy_key, transcode_to_sample_rate=capabilities.max_sample_rate
+                track_id,
+                stream,
+                proxy_key,
+                transcode_to_sample_rate=target_rate,
+                gain_db=gain_db,
             )
 
         cd_stream = await self._resolver.resolve(track_id, QOBUZ_QUALITY_CD)
@@ -250,6 +302,7 @@ class SonosAudioProxyServer:
         stream: "ResolvedStream",
         proxy_key: Optional[str],
         transcode_to_sample_rate: Optional[int] = None,
+        gain_db: float = 0.0,
     ) -> ResolvedTrack:
         """Build the self-describing URL (see module docstring) and
         ResolvedTrack for one stream — a plain passthrough of `stream` as
@@ -284,6 +337,13 @@ class SonosAudioProxyServer:
         proxy_url = (
             f"{self.base_url}/audio/{track_id}?format={fmt}&depth={depth}&rate={rate}&item={item}"
         )
+        if transcode_to_sample_rate is not None and gain_db:
+            # Self-describing, like every other part of this URL (see
+            # module docstring) — no server-side state to look up at
+            # serve time. Only meaningful for the transcode path: plain
+            # passthrough bytes are never touched, so there's nothing to
+            # apply gain to.
+            proxy_url += f"&gain_db={gain_db:.3f}"
         kind = (
             f"transcode {stream.sample_rate}Hz -> {rate}Hz"
             if transcode_to_sample_rate
@@ -322,12 +382,18 @@ class SonosAudioProxyServer:
             if depth != 24:
                 logger.warning(f"Unsupported wav depth for track {track_id}: {depth}")
                 return web.Response(status=400, text=f"Unsupported wav depth: {depth}")
+            try:
+                gain_db = float(query.get("gain_db", "0"))
+            except ValueError:
+                gain_db = 0.0
             if request.method == "HEAD":
+                # Gain never changes the byte count, only sample values —
+                # no need to thread it through the HEAD probe.
                 return await self._transcode.handle_head_probe(
                     track_id, _TRANSCODE_SOURCE_FORMAT_ID, rate
                 )
             return await self._transcode.stream(
-                request, track_id, _TRANSCODE_SOURCE_FORMAT_ID, rate
+                request, track_id, _TRANSCODE_SOURCE_FORMAT_ID, rate, gain_db=gain_db
             )
 
         format_id = _QUERY_TO_FORMAT_ID.get((fmt, depth, rate))

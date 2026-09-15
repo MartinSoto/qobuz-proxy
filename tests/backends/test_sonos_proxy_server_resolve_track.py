@@ -16,6 +16,7 @@ from qobuz_proxy.backends.dlna.capabilities import (
     QOBUZ_QUALITY_CD,
     QOBUZ_QUALITY_96K,
     QOBUZ_QUALITY_192K,
+    QOBUZ_QUALITY_MP3,
 )
 from qobuz_proxy.backends.dlna.sonos.proxy_server import SonosAudioProxyServer
 from qobuz_proxy.playback.stream_resolver import ResolvedStream
@@ -38,11 +39,22 @@ def _caps(max_sample_rate: int, max_bit_depth: int, supports_flac: bool = True) 
     )
 
 
-def _make_proxy(resolve_side_effect, hires_downsampling: bool) -> SonosAudioProxyServer:
+def _make_proxy(
+    resolve_side_effect,
+    hires_downsampling: bool,
+    hires_downsampling_gain: bool = False,
+    queue=None,
+) -> SonosAudioProxyServer:
     resolver = AsyncMock()
     resolver.resolve = AsyncMock(side_effect=resolve_side_effect)
+    resolver.api_client.get_tracks_audio_info = AsyncMock(return_value={})
     return SonosAudioProxyServer(
-        resolver=resolver, hires_downsampling=hires_downsampling, host="127.0.0.1", port=0
+        resolver=resolver,
+        hires_downsampling=hires_downsampling,
+        hires_downsampling_gain=hires_downsampling_gain,
+        queue=queue,
+        host="127.0.0.1",
+        port=0,
     )
 
 
@@ -130,3 +142,96 @@ class TestDownsamplingDecision:
         assert resolved.content_type == "audio/wav"
         assert resolved.sample_rate == 48000
         proxy._resolver.resolve.assert_awaited_once_with("42", QOBUZ_QUALITY_96K)
+
+
+class TestHiresDownsamplingGain:
+    """hires_downsampling_gain forces every track through the transcode
+    pipeline (not just ones exceeding the device's cap) so playback gain
+    applies consistently — see gain.py's QueueGainResolver."""
+
+    async def test_a_track_that_already_fits_is_still_transcoded(self) -> None:
+        """Without the gain flag this would be a plain passthrough (see
+        the base TestDownsamplingDecision case) — with it, gain needs a
+        decode pipeline even though nothing needs downsampling."""
+        proxy = _make_proxy(
+            lambda track_id, format_id, force=False: _stream(QOBUZ_QUALITY_CD, 44100, 16),
+            hires_downsampling=True,
+            hires_downsampling_gain=True,
+        )
+        caps = _caps(max_sample_rate=48000, max_bit_depth=24)
+
+        resolved = await proxy.resolve_track("42", caps)
+
+        assert resolved is not None
+        assert resolved.content_type == "audio/wav"
+        # min(stream.sample_rate, capabilities.max_sample_rate): the track
+        # already fit, so there's nothing to actually downsample — no
+        # gratuitous upsampling to the device's ceiling.
+        assert resolved.sample_rate == 44100
+        assert "rate=44100" in resolved.proxy_url
+
+    async def test_gain_db_is_embedded_in_the_url(self) -> None:
+        proxy = _make_proxy(
+            lambda track_id, format_id, force=False: _stream(QOBUZ_QUALITY_192K, 192000, 24),
+            hires_downsampling=True,
+            hires_downsampling_gain=True,
+        )
+        caps = _caps(max_sample_rate=48000, max_bit_depth=24)
+
+        resolved = await proxy.resolve_track("42", caps)
+
+        assert resolved is not None
+        # No queue/gain data available -> 0 dB, which isn't worth adding
+        # to the URL at all (see _resolved_track).
+        assert "gain_db=" not in resolved.proxy_url
+
+    async def test_nonzero_gain_appears_in_the_url(self) -> None:
+        from qobuz_proxy.auth.api_client import TrackAudioInfo
+
+        proxy = _make_proxy(
+            lambda track_id, format_id, force=False: _stream(QOBUZ_QUALITY_192K, 192000, 24),
+            hires_downsampling=True,
+            hires_downsampling_gain=True,
+        )
+        proxy._gain_resolver._api.get_tracks_audio_info = AsyncMock(
+            return_value={"42": TrackAudioInfo(track_id="42", gain_db=-9.35, peak=0.97)}
+        )
+        caps = _caps(max_sample_rate=48000, max_bit_depth=24)
+
+        resolved = await proxy.resolve_track("42", caps)
+
+        assert resolved is not None
+        assert "gain_db=-9.350" in resolved.proxy_url
+
+    async def test_mp3_only_stream_still_passes_through_untouched(self) -> None:
+        """No decode path exists for MP3 here at all (TranscodingFlacReader
+        decodes FLAC only) — gain must never force it through anyway."""
+        proxy = _make_proxy(
+            lambda track_id, format_id, force=False: _stream(QOBUZ_QUALITY_MP3, 44100, 16),
+            hires_downsampling=True,
+            hires_downsampling_gain=True,
+        )
+        caps = _caps(max_sample_rate=48000, max_bit_depth=24, supports_flac=False)
+
+        resolved = await proxy.resolve_track("42", caps)
+
+        assert resolved is not None
+        assert resolved.content_type == "audio/mpeg"
+        assert "format=wav" not in resolved.proxy_url
+
+    async def test_gain_without_explicit_hires_downsampling_still_transcodes(self) -> None:
+        """Defensive: even if a caller sets the gain flag without also
+        setting hires_downsampling (config.py is expected to always do
+        both together, but this class shouldn't silently degrade to a
+        CD-tier fallback if that invariant is ever violated)."""
+        proxy = _make_proxy(
+            lambda track_id, format_id, force=False: _stream(QOBUZ_QUALITY_CD, 44100, 16),
+            hires_downsampling=False,
+            hires_downsampling_gain=True,
+        )
+        caps = _caps(max_sample_rate=48000, max_bit_depth=24)
+
+        resolved = await proxy.resolve_track("42", caps)
+
+        assert resolved is not None
+        assert resolved.content_type == "audio/wav"

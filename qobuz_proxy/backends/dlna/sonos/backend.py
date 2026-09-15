@@ -23,6 +23,7 @@ from .client import SonosClient
 from .proxy_server import SonosAudioProxyServer
 
 if TYPE_CHECKING:
+    from qobuz_proxy.playback.queue import QobuzQueue
     from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
 
 logger = logging.getLogger(__name__)
@@ -38,10 +39,13 @@ class SonosBackend(DLNABackend):
         resolver: "QobuzStreamResolver",
         host: str = "0.0.0.0",
         port: int = 7120,
+        queue: Optional["QobuzQueue"] = None,
     ) -> AudioProxyServerProtocol:
         return SonosAudioProxyServer(
             resolver=resolver,
             hires_downsampling=self._hires_downsampling,
+            hires_downsampling_gain=self._hires_downsampling_gain,
+            queue=queue,
             host=host,
             port=port,
         )

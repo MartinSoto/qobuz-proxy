@@ -28,6 +28,7 @@ from .capabilities import (
 from .proxy_server import AudioProxyServer, AudioProxyServerProtocol
 
 if TYPE_CHECKING:
+    from qobuz_proxy.playback.queue import QobuzQueue
     from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,7 @@ class DLNABackend(AudioBackend):
         name: Optional[str] = None,
         description_url: Optional[str] = None,
         hires_downsampling: bool = False,
+        hires_downsampling_gain: bool = False,
     ):
         """
         Initialize DLNA backend.
@@ -269,6 +271,11 @@ class DLNABackend(AudioBackend):
                 dlna/sonos/proxy_server.py's SonosAudioProxyServer, which
                 is what actually downsamples on the fly). False (the
                 default) keeps the old, conservative behavior everywhere.
+            hires_downsampling_gain: Experimental, opt-in, Sonos only —
+                forwarded to create_proxy_server() the same way. Generic
+                DLNABackend does nothing with it either; only
+                SonosBackend's create_proxy_server override actually
+                builds a QueueGainResolver from it (see dlna/sonos/gain.py).
         """
         super().__init__(name or f"DLNA ({ip})")
         self._ip = ip
@@ -276,6 +283,7 @@ class DLNABackend(AudioBackend):
         self._fixed_volume = fixed_volume
         self._description_url = description_url
         self._hires_downsampling = hires_downsampling
+        self._hires_downsampling_gain = hires_downsampling_gain
         # See VOLUME_POLL_GRACE_SECONDS. 0.0 (never commanded yet) means
         # the very first poll after connect is never suppressed.
         self._last_commanded_volume_at: float = 0.0
@@ -410,17 +418,20 @@ class DLNABackend(AudioBackend):
         resolver: "QobuzStreamResolver",
         host: str = "0.0.0.0",
         port: int = 7120,
+        queue: Optional["QobuzQueue"] = None,
     ) -> "AudioProxyServerProtocol":
         """Construct the proxy server this backend should be paired with
         (then passed to set_proxy_server — this doesn't set it itself,
         since the caller also needs it to call .start()/.stop()).
 
-        Base: the plain, manufacturer-generic AudioProxyServer. Overridden
-        by SonosBackend to return a SonosAudioProxyServer instead, wiring
-        up on-the-fly downsampling — see dlna/sonos/proxy_server.py.
-        SonosAudioProxyServer shares no base class with AudioProxyServer
-        (see AudioProxyServerProtocol's own docstring) — nothing here
-        needs to know that, or that on-the-fly downsampling exists at all.
+        Base: the plain, manufacturer-generic AudioProxyServer, which
+        ignores `queue` entirely — playback gain grouping is Sonos-only
+        (see dlna/sonos/gain.py). Overridden by SonosBackend to return a
+        SonosAudioProxyServer instead, wiring up on-the-fly downsampling —
+        see dlna/sonos/proxy_server.py. SonosAudioProxyServer shares no
+        base class with AudioProxyServer (see AudioProxyServerProtocol's
+        own docstring) — nothing here needs to know that, or that
+        on-the-fly downsampling exists at all.
         """
         return AudioProxyServer(resolver=resolver, host=host, port=port)
         logger.info("Audio proxy server configured for DLNA backend")

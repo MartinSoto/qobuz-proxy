@@ -90,6 +90,7 @@ class SonosController:
         event_subscriber: SonosEventSubscriber,
         stream_resolver: "QobuzStreamResolver",
         hires_downsampling: bool = False,
+        hires_downsampling_gain: bool = False,
     ) -> None:
         """
         Args:
@@ -111,13 +112,27 @@ class SonosController:
             hires_downsampling: Forwarded uniformly to every auto-
                 discovered room's DLNAConfig — auto-discovered rooms have
                 no per-room config of their own to set this individually.
+            hires_downsampling_gain: Forwarded the same way — see
+                config.py's build_speaker_configs for why this implies
+                hires_downsampling; that's a config-loading-time
+                normalization app.py's own caller relies on, not
+                something enforced again here.
         """
         self._api_client = api_client
         self._app_id = app_id
         self._webui_http_port = webui_http_port
         self._event_subscriber = event_subscriber
         self._stream_resolver = stream_resolver
+        # config.py's load_config() only applies the "gain implies
+        # downsampling" normalization to config.speakers — empty in
+        # auto-discover mode, so it never reaches the flat
+        # config.backend.dlna values app.py passes in here. Enforced
+        # again, locally, rather than trusting that invariant to have
+        # already held by the time it gets this far.
+        if hires_downsampling_gain and not hires_downsampling:
+            hires_downsampling = True
         self._hires_downsampling = hires_downsampling
+        self._hires_downsampling_gain = hires_downsampling_gain
 
         self._discovery: Optional[SonosDiscoveryManager] = None
         # Keyed by SonosRoom.tracking_key (a group's own group_id) — the
@@ -132,6 +147,15 @@ class SonosController:
 
     async def start(self) -> None:
         """Start continuous Sonos household discovery."""
+        if self._hires_downsampling:
+            logger.info(
+                "Hi-Res downsampling: enabled (experimental)"
+                + (
+                    " — playback gain normalization: enabled (experimental)"
+                    if self._hires_downsampling_gain
+                    else ""
+                )
+            )
         self._discovery = SonosDiscoveryManager(
             on_room_found=self._on_room_found,
             on_room_lost=self._on_room_lost,
@@ -211,6 +235,7 @@ class SonosController:
             dlna_ip=room.ip,
             dlna_port=room.port,
             dlna_hires_downsampling=self._hires_downsampling,
+            dlna_hires_downsampling_gain=self._hires_downsampling_gain,
             auto_managed=True,
         )
         all_configs = [s._config for s in self.speakers] + [sc]

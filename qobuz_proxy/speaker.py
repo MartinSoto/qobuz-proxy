@@ -307,6 +307,7 @@ class Speaker:
                     proxy_port=self._config.proxy_port,
                     description_url=self._config.dlna_description_url,
                     hires_downsampling=self._config.dlna_hires_downsampling,
+                    hires_downsampling_gain=self._config.dlna_hires_downsampling_gain,
                 ),
                 local=LocalConfig(
                     device=self._config.audio_device,
@@ -448,6 +449,12 @@ class Speaker:
         logger.debug(f"[{self.name}] Creating metadata service...")
         self._metadata_service = MetadataService(api_client=self._api_client)
 
+        # Queue created here (ahead of the player, below) so it already
+        # exists for create_proxy_server() to hand to SonosAudioProxyServer
+        # for its approximated-album-gain grouping (see dlna/sonos/gain.py)
+        # — QobuzQueue itself has no dependency on the player.
+        self._queue = QobuzQueue()
+
         # Create and start audio proxy server (DLNA only). Which concrete
         # class — plain generic, or SonosAudioProxyServer with on-the-fly
         # downsampling — is the backend's own call; see
@@ -458,6 +465,7 @@ class Speaker:
                 resolver=self._stream_resolver,
                 host=self._config.bind_address,
                 port=self._config.proxy_port,
+                queue=self._queue,
             )
             await self._proxy_server.start()
             logger.info(
@@ -495,9 +503,9 @@ class Speaker:
             quality_override = self._effective_quality
         backend.set_quality_override(quality_override)
 
-        # Create queue and player
-        logger.debug(f"[{self.name}] Creating queue and player...")
-        self._queue = QobuzQueue()
+        # Create player (queue was already created above, ahead of the
+        # proxy server)
+        logger.debug(f"[{self.name}] Creating player...")
         self._player = QobuzPlayer(
             queue=self._queue,
             metadata_service=self._metadata_service,

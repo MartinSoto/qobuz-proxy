@@ -401,6 +401,60 @@ backend:
         assert speakers[0].name == "Flat Speaker"
 
 
+class TestHiresDownsamplingGain:
+    """--hires-downsampling-gain: per-speaker like hires_downsampling
+    itself, except passing it on the CLI forces it on for every speaker
+    regardless of their individual config — and it implies
+    hires_downsampling, since gain does nothing without the decode
+    pipeline that flag enables."""
+
+    def test_yaml_per_speaker(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+speakers:
+  - name: Room A
+    dlna_ip: 192.168.1.10
+    dlna_hires_downsampling_gain: true
+  - name: Room B
+    dlna_ip: 192.168.1.11
+""")
+        config = load_config(config_path=config_file)
+
+        room_a, room_b = config.speakers
+        assert room_a.dlna_hires_downsampling_gain is True
+        assert room_a.dlna_hires_downsampling is True  # implied
+        assert room_b.dlna_hires_downsampling_gain is False
+        assert room_b.dlna_hires_downsampling is False
+
+    def test_cli_forces_every_speaker(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+speakers:
+  - name: Room A
+    dlna_ip: 192.168.1.10
+  - name: Room B
+    dlna_ip: 192.168.1.11
+    dlna_hires_downsampling: true
+""")
+        cli_args = {"backend": {"dlna": {"hires_downsampling_gain": True}}}
+
+        config = load_config(config_path=config_file, cli_args=cli_args)
+
+        assert all(sc.dlna_hires_downsampling_gain for sc in config.speakers)
+        assert all(sc.dlna_hires_downsampling for sc in config.speakers)
+
+    def test_absent_from_cli_does_not_force_anything(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+speakers:
+  - name: Room A
+    dlna_ip: 192.168.1.10
+""")
+        config = load_config(config_path=config_file, cli_args={})
+
+        assert config.speakers[0].dlna_hires_downsampling_gain is False
+
+
 class TestConfigPathFallback:
     """When no config file exists, the writable fallback path must respect
     QOBUZPROXY_DATA_DIR. Otherwise Docker users (CWD=/app, /data mounted)

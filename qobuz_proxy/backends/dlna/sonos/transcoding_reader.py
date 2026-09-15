@@ -247,11 +247,19 @@ class TranscodingFlacReader:
         *,
         source_chunk_frames: int = DEFAULT_SOURCE_CHUNK_FRAMES,
         resample_quality: str = DEFAULT_RESAMPLE_QUALITY,
+        gain_db: float = 0.0,
     ) -> None:
         import soundfile as sf
 
         self._source_chunk_frames = source_chunk_frames
         self._resample_quality = resample_quality
+        # Linear amplitude multiplier applied to every decoded sample
+        # before resampling — see proxy_server.py's hires_downsampling_gain
+        # and gain.py's QueueGainResolver for where gain_db comes from.
+        # _float_to_pcm24_bytes' own clip to [-1, 1] is the safety net
+        # against a gain that (e.g. an out-of-date/approximated value)
+        # pushes a sample past full scale.
+        self._gain_linear = 10.0 ** (gain_db / 20.0)
 
         self._lazy_source = LazyHttpFlacSource(cache, track_id, format_id, loop)
         self._handle = sf.SoundFile(self._lazy_source)
@@ -310,8 +318,10 @@ class TranscodingFlacReader:
         yield from self._stream_target_frames_from(target_frame)
 
     def _stream_target_frames_from(self, target_frame: int) -> Generator[bytes, None, None]:
+        import numpy as np
         import soxr
 
+        gain_linear = np.float32(self._gain_linear)
         source_frame = self._target_frame_to_source_frame(target_frame)
         self._handle.seek(source_frame)
 
@@ -329,6 +339,8 @@ class TranscodingFlacReader:
             chunk = self._handle.read(n, dtype="float32", always_2d=True)
             remaining_source -= len(chunk)
             is_last = remaining_source <= 0
+            if self._gain_linear != 1.0:
+                chunk = chunk * gain_linear
             resampled = resampler.resample_chunk(chunk, last=is_last)
             if len(resampled):
                 yield _float_to_pcm24_bytes(resampled)

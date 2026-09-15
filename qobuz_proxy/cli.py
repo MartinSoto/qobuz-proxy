@@ -196,6 +196,19 @@ Environment Variables:
             "exceeds the device's sample-rate cap (default: off)"
         ),
     )
+    dlna_group.add_argument(
+        "--hires-downsampling-gain",
+        action="store_true",
+        help=(
+            "Experimental, Sonos only: route every track through the "
+            "downsampling pipeline (implies --hires-downsampling) to apply "
+            "consistent playback gain — track gain by default, or an "
+            "approximated album gain when the whole current queue shares "
+            "one album (default: off). Passed on the command line, this "
+            "affects every configured speaker, unlike the per-speaker "
+            "config file / env var form."
+        ),
+    )
 
     # Local Audio Backend
     local_group = parser.add_argument_group("Local Audio Backend")
@@ -279,6 +292,7 @@ def args_to_dict(args: argparse.Namespace) -> dict:
         "dlna_port": ("backend", "dlna", "port"),
         "fixed_volume": ("backend", "dlna", "fixed_volume"),
         "hires_downsampling": ("backend", "dlna", "hires_downsampling"),
+        "hires_downsampling_gain": ("backend", "dlna", "hires_downsampling_gain"),
         "audio_device": ("backend", "local", "device"),
         "audio_buffer_size": ("backend", "local", "buffer_size"),
         "backend_type": ("backend", "type"),
@@ -291,7 +305,12 @@ def args_to_dict(args: argparse.Namespace) -> dict:
 
     # store_true flags: only set (and thus override lower-priority sources)
     # when the user explicitly passed them, never for their False default.
-    store_true_flags = {"fixed_volume", "hires_downsampling", "sonos_auto_discover"}
+    store_true_flags = {
+        "fixed_volume",
+        "hires_downsampling",
+        "hires_downsampling_gain",
+        "sonos_auto_discover",
+    }
 
     for arg_name, path in mappings.items():
         value = getattr(args, arg_name, None)
@@ -315,6 +334,8 @@ def log_config(config: Config) -> None:
                 logger.info("  Volume control: disabled (fixed_volume=true)")
             if sc.dlna_hires_downsampling:
                 logger.info("  Hi-Res downsampling: enabled (experimental)")
+            if sc.dlna_hires_downsampling_gain:
+                logger.info("  Playback gain normalization: enabled (experimental)")
             logger.info(f"  Proxy server: {sc.bind_address}:{sc.proxy_port}")
         elif sc.backend_type == "local":
             logger.info(f"  Audio device: {sc.audio_device}")

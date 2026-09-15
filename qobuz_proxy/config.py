@@ -52,6 +52,7 @@ ENV_MAPPINGS = {
     "QOBUZPROXY_DLNA_PORT": ("backend", "dlna", "port"),
     "QOBUZPROXY_DLNA_FIXED_VOLUME": ("backend", "dlna", "fixed_volume"),
     "QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING": ("backend", "dlna", "hires_downsampling"),
+    "QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING_GAIN": ("backend", "dlna", "hires_downsampling_gain"),
     # Backend type
     "QOBUZPROXY_BACKEND": ("backend", "type"),
     # Local audio
@@ -109,6 +110,12 @@ class DLNAConfig:
     # DLNABackend.__init__ and apply_device_overrides. False keeps the old,
     # conservative behavior.
     hires_downsampling: bool = False
+    # Experimental, opt-in, Sonos only: route every track through the
+    # decode pipeline above (not just ones exceeding the device's cap) so
+    # playback gain (track, or an approximated album gain — see
+    # backends/dlna/sonos/gain.py) can be applied consistently. Implies
+    # hires_downsampling — see build_speaker_configs.
+    hires_downsampling_gain: bool = False
 
 
 @dataclass
@@ -157,6 +164,7 @@ class SpeakerConfig:
     dlna_port: int = 1400
     dlna_fixed_volume: bool = False
     dlna_hires_downsampling: bool = False
+    dlna_hires_downsampling_gain: bool = False
     dlna_description_url: str = ""
     proxy_port: int = 0  # 0 = auto-assign
     audio_device: str = "default"
@@ -286,6 +294,7 @@ def speaker_config_to_dict(sc: SpeakerConfig) -> dict:
         d["dlna_port"] = sc.dlna_port
         d["dlna_fixed_volume"] = sc.dlna_fixed_volume
         d["dlna_hires_downsampling"] = sc.dlna_hires_downsampling
+        d["dlna_hires_downsampling_gain"] = sc.dlna_hires_downsampling_gain
         if sc.dlna_description_url:
             d["dlna_description_url"] = sc.dlna_description_url
     elif sc.backend_type == "local":
@@ -307,6 +316,7 @@ def _single_speaker_from_config(config: Config) -> SpeakerConfig:
         dlna_port=config.backend.dlna.port,
         dlna_fixed_volume=config.backend.dlna.fixed_volume,
         dlna_hires_downsampling=config.backend.dlna.hires_downsampling,
+        dlna_hires_downsampling_gain=config.backend.dlna.hires_downsampling_gain,
         dlna_description_url=config.backend.dlna.description_url,
         proxy_port=config.backend.dlna.proxy_port,
         audio_device=config.backend.local.device,
@@ -413,6 +423,7 @@ def _parse_yaml_speakers(raw_speakers: list[dict], config: Config) -> list[Speak
             dlna_port=int(raw.get("dlna_port", 1400)),
             dlna_fixed_volume=bool(raw.get("dlna_fixed_volume", False)),
             dlna_hires_downsampling=bool(raw.get("dlna_hires_downsampling", False)),
+            dlna_hires_downsampling_gain=bool(raw.get("dlna_hires_downsampling_gain", False)),
             dlna_description_url=raw.get("dlna_description_url", ""),
             proxy_port=int(raw.get("proxy_port", 0)),
             audio_device=raw.get("audio_device", "default"),
@@ -462,6 +473,9 @@ def _parse_env_speakers(config: Config) -> list[SpeakerConfig]:
     dlna_hires_downsampling_raw = _split_env_padded(
         "QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING", count, "false"
     )
+    dlna_hires_downsampling_gain_raw = _split_env_padded(
+        "QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING_GAIN", count, "false"
+    )
     http_ports_raw = _split_env_padded("QOBUZPROXY_HTTP_PORT", count, "0")
     proxy_ports_raw = _split_env_padded("QOBUZPROXY_PROXY_PORT", count, "0")
     audio_devices = _split_env_padded("QOBUZPROXY_AUDIO_DEVICE", count, "default")
@@ -480,6 +494,8 @@ def _parse_env_speakers(config: Config) -> list[SpeakerConfig]:
             dlna_port=int(dlna_ports_raw[i]),
             dlna_fixed_volume=dlna_fixed_volumes_raw[i].lower() in ("true", "1", "yes", "on"),
             dlna_hires_downsampling=dlna_hires_downsampling_raw[i].lower()
+            in ("true", "1", "yes", "on"),
+            dlna_hires_downsampling_gain=dlna_hires_downsampling_gain_raw[i].lower()
             in ("true", "1", "yes", "on"),
             proxy_port=int(proxy_ports_raw[i]),
             audio_device=audio_devices[i],
@@ -554,6 +570,16 @@ def _set_nested(d: dict, path: tuple, value: Any) -> None:
     d[path[-1]] = value
 
 
+def _get_nested(d: dict, path: tuple) -> Any:
+    """Read a nested dictionary value using a path tuple, or None if any
+    key along the way is missing."""
+    for key in path:
+        if not isinstance(d, dict) or key not in d:
+            return None
+        d = d[key]
+    return d
+
+
 def load_env_config() -> dict:
     """
     Load configuration from environment variables.
@@ -592,6 +618,7 @@ def load_env_config() -> dict:
             elif env_var in (
                 "QOBUZPROXY_DLNA_FIXED_VOLUME",
                 "QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING",
+                "QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING_GAIN",
                 "QOBUZPROXY_SONOS_AUTO_DISCOVER",
             ):
                 value = value.lower() in ("true", "1", "yes", "on")
@@ -668,6 +695,9 @@ def dict_to_config(d: dict) -> Config:
             )
             config.backend.dlna.hires_downsampling = dlna.get(
                 "hires_downsampling", config.backend.dlna.hires_downsampling
+            )
+            config.backend.dlna.hires_downsampling_gain = dlna.get(
+                "hires_downsampling_gain", config.backend.dlna.hires_downsampling_gain
             )
             config.backend.dlna.proxy_port = dlna.get("proxy_port", config.backend.dlna.proxy_port)
             config.backend.dlna.description_url = dlna.get(
@@ -777,6 +807,26 @@ def load_config(
 
     # Build speaker configs
     config.speakers = build_speaker_configs(config, raw_yaml_speakers)
+
+    # --hires-downsampling-gain on the CLI is a blanket override: unlike
+    # the field's own per-speaker YAML/env forms, passing it on the
+    # command line turns it on for every speaker regardless of their
+    # individual config — see cli.py's --hires-downsampling-gain help.
+    if cli_args and _get_nested(cli_args, ("backend", "dlna", "hires_downsampling_gain")):
+        for sc in config.speakers:
+            sc.dlna_hires_downsampling_gain = True
+
+    # hires_downsampling_gain only does anything through the downsampling
+    # pipeline it forces every track through — implicitly enable that too
+    # rather than have gain silently do nothing for someone who set only
+    # the gain flag.
+    for sc in config.speakers:
+        if sc.dlna_hires_downsampling_gain and not sc.dlna_hires_downsampling:
+            logger.info(
+                f"Speaker '{sc.name}': hires_downsampling_gain implies "
+                "hires_downsampling; enabling it"
+            )
+            sc.dlna_hires_downsampling = True
 
     # Validate only for single-speaker (non-multi) mode; skip when no speakers
     # (empty config is valid — speakers can be added via the web UI)

@@ -96,9 +96,14 @@ def _cache_for(url: str, **kwargs: object) -> CDNBlockCache:
 
 
 def _new_reader(
-    cache: CDNBlockCache, loop: asyncio.AbstractEventLoop, track_id: str = TRACK_ID
+    cache: CDNBlockCache,
+    loop: asyncio.AbstractEventLoop,
+    track_id: str = TRACK_ID,
+    gain_db: float = 0.0,
 ) -> TranscodingFlacReader:
-    return TranscodingFlacReader(cache, track_id, FORMAT_ID, TARGET_SAMPLE_RATE, loop)
+    return TranscodingFlacReader(
+        cache, track_id, FORMAT_ID, TARGET_SAMPLE_RATE, loop, gain_db=gain_db
+    )
 
 
 def _new_source(
@@ -499,6 +504,58 @@ class TestStreamingAndSeeking:
                 return b"".join(reader.stream_from(reader.content_length))
 
             assert await asyncio.to_thread(_run) == b""
+        finally:
+            await cache.close()
+            await server.stop()
+
+
+class TestGainApplication:
+    """gain_db (see proxy_server.py's hires_downsampling_gain and
+    gain.py's QueueGainResolver) — applied to every decoded sample before
+    resampling."""
+
+    async def test_negative_gain_attenuates_by_the_expected_linear_factor(self) -> None:
+        flac_bytes, original = _make_test_flac()
+        server = RangeServingUpstream(flac_bytes)
+        url = await server.start()
+        cache = _cache_for(url)
+        try:
+            expected_unity = soxr.resample(
+                original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ"
+            )
+            gain_db = -6.0
+            expected_gained = expected_unity * (10.0 ** (gain_db / 20.0))
+            loop = asyncio.get_event_loop()
+
+            def _run() -> bytes:
+                reader = _new_reader(cache, loop, gain_db=gain_db)
+                return b"".join(reader.stream_from(0))
+
+            all_bytes = await asyncio.to_thread(_run)
+            decoded = _pcm24_bytes_to_float(all_bytes[WAV_HEADER_SIZE:], CHANNELS)
+
+            np.testing.assert_allclose(decoded, expected_gained, atol=2e-4)
+        finally:
+            await cache.close()
+            await server.stop()
+
+    async def test_zero_gain_is_unchanged_from_no_gain_argument_at_all(self) -> None:
+        flac_bytes, original = _make_test_flac()
+        server = RangeServingUpstream(flac_bytes)
+        url = await server.start()
+        cache = _cache_for(url)
+        try:
+            expected = soxr.resample(original, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE, quality="HQ")
+            loop = asyncio.get_event_loop()
+
+            def _run() -> bytes:
+                reader = _new_reader(cache, loop, gain_db=0.0)
+                return b"".join(reader.stream_from(0))
+
+            all_bytes = await asyncio.to_thread(_run)
+            decoded = _pcm24_bytes_to_float(all_bytes[WAV_HEADER_SIZE:], CHANNELS)
+
+            np.testing.assert_allclose(decoded, expected, atol=2e-4)
         finally:
             await cache.close()
             await server.stop()

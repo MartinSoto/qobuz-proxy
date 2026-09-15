@@ -82,6 +82,7 @@ class BackendFactory:
                 port=port,
                 description_url=description_url,
                 hires_downsampling=config.backend.dlna.hires_downsampling,
+                hires_downsampling_gain=config.backend.dlna.hires_downsampling_gain,
                 backend_class=dlna_backend_class,
             )
         elif backend_type == "local":
@@ -102,6 +103,7 @@ class BackendFactory:
         name: Optional[str] = None,
         description_url: Optional[str] = None,
         hires_downsampling: bool = False,
+        hires_downsampling_gain: bool = False,
         backend_class: Optional[type[DLNABackend]] = None,
     ) -> AudioBackend:
         """
@@ -115,6 +117,8 @@ class BackendFactory:
             description_url: Full URL to UPnP device description XML
             hires_downsampling: Experimental, opt-in hi-res-with-on-the-fly-
                 downsampling for capable devices — see DLNABackend.__init__.
+            hires_downsampling_gain: Experimental, Sonos-only — see
+                DLNABackend.__init__.
             backend_class: Concrete DLNABackend subclass to instantiate.
                 Defaults to the plain generic DLNABackend — pass
                 sonos.SonosBackend for a device already known to be Sonos
@@ -136,6 +140,7 @@ class BackendFactory:
             name=name,
             description_url=description_url,
             hires_downsampling=hires_downsampling,
+            hires_downsampling_gain=hires_downsampling_gain,
         )
         if await backend.connect():
             return backend
