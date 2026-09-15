@@ -301,21 +301,32 @@ class TestSelfRefreshWsToken:
 
 
 class TestWaitForValidTokenGating:
-    """_wait_for_valid_token's eager "already good, connect now" check
-    must not fire just because the token itself happens to still be
-    valid — it also has to agree the connection is worth holding open at
-    all, or IdleShutdownRequired's proactive close (see
-    TestReceiveLoopIdleShutdown below) would be undone the instant the
-    connection loop asked again, and invalidate_session()'s whole point
-    (stop retrying a session_uuid the server already rejected) would be
-    defeated the same way."""
+    """_wait_for_valid_token's eager "already good, connect now" check.
 
-    async def test_idle_playback_blocks_even_with_a_valid_token(
+    Regression covered here (confirmed live 2026-09-15, overnight log):
+    an earlier version of this gate checked is_worth_keeping_alive()
+    directly instead of _idle_closed_token_version, which meant that once
+    playback had been idle long enough to trigger IdleShutdownRequired,
+    *no* future reconnect could ever succeed — not even the app
+    explicitly handing over a brand new session_uuid — because nothing
+    can flip is_worth_keeping_alive() back to true before the app can
+    reach the renderer at all (it only tracks Player's own playing/paused
+    state). A real household got stuck exactly like this: one speaker's
+    control WebSocket never came back after an idle close despite five
+    separate app reconnect attempts, while a different, never-idled
+    speaker connected normally. These tests pin the fix: only the
+    *specific* token IdleShutdownRequired closed over is refused —
+    anything that bumps _token_version (set_tokens() from the app, or a
+    successful self-refresh once playback resumes) lifts it immediately.
+    """
+
+    async def test_reconnecting_with_the_same_token_right_after_an_idle_close_is_refused(
         self, config: Config, valid_tokens: ConnectTokens
     ) -> None:
-        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
+        ws_manager = WsManager(config)
         ws_manager.set_tokens(valid_tokens)
         ws_manager._should_run = True
+        ws_manager._idle_closed_token_version = ws_manager._token_version  # simulates the raise
 
         wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
         await asyncio.sleep(0)
@@ -337,25 +348,55 @@ class TestWaitForValidTokenGating:
         assert wait_task.done() is False
         wait_task.cancel()
 
-    async def test_resuming_playback_unblocks_once_the_app_reconnects(
+    async def test_the_app_reconnecting_unblocks_an_idle_close_immediately(
         self, config: Config, valid_tokens: ConnectTokens
     ) -> None:
-        """Mirrors the real recovery path: is_worth_keeping_alive flips
-        True (a resume), but there's no separate "wake up, resume
-        happened" signal into this loop — same pre-existing shape as
-        test_wait_for_valid_token_blocks_until_refresh, just gated on the
-        idle flag instead of token expiry."""
-        worth_it = False
-        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: worth_it)
+        """The regression case: the app hands over a session while
+        playback is still idle (is_worth_keeping_alive() would still say
+        False) — must reconnect anyway, since only the app itself can
+        ever get us out of this state at all."""
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
         ws_manager.set_tokens(valid_tokens)
         ws_manager._should_run = True
+        ws_manager._idle_closed_token_version = ws_manager._token_version
 
         wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
         await asyncio.sleep(0)
         assert wait_task.done() is False
 
-        worth_it = True
-        ws_manager.set_tokens(valid_tokens)  # app-style nudge, unblocks the wait
+        ws_manager.set_tokens(valid_tokens)  # the app reconnects — still not "worth it" itself
+
+        assert await asyncio.wait_for(wait_task, timeout=1.0) is True
+
+    async def test_a_resume_that_self_refreshes_unblocks_an_idle_close(
+        self, config: Config, valid_tokens: ConnectTokens, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other recovery path: nobody touched the app, but the
+        device's own controls resumed playback (is_worth_keeping_alive()
+        flips true) — the next periodic self-refresh retry inside this
+        same loop succeeds and bumps _token_version on its own, no
+        set_tokens() call needed. Real recovery still takes up to
+        SELF_REFRESH_RETRY_SECONDS to notice (nothing wakes this loop
+        early just because Player's state changed) — shortened here so
+        the test doesn't have to actually wait 30s for it."""
+        monkeypatch.setattr(ws_manager_module, "SELF_REFRESH_RETRY_SECONDS", 0.01)
+        worth_it = False
+        api_client = AsyncMock()
+        api_client.get_ws_token = AsyncMock(
+            return_value={"jwt": "self-refreshed", "exp": 9999999999, "endpoint": "wss://x/ws"}
+        )
+        ws_manager = WsManager(
+            config, api_client=api_client, is_worth_keeping_alive=lambda: worth_it
+        )
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+        ws_manager._idle_closed_token_version = ws_manager._token_version
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
+        await asyncio.sleep(0)
+        assert wait_task.done() is False
+
+        worth_it = True  # e.g. a device-side resume, with nobody touching the app
 
         assert await asyncio.wait_for(wait_task, timeout=1.0) is True
 
@@ -399,6 +440,24 @@ class TestReceiveLoopIdleShutdown:
 
         with pytest.raises(IdleShutdownRequired):
             await ws_manager._receive_loop()
+
+    async def test_stamps_idle_closed_token_version_for_wait_for_valid_token(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        """See TestWaitForValidTokenGating — this stamp is the only thing
+        that stops the very next _wait_for_valid_token call from
+        reconnecting immediately with the same token and undoing this
+        close."""
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+        ws_manager._ws = self._make_timing_out_ws()
+        assert ws_manager._idle_closed_token_version is None
+
+        with pytest.raises(IdleShutdownRequired):
+            await ws_manager._receive_loop()
+
+        assert ws_manager._idle_closed_token_version == ws_manager._token_version
 
     async def test_does_not_raise_while_still_worth_keeping_alive(
         self, config: Config, valid_tokens: ConnectTokens

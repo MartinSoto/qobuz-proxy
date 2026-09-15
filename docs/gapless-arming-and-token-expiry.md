@@ -812,3 +812,100 @@ reconnect attempt before recovering, and whether `Invalidating Connect
 session` ever fires for a code `1001` that turns out to be unrelated to
 session identity (the narrowing comment on `_STALE_SESSION_ERROR_CODE`
 in speaker.py flags exactly this risk).
+
+**Update (2026-09-15): piece (2) above shipped a real regression** — see
+the next section. The overnight run below is also the first live look at
+piece (1) (the proactive idle close) working correctly on its own.
+
+## A false 3am wake from a network blip, and a reconnect deadlock from the idle-close fix (2026-09-15)
+
+An overnight run (`sonos_auto_discover`, three rooms) surfaced two
+unrelated incidents in the same log — one a pre-existing gap in hijack
+detection, the other a same-day regression from the idle-close fix above.
+
+### 1. A home network outage produced a false "track ended", waking the user at 3am
+
+`01:00:22`-`01:02:24` UTC: every SOAP call to the `Cocina` device starts
+failing with `Network is unreachable` (not a device-side timeout — this
+is the proxy host's own network stack reporting no route, i.e. a local
+network interruption, not the speaker being slow to answer). At
+`01:02:52`, once reachable again, the device's own transport URI has
+reset to a bare `x-rincon:<its own RINCON>` — logged as `External
+takeover detected on this renderer`, and `Player` reacts the same way it
+would to a real external takeover: `treating as stopped`. Ten seconds
+later, with the device's URI never confirming our stream resumed, the
+existing unconfirmed-stop timeout commits to `Trusting STOPPED` →
+`Track ended naturally` → `Auto-advancing to next track` — and the group
+(including `Cuarto`) starts audibly playing the next track. Reported
+directly: this is what woke the user at 3am; they stopped it manually
+from the Qobuz app a minute later (`Playback paused`, `01:04:06`).
+
+The underlying mechanism (hijack/unconfirmed-stop detection, "Sonos
+hijack proxy-origin check" et al.) can't currently distinguish a genuine
+external takeover from a Sonos group transiently resetting itself after
+a network blip on our own end — both look identical from the transport
+URI alone. `_UNCONFIRMED_STOP_TIMEOUT_SECONDS`'s 10s window exists
+precisely to let a transient blip self-heal before committing to
+"stopped", but a *sustained* multi-minute outage (as here — LAN
+unreachable for ~2 minutes, later even DNS failing) outlasts it easily.
+Not fixed this pass — flagging the interaction (existing hijack/stop
+detection + a real, multi-minute network outage) as the concrete
+scenario to design a fix around, rather than a one-off.
+
+The user's report also independently confirmed the WS *should* still
+have been alive at 3am, since something was still actively playing —
+correct: `is_worth_keeping_ws_alive()` only starts its idle clock once
+`PAUSED`/`STOPPED`, so a (wrongly) resumed `PLAYING` state keeping the
+control WebSocket connected is expected here, not a bug.
+
+### 2. The idle-close fix from the section above could deadlock a reconnect entirely
+
+The user manually paused at `01:04:06`; exactly `_WS_IDLE_TIMEOUT_SECONDS`
+(1h) later, at `02:04:07`, `IdleShutdownRequired` fired and closed the
+control WebSocket — piece (2) above working exactly as designed. The
+problem showed up almost 3.5 hours later, when the user opened the app
+again (a fresh Connect session, `session: 72f75752...`, replacing the
+prior day's `4bc7b22c...` — unsurprising after being fully disconnected
+that long) and tried to select the `Cocina, Cuarto` group: the app's
+`connect-to-qconnect` POST succeeded (`200`) and `_setup_websocket`
+called `set_tokens()` every time, logging `Refreshed WebSocket tokens
+from Qobuz app` — but **no `Connecting to wss://...` line ever
+followed**, across five separate attempts over three minutes. Reported
+directly: "the app trying for a few seconds and failing" every time,
+while a *different*, never-idled speaker (`Baño`, a fresh `Speaker`
+instance from the same topology churn) connected and played normally in
+the same window — matching "joining another group worked, though."
+
+Root cause: `_wait_for_valid_token`'s eager "already good, reconnect
+now" check (added by the section above) required
+`is_worth_keeping_alive()` to be true, not just a valid token and
+session. That's the wrong signal — `is_worth_keeping_alive()` only ever
+becomes true once `Player` is already `PLAYING`, which for an idle
+speaker can only happen *after* a command arrives over the very control
+WebSocket this check was refusing to open. Once genuinely idle, the only
+way out was a device-side resume (`_handle_unprompted_state_change`
+flipping `Player` to `PLAYING` directly, independent of the app) — which
+is exactly what bailed out the *first* incident in the section above,
+and is why this went unnoticed until a case with no device-side resume
+at all (the app alone, nothing yet selected) hit it head-on. A real
+household got one speaker stuck behind this permanently for the rest of
+the session.
+
+**Fixed**: replaced the `is_worth_keeping_alive()` check in the eager
+path with `_idle_closed_token_version` — stamped to the current
+`_token_version` at the exact moment `IdleShutdownRequired` fires.
+The eager check now refuses only the *specific* token/version pair that
+was just closed over (preventing the original "instantly undo the
+proactive close" problem this was meant to solve), while anything that
+bumps `_token_version` — a fresh `set_tokens()` from the app, or a
+successful self-refresh once `is_worth_keeping_alive()` naturally turns
+true again — lifts it immediately, regardless of current playback state.
+`is_worth_keeping_alive()` is now consulted only where it always was:
+inside `_refresh_token_from_api`, gating *proactive background renewal*,
+never an externally-triggered reconnect.
+
+Confirmed against the overnight log's exact shape in
+`tests/connect/test_ws_manager.py`'s `TestWaitForValidTokenGating`. Not
+yet re-confirmed live against a real idle-close-then-reconnect cycle —
+watch for whether an app reconnect after a proactive idle close still
+ever needs a second attempt.
