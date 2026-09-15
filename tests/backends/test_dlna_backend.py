@@ -861,6 +861,53 @@ class TestPollStateLoop:
 
         callback.assert_not_called()
 
+    async def test_suppresses_playing_notification_while_takeover_unresolved(self) -> None:
+        """Regression, confirmed live (2026-09-15 overnight, a network
+        outage at a nightly router reboot): a hijack must leave the
+        device alone. Without this, the very next poll after a detected-
+        but-unresolved takeover reported a bare PLAYING transport reading
+        as an unprompted resume of *our* content (see
+        Player._handle_unprompted_state_change) — reasserting control
+        over a renderer something else was actively using, and later
+        auto-advancing to the next track once the mismatch resurfaced as
+        an "unconfirmed stop". Woke the user at 3am."""
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        # Fixture default: _state=STOPPED — nothing of ours has resumed.
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._get_current_transport_uri = AsyncMock(
+            return_value="http://someone-else/spotify-stream"
+        )
+        backend._hijack_check_countdown = 1  # force the check on the first cycle only
+        state_changes: list[PlaybackState] = []
+        backend.on_state_change(state_changes.append)
+
+        await self._run_poll_cycles(backend, cycles=2)
+
+        assert state_changes == []
+        assert backend._state == PlaybackState.STOPPED
+
+    async def test_resumes_notifying_once_content_is_confirmed_ours_again(self) -> None:
+        """The suppression above must lift the instant a read confirms
+        the device really is playing our content again — a genuine
+        resume (device-side Play after a takeover actually resolved)
+        must still reach Player."""
+        from unittest.mock import AsyncMock
+
+        backend = self._make_backend()
+        backend._external_takeover_notified = True  # a prior cycle already saw the mismatch
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)
+        backend._get_current_transport_uri = AsyncMock(return_value="http://proxy/track.flac")
+        backend._hijack_check_countdown = 1  # force the confirming check on the first cycle
+        state_changes: list[PlaybackState] = []
+        backend.on_state_change(state_changes.append)
+
+        await self._run_poll_cycles(backend, cycles=1)
+
+        assert state_changes == [PlaybackState.PLAYING]
+        assert backend._external_takeover_notified is False
+
     async def test_sustained_takeover_notifies_only_once(self) -> None:
         """Regression (test1.log, 2026-08-28): while something's armed for
         gapless, the shared read runs every poll cycle rather than the

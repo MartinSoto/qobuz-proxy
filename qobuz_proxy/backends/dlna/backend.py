@@ -1576,8 +1576,36 @@ class DLNABackend(AudioBackend):
 
                 # Detect state changes
                 if new_state != self._state:
-                    logger.debug(f"State changed: {self._state} -> {new_state}")
-                    self._notify_state_change(new_state)
+                    if new_state == PlaybackState.PLAYING and self._external_takeover_notified:
+                        # A confirmed, still-unresolved external takeover
+                        # (device reachable, but its own URI keeps not
+                        # matching ours) — a bare raw PLAYING transport
+                        # reading here is still whatever hijacked us, not a
+                        # resume of our content, and this poll didn't re-run
+                        # the (throttled) URI check that would tell either
+                        # way. Notifying Player anyway used to read as an
+                        # unprompted device-side resume of *our* playback
+                        # (see _handle_unprompted_state_change) — reasserting
+                        # control over a renderer someone/something else is
+                        # actively using, and then auto-advancing to the
+                        # next track ~10s later once the mismatch resurfaced
+                        # as an "unconfirmed stop". A genuine takeover must
+                        # leave the device alone until it's actually playing
+                        # our content again — confirmed live (2026-09-15
+                        # overnight, network outage at a nightly router
+                        # reboot): this is exactly what woke the user with
+                        # audio it never should have started. Left
+                        # unconfirmed (self._state untouched) rather than
+                        # updated silently, so the *next* poll's mismatch
+                        # against self._state keeps re-evaluating this same
+                        # guard for as long as the takeover persists.
+                        logger.debug(
+                            f"[{self.name}] Suppressing PLAYING notification — external "
+                            "takeover still unresolved"
+                        )
+                    else:
+                        logger.debug(f"State changed: {self._state} -> {new_state}")
+                        self._notify_state_change(new_state)
 
                 # Detect volume changed externally (the Sonos app, the
                 # device's own physical controls, another DLNA controller,
