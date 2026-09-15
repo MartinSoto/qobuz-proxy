@@ -67,3 +67,75 @@ class TestLoginWithToken:
             result = await client.login_with_token("999", "token")
 
         assert result is False
+
+
+class TestGetTracksAudioInfo:
+    """track/getList (batch) — the source of gain data for
+    backends/dlna/sonos/gain.py. Confirmed live 2026-09-15 (qobuz-player.har)."""
+
+    async def test_empty_input_makes_no_request(self):
+        client = QobuzAPIClient("app123", "secret456")
+        client._request_signed = AsyncMock()
+
+        result = await client.get_tracks_audio_info([])
+
+        assert result == {}
+        client._request_signed.assert_not_awaited()
+
+    async def test_parses_audio_info_and_album_id(self):
+        client = QobuzAPIClient("app123", "secret456")
+        client._request_signed = AsyncMock(
+            return_value={
+                "tracks": {
+                    "items": [
+                        {
+                            "id": 111,
+                            "duration": 200,
+                            "audio_info": {
+                                "replaygain_track_gain": -9.35,
+                                "replaygain_track_peak": 0.97052,
+                            },
+                            "album": {"id": "ALB123"},
+                        }
+                    ]
+                }
+            }
+        )
+
+        result = await client.get_tracks_audio_info(["111"])
+
+        assert client._request_signed.await_args.kwargs["method"] == "POST"
+        info = result["111"]
+        assert info.gain_db == -9.35
+        assert info.peak == 0.97052
+        assert info.album_id == "ALB123"
+        assert info.duration_ms == 200_000
+
+    async def test_missing_audio_info_defaults_to_no_adjustment(self):
+        """A real catalog gap (no audio_info at all) must read the same
+        as a track that genuinely needs no gain, not as an error."""
+        client = QobuzAPIClient("app123", "secret456")
+        client._request_signed = AsyncMock(
+            return_value={"tracks": {"items": [{"id": 111, "duration": 200}]}}
+        )
+
+        result = await client.get_tracks_audio_info(["111"])
+
+        assert result["111"].gain_db == 0.0
+        assert result["111"].peak == 1.0
+
+    async def test_unrecognized_id_is_simply_absent(self):
+        client = QobuzAPIClient("app123", "secret456")
+        client._request_signed = AsyncMock(return_value={"tracks": {"items": []}})
+
+        result = await client.get_tracks_audio_info(["999"])
+
+        assert result == {}
+
+    async def test_request_failure_returns_empty_dict_not_raises(self):
+        client = QobuzAPIClient("app123", "secret456")
+        client._request_signed = AsyncMock(side_effect=RuntimeError("boom"))
+
+        result = await client.get_tracks_audio_info(["111"])
+
+        assert result == {}

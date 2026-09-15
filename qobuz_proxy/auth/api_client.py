@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlencode
@@ -15,6 +16,26 @@ from urllib.parse import urlencode
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TrackAudioInfo:
+    """Per-track loudness/album data used for playback gain normalization
+    (see backends/dlna/sonos/gain.py) — kept separate from the plain
+    dict get_track_metadata returns since it comes from a different
+    endpoint (track/getList, batched) and is never shown in the UI.
+
+    gain_db/peak default to "no adjustment" (0 dB, full-scale peak) when
+    Qobuz has no audio_info for a track at all — rare, but real catalog
+    gaps exist; callers should treat that the same as a track that
+    genuinely needs no gain rather than as missing data.
+    """
+
+    track_id: str
+    gain_db: float = 0.0
+    peak: float = 1.0
+    album_id: str = ""
+    duration_ms: int = 0
 
 
 class QobuzAPIError(Exception):
@@ -434,6 +455,59 @@ class QobuzAPIClient:
             logger.error(f"Failed to get track metadata: {e}")
 
         return None
+
+    async def get_tracks_audio_info(self, track_ids: list[str]) -> dict[str, TrackAudioInfo]:
+        """
+        Batch-fetch per-track ReplayGain-style loudness data and album id
+        (track/getList) — the data backends/dlna/sonos/gain.py uses to
+        apply track gain, or an approximated album gain when a queue's
+        tracks all share one album_id. Confirmed live (2026-09-15,
+        qobuz-player.har): responses carry audio_info.
+        {replaygain_track_gain, replaygain_track_peak} and album.id per
+        track, the same shape album/get returns — Qobuz has no
+        replaygain_album_gain anywhere, which is exactly why the caller
+        has to approximate one.
+
+        Args:
+            track_ids: Qobuz track IDs to fetch. Empty input returns {}
+                without making a request.
+
+        Returns:
+            Mapping of track_id -> TrackAudioInfo for every id Qobuz
+            actually returned data for. An id it doesn't recognize is
+            just absent, not an error; a request failure returns {}
+            rather than raising — the caller falls back to no adjustment.
+        """
+        if not track_ids:
+            return {}
+        try:
+            body = json.dumps({"tracks_id": [int(t) for t in track_ids]})
+            response = await self._request_signed(
+                "track", "getList", params={}, method="POST", body=body
+            )
+            if not response:
+                return {}
+
+            items = response.get("tracks", {}).get("items", [])
+            result: dict[str, TrackAudioInfo] = {}
+            for item in items:
+                track_id = str(item.get("id", ""))
+                if not track_id:
+                    continue
+                audio_info = item.get("audio_info") or {}
+                album = item.get("album") or {}
+                result[track_id] = TrackAudioInfo(
+                    track_id=track_id,
+                    gain_db=float(audio_info.get("replaygain_track_gain", 0.0)),
+                    peak=float(audio_info.get("replaygain_track_peak", 1.0)),
+                    album_id=str(album.get("id", "")),
+                    duration_ms=int(item.get("duration", 0)) * 1000,
+                )
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to get tracks audio info: {e}")
+            return {}
 
     async def _request_signed(
         self,
