@@ -493,10 +493,18 @@ class QobuzAPIClient:
                 continue
             audio_info = item.get("audio_info") or {}
             album = item.get("album") or {}
+            gain = audio_info.get("replaygain_track_gain", 0.0)
+            if gain is None:
+                # Qobuz sends the keys with null for tracks it has no loudness
+                # data for (seen on real tracks); one such track must not take
+                # the rest of the chunk down with a float(None). Absent here
+                # means "no data" to the caller: no adjustment for this one.
+                continue
+            peak = audio_info.get("replaygain_track_peak", 1.0)
             result[track_id] = TrackAudioInfo(
                 track_id=track_id,
-                gain_db=float(audio_info.get("replaygain_track_gain", 0.0)),
-                peak=float(audio_info.get("replaygain_track_peak", 1.0)),
+                gain_db=float(gain),
+                peak=float(peak) if peak is not None else 1.0,
                 album_id=str(album.get("id", "")),
                 duration_ms=int(item.get("duration", 0)) * 1000,
             )

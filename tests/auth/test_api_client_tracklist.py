@@ -161,3 +161,51 @@ class TestGetTracksMetadata:
         assert meta is not None
         assert meta["max_sample_rate_hz"] == 192000
         assert meta["max_bit_depth"] == 24
+
+
+class TestTracksWithoutLoudnessData:
+    """Qobuz sends audio_info with null gain and peak for some tracks (seen on
+    real ones): that must not cost the rest of the chunk its gain."""
+
+    def _client(self, items: list[dict[str, Any]]) -> QobuzAPIClient:
+        client = QobuzAPIClient("app123", "secret456")
+        client._request_signed = AsyncMock(  # type: ignore[method-assign]
+            return_value={"tracks": {"items": items}}
+        )
+        return client
+
+    async def test_a_null_gain_leaves_only_that_track_without_data(self) -> None:
+        client = self._client(
+            [
+                {
+                    "id": 1,
+                    "duration": 100,
+                    "audio_info": {"replaygain_track_gain": None, "replaygain_track_peak": None},
+                },
+                {
+                    "id": 2,
+                    "duration": 200,
+                    "audio_info": {"replaygain_track_gain": -2.76, "replaygain_track_peak": 0.98},
+                },
+            ]
+        )
+
+        result = await client.get_tracks_audio_info(["1", "2"])
+
+        assert set(result) == {"2"}  # no data for 1: the caller applies no adjustment
+        assert result["2"].gain_db == -2.76 and result["2"].peak == 0.98
+
+    async def test_a_null_peak_alone_is_no_peak_limit(self) -> None:
+        client = self._client(
+            [
+                {
+                    "id": 1,
+                    "duration": 100,
+                    "audio_info": {"replaygain_track_gain": 1.5, "replaygain_track_peak": None},
+                }
+            ]
+        )
+
+        result = await client.get_tracks_audio_info(["1"])
+
+        assert result["1"].gain_db == 1.5 and result["1"].peak == 1.0
