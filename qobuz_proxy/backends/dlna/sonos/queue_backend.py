@@ -108,7 +108,16 @@ class SonosQueueBackend(SonosBackend):
         if uri is None or self._current_key is None:
             return uri == self._current_proxy_url
         parsed = parse_entry_url(uri)
-        return parsed is not None and parsed.key == self._current_key
+        if parsed is None:
+            return False
+        if self._awaiting_retarget_confirmation:
+            # A new coordinator took the queue over: whichever of our entries it
+            # is on is our content (it may have moved on during the handoff).
+            return self._is_own_proxy_url(uri)
+        return parsed.key == self._current_key
+
+    def _retarget_resolved(self) -> None:
+        self._notify_resync()
 
     @property
     def keeps_playing_on_shutdown(self) -> bool:

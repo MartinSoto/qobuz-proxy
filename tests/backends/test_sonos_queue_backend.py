@@ -519,6 +519,29 @@ class TestCurrentContent:
         assert not backend._is_current_content(None)
 
 
+class TestRetargetConfirmation:
+    async def test_any_of_our_entries_confirms_a_handoff(self) -> None:
+        """The new coordinator may already be past the entry we had."""
+        backend, client, _ = await make([1, 2, 3])
+        await backend.play(meta(1))
+        await settled(backend)
+        later = client.device.urls[2]
+
+        assert not backend._is_current_content(later)  # normally: only the entry we started
+        backend._awaiting_retarget_confirmation = True
+        assert backend._is_current_content(later)
+        assert not backend._is_current_content("http://elsewhere:7120/audio/3?x=1")
+
+    async def test_settling_a_retarget_asks_for_a_resync(self) -> None:
+        backend, _, _ = await make([1])
+        callback = MagicMock()
+        backend.on_resync(callback)
+
+        backend._retarget_resolved()
+
+        callback.assert_called_once_with()
+
+
 class TestOwnUrls:
     async def test_an_entry_naming_another_rooms_proxy_port_is_still_ours(self) -> None:
         backend, client, _ = await make([1, 2])

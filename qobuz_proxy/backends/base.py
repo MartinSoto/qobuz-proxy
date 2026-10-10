@@ -219,6 +219,21 @@ class AudioBackend(ABC):
         report; every other backend sequences the queue itself."""
         self._on_item_changed = callback
 
+    def on_resync(self, callback: Optional[Callable[[], None]]) -> None:
+        """Register callback for "look at what the device really does now":
+        fired once a retarget has settled (confirmed, or given up on), for a
+        backend whose device carries on by itself through a handoff. Default:
+        never fired."""
+        self._on_resync = callback
+
+    def _notify_resync(self) -> None:
+        callback = getattr(self, "_on_resync", None)
+        if callback:
+            try:
+                callback()
+            except Exception as e:
+                logger.error(f"Resync callback error: {e}")
+
     async def set_repeat_mode(self, mode: str) -> None:
         """The repeat mode changed: "off", "one" or "all". A backend that
         lets the device run through the queue on its own relays it to the

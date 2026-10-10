@@ -1046,6 +1046,11 @@ class DLNABackend(AudioBackend):
         moving to another entry of the queue it was given."""
         return None
 
+    def _retarget_resolved(self) -> None:
+        """The wait for our content to show on the retargeted device is over
+        (it did, or the time ran out). Default: nothing to do."""
+        return None
+
     def _is_current_content(self, uri: Optional[str]) -> bool:
         """Whether the device's reported URI is the content we last started.
         Exact match here; a backend whose device holds entries published under
@@ -1393,6 +1398,7 @@ class DLNABackend(AudioBackend):
                             f"(still expected {self._current_proxy_url!r})"
                         )
                         self._awaiting_retarget_confirmation = False
+                        self._retarget_resolved()
                     elif self._client:
                         current_uri = await self._get_current_transport_uri()
                         logger.debug(
@@ -1407,6 +1413,7 @@ class DLNABackend(AudioBackend):
                             self._awaiting_retarget_confirmation = False
                             self._playback_started_at = time.monotonic()
                             self._current_track_confirmed = True
+                            self._retarget_resolved()
 
                 # Check if we're in the grace period after starting playback
                 # (or a retarget still awaiting confirmation — see above).

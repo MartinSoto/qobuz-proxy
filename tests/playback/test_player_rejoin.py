@@ -213,3 +213,90 @@ class TestCarryingOnUnderAPlayingDevice:
 
         backend.adopt.assert_not_called()
         player._load_track_locked.assert_awaited()
+
+
+class TestHandoffOfADeviceThatKeepsPlaying:
+    """The coordinator changes while the device plays its own queue: the queue
+    moves to the new coordinator and carries on, so the player must report that,
+    not the 'loading' the detach left behind."""
+
+    def _player(self, keeps_playing: bool = True, playing=None):  # type: ignore[no-untyped-def]
+        player, backend = _make_player()
+        player.queue.generation = ("tag", 64)
+        backend.keeps_playing_on_shutdown = keeps_playing
+        backend.disconnect = AsyncMock()
+        backend.retarget = AsyncMock(return_value=True)
+        backend.playing_entry = AsyncMock(return_value=playing)
+        backend.adopt = AsyncMock()
+        player._send_state_update = AsyncMock()  # type: ignore[method-assign]
+        player._current_track = QueueTrack(queue_item_id=3, track_id="333")
+        player._state = PlaybackState.PLAYING
+        player._backend_attached = True
+        return player, backend
+
+    @staticmethod
+    def _playing(**kw):  # type: ignore[no-untyped-def]
+        return TestCarryingOnUnderAPlayingDevice._playing(**kw)
+
+    async def test_detaching_does_not_stop_a_device_that_plays_on(self) -> None:
+        player, backend = self._player(keeps_playing=True)
+
+        await player._detach_locked()
+
+        backend.disconnect.assert_awaited_once_with(send_device_stop=False)
+
+    async def test_detaching_still_stops_any_other_device(self) -> None:
+        player, backend = self._player(keeps_playing=False)
+
+        await player._detach_locked()
+
+        backend.disconnect.assert_awaited_once_with(send_device_stop=True)
+
+    async def test_the_new_coordinator_playing_our_entry_is_taken_over(self) -> None:
+        player, backend = self._player(playing=self._playing(queue_item_id=4, track_id="444"))
+        await player._detach_locked()
+        assert player._state == PlaybackState.LOADING  # what the detach reports
+
+        await player._retarget_locked("10.0.0.9", 1400)
+
+        assert player._state == PlaybackState.PLAYING
+        assert player._current_track is not None
+        assert player._current_track.queue_item_id == 4  # it may have moved on meanwhile
+        backend.adopt.assert_awaited_once()
+        player._send_state_update.assert_awaited()
+
+    async def test_nothing_found_straight_away_leaves_it_loading_for_now(self) -> None:
+        player, _ = self._player(playing=None)
+        await player._detach_locked()
+
+        await player._retarget_locked("10.0.0.9", 1400)
+
+        assert player._state == PlaybackState.LOADING  # the queue may still be arriving
+
+    async def test_giving_up_waiting_settles_on_stopped(self) -> None:
+        player, _ = self._player(playing=None)
+        await player._detach_locked()
+        await player._retarget_locked("10.0.0.9", 1400)
+
+        await player._resync_after_retarget(settled=True)
+
+        assert player._state == PlaybackState.STOPPED
+
+    async def test_the_settled_callback_takes_over_what_the_device_plays(self) -> None:
+        player, backend = self._player(playing=self._playing())
+        await player._detach_locked()
+        await player._retarget_locked("10.0.0.9", 1400)
+        player._state = PlaybackState.LOADING  # as if it had been found only later
+
+        await player._resync_after_retarget(settled=True)
+
+        assert player._state == PlaybackState.PLAYING
+
+    async def test_another_backend_is_left_to_its_own_poll_loop(self) -> None:
+        player, backend = self._player(keeps_playing=False, playing=self._playing())
+        await player._detach_locked()
+
+        await player._retarget_locked("10.0.0.9", 1400)
+
+        backend.adopt.assert_not_called()
+        assert player._state == PlaybackState.LOADING

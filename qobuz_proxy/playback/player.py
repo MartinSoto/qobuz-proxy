@@ -331,6 +331,7 @@ class QobuzPlayer:
         self.backend.on_position_update(self._on_position_update)
         self.backend.on_next_track_started(self._on_next_track_started)
         self.backend.on_item_changed(self._on_item_changed)
+        self.backend.on_resync(self._on_backend_resync)
         self.backend.on_state_change(self._on_state_change)
         self.backend.on_external_takeover(self._on_external_takeover)
         self.backend.on_volume_update(self._on_volume_update)
@@ -507,7 +508,10 @@ class QobuzPlayer:
         await self._enqueue_and_wait(self._detach_locked)
 
     async def _detach_locked(self) -> None:
-        await self.backend.disconnect(send_device_stop=True)
+        # A device playing a queue it holds itself carries on through a handoff
+        # (the queue moves to the new coordinator): stopping it is the one thing
+        # that would interrupt it.
+        await self.backend.disconnect(send_device_stop=not self.backend.keeps_playing_on_shutdown)
         await self.set_backend_attached(False)
 
     async def retarget(self, ip: str, port: int) -> bool:
@@ -524,6 +528,8 @@ class QobuzPlayer:
         ok = await self.backend.retarget(ip, port)
         if ok:
             await self.set_backend_attached(True)
+            if self.backend.keeps_playing_on_shutdown and self._current_track is not None:
+                await self._resync_after_retarget()
         return ok
 
     async def _enqueue_and_wait(self, coro_fn: Callable[[], Awaitable[_T]]) -> _T:
@@ -774,11 +780,18 @@ class QobuzPlayer:
             except Exception as e:
                 logger.warning(f"Failed to stop the device: {e}")
             return False
+        await self._take_over(playing)
+        return True
+
+    async def _take_over(self, playing: AdoptedPlayback) -> None:
+        """Make what the device plays the current track, position and state,
+        and tell the app."""
+        previous = self._current_track
         meta = await self._get_track_metadata(playing.track_id)
         track = QueueTrack(
             queue_item_id=playing.queue_item_id,
             track_id=playing.track_id,
-            context_uuid=None,
+            context_uuid=previous.context_uuid if previous else None,
             metadata=meta or {},
             duration_ms=meta.get("duration_ms", 0) if meta else 0,
         )
@@ -797,7 +810,23 @@ class QobuzPlayer:
         await self._send_state_update()
         if not playing.paused:
             await self._report_playing(playing.position_ms)
-        return True
+
+    def _on_backend_resync(self) -> None:
+        """The retarget settled (see AudioBackend.on_resync): enqueued like any
+        other backend-driven change."""
+        self.enqueue(functools.partial(self._resync_after_retarget, True))
+
+    async def _resync_after_retarget(self, settled: bool = False) -> None:
+        """A device that plays its own queue carried on through the handoff
+        (a new coordinator took the queue over): report what it is really doing
+        instead of the 'loading' left by the detach."""
+        playing = await self._find_adoptable()
+        if playing is not None and playing.major == self.queue.generation[1]:
+            await self._take_over(playing)
+            return
+        if settled and self._state == PlaybackState.LOADING:
+            self._state = PlaybackState.STOPPED  # nothing of ours plays there
+            await self._send_state_update()
 
     async def deactivate_renderer(self) -> None:
         """Handle SET_ACTIVE(false) — debounced, not an immediate stop.
