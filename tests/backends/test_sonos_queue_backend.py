@@ -3,6 +3,7 @@ device, jumping within it afterwards, following queue changes, and noticing
 which entry the device plays. The device is a fake queue behind a real
 SonosClient subclass, so the whole play() path runs."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlsplit
 
@@ -834,3 +835,85 @@ class TestEntryFromEvents:
         )
 
         assert changed == []
+
+
+class TestEventsThatMissedAChange:
+    """If the slow poll finds a change no event announced, the events cannot be
+    relied on right now: poll closely and subscribe afresh."""
+
+    def _slow(self):  # type: ignore[no-untyped-def]
+        import time as _time
+
+        backend = SonosQueueBackend("10.0.0.5")
+        backend._polling_slowly = True
+        backend._last_event_at = _time.monotonic() - 60
+        return backend
+
+    def test_a_change_the_poll_finds_alone_distrusts_the_events(self) -> None:
+        import time as _time
+
+        backend = self._slow()
+
+        backend._poll_observed("state")
+
+        assert backend._distrust_events_until > _time.monotonic() + 60
+
+    def test_a_change_just_after_an_event_is_the_events_own(self) -> None:
+        import time as _time
+
+        backend = self._slow()
+        backend._last_event_at = _time.monotonic() - 1
+
+        backend._poll_observed("state")
+
+        assert backend._distrust_events_until == 0.0
+
+    def test_nothing_is_distrusted_while_polling_closely_anyway(self) -> None:
+        backend = self._slow()
+        backend._polling_slowly = False
+
+        backend._poll_observed("state")
+
+        assert backend._distrust_events_until == 0.0
+
+    def test_distrusted_events_keep_the_fast_poll(self) -> None:
+        import time as _time
+
+        from qobuz_proxy.backends.dlna.backend import STATE_POLL_INTERVAL_SECONDS
+
+        backend = TestSafetyNetPolling()._healthy_backend()
+        backend._distrust_events_until = _time.monotonic() + 100
+
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    async def test_it_subscribes_afresh(self) -> None:
+        backend, _, _ = await make([1])
+        backend._polling_slowly = True
+        backend._event_source = MagicMock()
+        backend._start_events = AsyncMock()  # type: ignore[method-assign]
+
+        backend._poll_observed("item")
+        await asyncio.sleep(0)
+
+        backend._start_events.assert_awaited_once()
+
+    async def test_an_event_wakes_the_loop_before_following_the_entry(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos.transport_events import TransportEvent
+
+        backend, client, _ = await make([1, 2])
+        await backend.play(meta(1))
+        await settled(backend)
+        order: list[str] = []
+        backend.wake_poll = lambda: order.append("wake")  # type: ignore[method-assign]
+
+        async def follow(uri, via_event=False):  # type: ignore[no-untyped-def]
+            order.append("follow")
+
+        backend._observe_polled_uri = follow  # type: ignore[method-assign]
+
+        await backend._on_transport_event(
+            TransportEvent(transport_state="PLAYING", current_track_uri=client.device.urls[0])
+        )
+
+        assert order == ["wake", "follow"]
+        assert backend._last_event_at > 0

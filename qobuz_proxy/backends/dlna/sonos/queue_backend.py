@@ -62,6 +62,14 @@ START_TIMEOUT_SECONDS = 30.0
 # only has to be a safety net: events wake it the moment something changes.
 SAFETY_NET_POLL_INTERVAL_SECONDS = 10.0
 
+# While the poll is only a safety net, a change it finds must have been announced
+# by an event within this long; if not, the events are distrusted for a while.
+EVENT_ANNOUNCE_WINDOW_SECONDS = 5.0
+EVENT_DISTRUST_SECONDS = 300.0
+# A NOTIFY is answered once its handler is done: never keep the device waiting
+# longer than this on following an entry.
+EVENT_HANDLING_TIMEOUT_SECONDS = 5.0
+
 
 class SonosQueueBackend(SonosBackend):
     _poll_uri_every_cycle = True
@@ -92,6 +100,10 @@ class SonosQueueBackend(SonosBackend):
         self._events: Optional[TransportEventStream] = None
         self._volume_events: Optional[ServiceEventStream[GroupVolumeEvent]] = None
         self._polling_slowly = False
+        # When the last event of any kind arrived, and until when the events are
+        # not trusted to say when something changes (see _poll_observed).
+        self._last_event_at: float = 0.0
+        self._distrust_events_until: float = 0.0
 
     @property
     def supports_gapless(self) -> bool:
@@ -201,6 +213,7 @@ class SonosQueueBackend(SonosBackend):
     async def _on_volume_event(self, event: GroupVolumeEvent) -> None:
         """The group volume or mute changed (from the Sonos app, a button): the
         cycle's volume read picks it up now instead of at the next tick."""
+        self._last_event_at = time.monotonic()
         self.wake_poll()
 
     def _events_settled(self) -> bool:
@@ -210,6 +223,8 @@ class SonosQueueBackend(SonosBackend):
         keep watching closely."""
         events, volume = self._events, self._volume_events
         if events is None or volume is None or not (events.healthy and volume.healthy):
+            return False
+        if time.monotonic() < self._distrust_events_until:
             return False
         return (
             self._unconfirmed_stop_polls == 0
@@ -235,23 +250,60 @@ class SonosQueueBackend(SonosBackend):
             )
         return SAFETY_NET_POLL_INTERVAL_SECONDS if slow else interval
 
+    def _poll_observed(self, kind: str) -> None:
+        """The poll loop noticed a change. While the poll is only a slow safety
+        net, the events must have announced it a moment ago; if they did not,
+        they cannot be relied on right now (a subscription the device dropped
+        looks exactly like a quiet one): poll closely for a while and subscribe
+        afresh."""
+        if not self._polling_slowly:
+            return
+        now = time.monotonic()
+        if now - self._last_event_at <= EVENT_ANNOUNCE_WINDOW_SECONDS:
+            return
+        logger.warning(
+            f"[{self.name}] the poll noticed a {kind} change no event announced: "
+            f"polling every {STATE_POLL_INTERVAL_SECONDS:.0f}s for "
+            f"{EVENT_DISTRUST_SECONDS / 60:.0f} min and subscribing afresh"
+        )
+        self._distrust_events_until = now + EVENT_DISTRUST_SECONDS
+        if self._event_source is not None:
+            asyncio.create_task(self._resubscribe_events())
+
+    async def _resubscribe_events(self) -> None:
+        try:
+            await self._start_events()
+        except Exception as e:
+            logger.warning(f"[{self.name}] could not resubscribe to device events: {e}")
+
     async def _on_transport_event(self, event: TransportEvent) -> None:
         """The device says something changed: look now rather than at the next
         tick. What it changed is read the usual way (see _poll_state_loop)."""
+        self._last_event_at = time.monotonic()
+        logger.info(
+            f"[{self.name}] event: {event.transport_state} track {event.current_track}"
+            + (f" of {event.number_of_tracks}" if event.number_of_tracks else "")
+        )
+        if event.transport_state != "TRANSITIONING":
+            self.wake_poll()  # first: the entry lookup below may take a moment
         if event.current_track_uri and event.transport_state in ("PLAYING", "TRANSITIONING"):
             # The event names the entry the device is on: no need to wait for the
             # cycle (a sudden track change reaches the app ~0.75 s earlier than
             # through the PLAYING event that follows it). Only while playing, like
             # the poll: a STOPPED device names the first entry it landed back on
             # at the end of the queue, which is not the device moving on.
-            await self._observe_polled_uri(event.current_track_uri)
-        if event.transport_state == "TRANSITIONING":
-            # The device is between entries and says nothing yet: a cycle now
-            # would read the same, and its spacing would then hold back the
-            # cycle the PLAYING event right behind it wants (captured: 0.75 s
-            # later). If that never comes, the interval poll still does.
-            return
-        self.wake_poll()
+            try:
+                await asyncio.wait_for(
+                    self._observe_polled_uri(event.current_track_uri, via_event=True),
+                    timeout=EVENT_HANDLING_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self.name}] following the entry an event named took too long")
+        # (A TRANSITIONING event does not wake the loop: the device is between
+        # entries and says nothing yet, a cycle now would read the same and its
+        # spacing would hold back the cycle the PLAYING event right behind it
+        # wants, captured 0.75 s later. If that never comes, the interval poll
+        # still does.)
 
     async def disconnect(self, send_device_stop: bool = True) -> None:
         await self._stop_events()
@@ -494,7 +546,9 @@ class SonosQueueBackend(SonosBackend):
             desired.append(current)  # an autoplay track keeps playing
         runner.request_reconcile(desired, anchor=current)
 
-    async def _observe_polled_uri(self, current_uri: Optional[str]) -> None:
+    async def _observe_polled_uri(
+        self, current_uri: Optional[str], via_event: bool = False
+    ) -> None:
         """The device reported this entry as current. Another one than the one
         we started means it moved on by itself."""
         if not current_uri or not self._is_own_proxy_url(current_uri):
@@ -511,6 +565,8 @@ class SonosQueueBackend(SonosBackend):
         logger.info(
             f"[{self.name}] device moved on to track {key.track_id} (item {key.queue_item_id})"
         )
+        if not via_event:
+            self._poll_observed("item")
         self._current_key = key
         self._current_proxy_url = current_uri
         self._position_ms = 0

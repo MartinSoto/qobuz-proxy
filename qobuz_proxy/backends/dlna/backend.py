@@ -1046,6 +1046,12 @@ class DLNABackend(AudioBackend):
         moving to another entry of the queue it was given."""
         return None
 
+    def _poll_observed(self, kind: str) -> None:
+        """The poll loop itself noticed a change (`kind`: state, volume, item).
+        A backend that is also told by events can tell whether they announced it.
+        Default: nothing."""
+        return None
+
     def _retarget_resolved(self) -> None:
         """The wait for our content to show on the retargeted device is over
         (it did, or the time ran out). Default: nothing to do."""
@@ -1758,6 +1764,7 @@ class DLNABackend(AudioBackend):
                         )
                     else:
                         logger.debug(f"State changed: {self._state} -> {new_state}")
+                        self._poll_observed("state")
                         self._notify_state_change(new_state)
 
                 # Detect volume changed externally (the Sonos app, the
@@ -1775,6 +1782,7 @@ class DLNABackend(AudioBackend):
                         logger.info(
                             f"[{self.name}] Volume changed externally: {old_volume} -> {new_volume}"
                         )
+                        self._poll_observed("volume")
                         self._notify_volume_update(new_volume)
 
                 # Update position while playing
