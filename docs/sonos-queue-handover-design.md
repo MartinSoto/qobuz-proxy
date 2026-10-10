@@ -852,3 +852,17 @@ the device (`Browse Q:0` listed 20 entries) and none appeared in the app, which
 kept showing the original 12. So the app does not read the device's queue
 contents (it keeps its own view of service queues), and no description of an
 entry makes a UPnP-added one listed. Closed for good.
+
+### 11.11 Entries naming a port no one serves (2026-10-10)
+
+A restart after the rooms had been regrouped (four speakers before, two after)
+left the device holding 37 entries published under port 7123 while the new run
+listened on 7120 and 7121: connection refused for every entry, the device ran
+through all 37 in a fraction of a second ("PLAYING track 37 of 37" then "STOPPED
+track 1") and stopped, and the app, which the restart had disconnected anyway,
+found nothing playing. Carrying on after a restart needs the entries' port to be
+served again, so the port a coordinator device was given is now remembered
+(`port_registry.py`, `proxy-ports.json` in the data dir, keyed by the device's
+uuid) and given back to the same device; a port promised to an absent device is
+not given to another. The first run after this change records the ports; a queue
+published before it names whatever port it was given then.
