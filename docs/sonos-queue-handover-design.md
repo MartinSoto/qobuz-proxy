@@ -830,3 +830,14 @@ Lessons from the failure on the way (a quiet but dead subscription looks like a
 quiet healthy one): `healthy` means only that an event once arrived; a poll that
 finds a change no event announced is the only evidence of a dead one, which is
 why the miss is logged (and can be acted on again with the switch).
+
+### 11.10 The queue the Sonos app does not list (decision, 2026-10-10)
+
+Checked against the usual advice for a queue the app does not show: the proxy
+already adds its entries to the device queue (`AddMultipleURIsToQueue`), binds
+the transport to `x-rincon-queue:<RINCON>#0`, gives every entry full DIDL-Lite
+metadata and targets the coordinator, so none of it explains the empty list.
+The likely difference is that the app's own entries carry a service or library
+identity ours lack. Experimenting with variants of the entry description on a
+spare room was offered and not taken up: cosmetic, since Previous/Next from the
+Sonos side work and editing the queue there is out of scope.
