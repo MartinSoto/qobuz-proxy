@@ -89,11 +89,15 @@ SonosDiscoveryManager (SSDP poll + GENA eventing, Sonos topology only)
 
 A group is tracked by its own `group_id` (confirmed stable across a coordinator handoff), not the coordinator's physical `uuid` — so a handoff renames/retargets the existing `Speaker` in place instead of tearing down and recreating it. `generate_sonos_speaker_uuid()` derives the Qobuz Connect device identity from that same `group_id`, so a promoted coordinator computes the identity its predecessor had and the Qobuz app sees a reconnect, not a new device. `Speaker.is_active` (wraps `Player.is_active_renderer`) is what gates whether a departing/idle Sonos room actually gets sent a live device Stop — a room that's merely discovered, not the one Qobuz is actually driving, must never be interrupted.
 
+### Sonos Queue Handover (experimental)
+
+`sonos_queue_handover: true` (or `QOBUZPROXY_SONOS_QUEUE_HANDOVER`, `--sonos-queue-handover`) makes Sonos rooms use `SonosQueueBackend` (`dlna/sonos/queue_backend.py`) instead of `SonosBackend`: the whole Qobuz queue is published to the device's own queue in the server's play order and the device plays through it by itself, while the proxy keeps it in step (`queue_sync.py`: planner `queue_plan.py`, executor, latest-wins runner), starts playback at the right entry, and reports the entry the device moves to (`on_item_changed`). Stream URLs carry the queue generation (`&s=&v=&i=`) and the proxy answers 410 for an earlier one. Off by default; design, wire evidence and hardware results are in `docs/sonos-queue-handover-design.md` and `docs/queue-and-shuffle-wire-observations.md`.
+
 ## Configuration Priority
 
 1. CLI arguments (highest) → 2. Environment variables → 3. YAML config file → 4. Code defaults
 
-Key env vars: `QOBUZ_AUTH_TOKEN`, `QOBUZ_USER_ID`, `QOBUZ_MAX_QUALITY`, `QOBUZPROXY_BACKEND`, `QOBUZPROXY_DEVICE_NAME`, `QOBUZPROXY_DLNA_IP`, `QOBUZPROXY_AUDIO_DEVICE`, `QOBUZPROXY_LOG_LEVEL`, `QOBUZPROXY_SONOS_AUTO_DISCOVER`, `QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING`
+Key env vars: `QOBUZ_AUTH_TOKEN`, `QOBUZ_USER_ID`, `QOBUZ_MAX_QUALITY`, `QOBUZPROXY_BACKEND`, `QOBUZPROXY_DEVICE_NAME`, `QOBUZPROXY_DLNA_IP`, `QOBUZPROXY_AUDIO_DEVICE`, `QOBUZPROXY_LOG_LEVEL`, `QOBUZPROXY_SONOS_AUTO_DISCOVER`, `QOBUZPROXY_SONOS_QUEUE_HANDOVER`, `QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING`
 
 ## Code Style
 

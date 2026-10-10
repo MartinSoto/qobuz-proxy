@@ -607,6 +607,7 @@ class QobuzProxy:
             event_subscriber=self._sonos_event_subscriber,
             hires_downsampling=self._config.backend.dlna.hires_downsampling,
             hires_downsampling_gain=self._config.backend.dlna.hires_downsampling_gain,
+            queue_handover=self._config.sonos_queue_handover,
             stream_resolver=self._stream_resolver,
         )
         await self._sonos_controller.start()

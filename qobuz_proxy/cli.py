@@ -236,6 +236,15 @@ Environment Variables:
         action="store_true",
         help="Continuously discover Sonos rooms/groups instead of configured speakers",
     )
+    parser.add_argument(
+        "--sonos-queue-handover",
+        action="store_true",
+        help=(
+            "Experimental: publish the whole Qobuz queue to Sonos devices and let "
+            "them play through it, instead of sequencing it track by track "
+            "(default: off)"
+        ),
+    )
 
     # Server
     server_group = parser.add_argument_group("Server")
@@ -301,6 +310,7 @@ def args_to_dict(args: argparse.Namespace) -> dict:
         "bind": ("server", "bind_address"),
         "log_level": ("logging", "level"),
         "sonos_auto_discover": ("sonos_auto_discover",),
+        "sonos_queue_handover": ("sonos_queue_handover",),
     }
 
     # store_true flags: only set (and thus override lower-priority sources)
@@ -310,6 +320,7 @@ def args_to_dict(args: argparse.Namespace) -> dict:
         "hires_downsampling",
         "hires_downsampling_gain",
         "sonos_auto_discover",
+        "sonos_queue_handover",
     }
 
     for arg_name, path in mappings.items():
@@ -336,6 +347,8 @@ def log_config(config: Config) -> None:
                 logger.info("  Hi-Res downsampling: enabled (experimental)")
             if sc.dlna_hires_downsampling_gain:
                 logger.info("  Playback gain normalization: enabled (experimental)")
+            if sc.dlna_queue_handover:
+                logger.info("  Queue handover (Sonos): enabled (experimental)")
             logger.info(f"  Proxy server: {sc.bind_address}:{sc.proxy_port}")
         elif sc.backend_type == "local":
             logger.info(f"  Audio device: {sc.audio_device}")

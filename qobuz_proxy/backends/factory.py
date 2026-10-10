@@ -83,6 +83,7 @@ class BackendFactory:
                 description_url=description_url,
                 hires_downsampling=config.backend.dlna.hires_downsampling,
                 hires_downsampling_gain=config.backend.dlna.hires_downsampling_gain,
+                queue_handover=config.backend.dlna.queue_handover,
                 backend_class=dlna_backend_class,
             )
         elif backend_type == "local":
@@ -104,6 +105,7 @@ class BackendFactory:
         description_url: Optional[str] = None,
         hires_downsampling: bool = False,
         hires_downsampling_gain: bool = False,
+        queue_handover: bool = False,
         backend_class: Optional[type[DLNABackend]] = None,
     ) -> AudioBackend:
         """
@@ -119,6 +121,10 @@ class BackendFactory:
                 downsampling for capable devices — see DLNABackend.__init__.
             hires_downsampling_gain: Experimental, Sonos-only — see
                 DLNABackend.__init__.
+            queue_handover: Experimental, Sonos-only: when the device turns out
+                to be a Sonos (backend_class is SonosBackend), use
+                SonosQueueBackend, which hands the whole queue to the device.
+                Ignored for every other device.
             backend_class: Concrete DLNABackend subclass to instantiate.
                 Defaults to the plain generic DLNABackend — pass
                 sonos.SonosBackend for a device already known to be Sonos
@@ -133,6 +139,14 @@ class BackendFactory:
             BackendNotFoundError: If connection fails
         """
         cls_ = backend_class or DLNABackend
+        if queue_handover:
+            # Deferred import, like _select_dlna_backend_class's: the sonos
+            # package imports this module's siblings at import time.
+            from .dlna.sonos import SonosBackend
+            from .dlna.sonos.queue_backend import SonosQueueBackend
+
+            if cls_ is SonosBackend:
+                cls_ = SonosQueueBackend
         backend = cls_(
             ip=ip,
             port=port,

@@ -124,6 +124,17 @@ class TestSpeakerConstruction:
         assert comp.backend.dlna.fixed_volume is True
         assert comp.backend.dlna.proxy_port == 7120
 
+    def test_build_component_config_carries_the_queue_handover_flag(self):
+        for flag in (True, False):
+            speaker = Speaker(
+                config=_make_speaker_config(backend_type="dlna", dlna_queue_handover=flag),
+                api_client=_make_api_client(),
+                app_id="id",
+                stream_resolver=_make_stream_resolver(),
+            )
+
+            assert speaker._build_component_config().backend.dlna.queue_handover is flag
+
     def test_build_component_config_maps_backend_local(self):
         config = _make_speaker_config(
             backend_type="local",

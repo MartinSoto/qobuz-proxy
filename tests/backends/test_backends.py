@@ -271,3 +271,36 @@ class TestAudioBackendInterface:
         """Test interface defines disconnect method."""
         assert hasattr(AudioBackend, "disconnect")
         assert callable(getattr(AudioBackend, "disconnect"))
+
+
+class TestQueueHandoverSelectsTheQueueBackend:
+    """create_dlna(queue_handover=True) swaps a Sonos backend for the one that
+    hands the whole queue to the device; anything else is left alone."""
+
+    async def _create(self, backend_class, queue_handover):  # type: ignore[no-untyped-def]
+        from unittest.mock import AsyncMock, patch
+
+        with patch.object(backend_class, "connect", AsyncMock(return_value=True)):
+            return await BackendFactory.create_dlna(
+                ip="10.0.1.30", backend_class=backend_class, queue_handover=queue_handover
+            )
+
+    async def test_a_sonos_becomes_the_queue_backend_when_asked(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos import SonosBackend
+        from qobuz_proxy.backends.dlna.sonos.queue_backend import SonosQueueBackend
+
+        backend = await self._create(SonosBackend, True)
+
+        assert type(backend) is SonosQueueBackend
+
+    async def test_a_sonos_stays_the_plain_sonos_backend_by_default(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos import SonosBackend
+
+        backend = await self._create(SonosBackend, False)
+
+        assert type(backend) is SonosBackend
+
+    async def test_a_generic_dlna_device_is_never_swapped(self) -> None:
+        backend = await self._create(DLNABackend, True)
+
+        assert type(backend) is DLNABackend

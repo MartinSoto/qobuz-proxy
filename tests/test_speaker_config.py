@@ -487,3 +487,79 @@ class TestConfigPathFallback:
         config = load_config(config_path=explicit)
 
         assert config.config_path == explicit
+
+
+class TestSonosQueueHandover:
+    """sonos_queue_handover: one switch for the whole process — YAML key, env
+    var or CLI flag — that every speaker follows."""
+
+    def test_yaml_turns_it_on_for_every_speaker(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+sonos_queue_handover: true
+speakers:
+  - name: Room A
+    dlna_ip: 192.168.1.10
+  - name: Room B
+    dlna_ip: 192.168.1.11
+""")
+
+        config = load_config(config_path=config_file)
+
+        assert config.sonos_queue_handover is True
+        assert all(sc.dlna_queue_handover for sc in config.speakers)
+
+    def test_off_by_default(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+speakers:
+  - name: Room A
+    dlna_ip: 192.168.1.10
+""")
+
+        config = load_config(config_path=config_file)
+
+        assert config.sonos_queue_handover is False
+        assert not any(sc.dlna_queue_handover for sc in config.speakers)
+
+    def test_env_var(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("QOBUZPROXY_SONOS_QUEUE_HANDOVER", "true")
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+speakers:
+  - name: Room A
+    dlna_ip: 192.168.1.10
+""")
+
+        config = load_config(config_path=config_file)
+
+        assert config.sonos_queue_handover is True
+        assert config.speakers[0].dlna_queue_handover is True
+
+    def test_cli_flag(self, tmp_path, monkeypatch):
+        import sys
+
+        from qobuz_proxy.cli import args_to_dict, parse_args
+
+        monkeypatch.setattr(sys, "argv", ["qobuz-proxy", "--sonos-queue-handover"])
+        cli_args = args_to_dict(parse_args())
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+speakers:
+  - name: Room A
+    dlna_ip: 192.168.1.10
+""")
+
+        config = load_config(config_path=config_file, cli_args=cli_args)
+
+        assert cli_args["sonos_queue_handover"] is True
+        assert config.speakers[0].dlna_queue_handover is True
+
+    def test_an_absent_cli_flag_is_not_set_at_all(self, monkeypatch):
+        import sys
+
+        from qobuz_proxy.cli import args_to_dict, parse_args
+
+        monkeypatch.setattr(sys, "argv", ["qobuz-proxy"])
+
+        assert "sonos_queue_handover" not in args_to_dict(parse_args())

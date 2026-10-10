@@ -308,6 +308,7 @@ class Speaker:
                     description_url=self._config.dlna_description_url,
                     hires_downsampling=self._config.dlna_hires_downsampling,
                     hires_downsampling_gain=self._config.dlna_hires_downsampling_gain,
+                    queue_handover=self._config.dlna_queue_handover,
                 ),
                 local=LocalConfig(
                     device=self._config.audio_device,

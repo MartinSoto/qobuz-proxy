@@ -65,6 +65,8 @@ ENV_MAPPINGS = {
     "QOBUZPROXY_LOG_LEVEL": ("logging", "level"),
     # Sonos auto-discovery (replaces the `speakers` list when enabled)
     "QOBUZPROXY_SONOS_AUTO_DISCOVER": ("sonos_auto_discover",),
+    # Hand the whole Qobuz queue to Sonos devices (experimental)
+    "QOBUZPROXY_SONOS_QUEUE_HANDOVER": ("sonos_queue_handover",),
 }
 
 
@@ -116,6 +118,10 @@ class DLNAConfig:
     # backends/dlna/sonos/gain.py) can be applied consistently. Implies
     # hires_downsampling — see build_speaker_configs.
     hires_downsampling_gain: bool = False
+    # Experimental, Sonos only: publish the whole Qobuz queue to the device and
+    # let it play through it (see SonosQueueBackend). Set from the global
+    # sonos_queue_handover setting for every speaker.
+    queue_handover: bool = False
 
 
 @dataclass
@@ -165,6 +171,8 @@ class SpeakerConfig:
     dlna_fixed_volume: bool = False
     dlna_hires_downsampling: bool = False
     dlna_hires_downsampling_gain: bool = False
+    # Not persisted per speaker: it follows the global sonos_queue_handover.
+    dlna_queue_handover: bool = False
     dlna_description_url: str = ""
     proxy_port: int = 0  # 0 = auto-assign
     audio_device: str = "default"
@@ -190,6 +198,9 @@ class Config:
     # instead of the `speakers` list above (which is ignored, with a
     # warning, if also set) — no manual per-room configuration needed.
     sonos_auto_discover: bool = False
+    # Experimental: hand the whole Qobuz queue to Sonos devices instead of
+    # sequencing it track by track (docs/sonos-queue-handover-design.md).
+    sonos_queue_handover: bool = False
     config_path: Optional[Path] = None  # Set by load_config() when loading from file
 
 
@@ -620,6 +631,7 @@ def load_env_config() -> dict:
                 "QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING",
                 "QOBUZPROXY_DLNA_HIRES_DOWNSAMPLING_GAIN",
                 "QOBUZPROXY_SONOS_AUTO_DISCOVER",
+                "QOBUZPROXY_SONOS_QUEUE_HANDOVER",
             ):
                 value = value.lower() in ("true", "1", "yes", "on")
 
@@ -723,6 +735,8 @@ def dict_to_config(d: dict) -> Config:
     # Sonos auto-discovery
     if "sonos_auto_discover" in d:
         config.sonos_auto_discover = bool(d["sonos_auto_discover"])
+    if "sonos_queue_handover" in d:
+        config.sonos_queue_handover = bool(d["sonos_queue_handover"])
 
     return config
 
@@ -807,6 +821,10 @@ def load_config(
 
     # Build speaker configs
     config.speakers = build_speaker_configs(config, raw_yaml_speakers)
+
+    # Queue handover is one switch for the whole process: every speaker follows it.
+    for sc in config.speakers:
+        sc.dlna_queue_handover = config.sonos_queue_handover
 
     # --hires-downsampling-gain on the CLI is a blanket override: unlike
     # the field's own per-speaker YAML/env forms, passing it on the

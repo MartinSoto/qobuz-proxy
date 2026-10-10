@@ -91,6 +91,7 @@ class SonosController:
         stream_resolver: "QobuzStreamResolver",
         hires_downsampling: bool = False,
         hires_downsampling_gain: bool = False,
+        queue_handover: bool = False,
     ) -> None:
         """
         Args:
@@ -133,6 +134,7 @@ class SonosController:
             hires_downsampling = True
         self._hires_downsampling = hires_downsampling
         self._hires_downsampling_gain = hires_downsampling_gain
+        self._queue_handover = queue_handover
 
         self._discovery: Optional[SonosDiscoveryManager] = None
         # Keyed by SonosRoom.tracking_key (a group's own group_id) — the
@@ -236,6 +238,7 @@ class SonosController:
             dlna_port=room.port,
             dlna_hires_downsampling=self._hires_downsampling,
             dlna_hires_downsampling_gain=self._hires_downsampling_gain,
+            dlna_queue_handover=self._queue_handover,
             auto_managed=True,
         )
         all_configs = [s._config for s in self.speakers] + [sc]

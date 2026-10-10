@@ -9,7 +9,9 @@ from qobuz_proxy.backends.dlna.sonos.discovery_manager import DepartedMember, So
 
 
 def _make_controller(
-    hires_downsampling: bool = False, hires_downsampling_gain: bool = False
+    hires_downsampling: bool = False,
+    hires_downsampling_gain: bool = False,
+    queue_handover: bool = False,
 ) -> SonosController:
     return SonosController(
         api_client=MagicMock(),
@@ -19,6 +21,7 @@ def _make_controller(
         stream_resolver=MagicMock(),
         hires_downsampling=hires_downsampling,
         hires_downsampling_gain=hires_downsampling_gain,
+        queue_handover=queue_handover,
     )
 
 
@@ -74,6 +77,26 @@ class TestHiresDownsamplingGainThreading:
         built_config = MockSpeaker.call_args.kwargs["config"]
         assert built_config.dlna_hires_downsampling_gain is False
         assert built_config.dlna_hires_downsampling is False
+
+
+class TestQueueHandoverThreading:
+    async def test_the_flag_reaches_every_discovered_speakers_config(self) -> None:
+        controller = _make_controller(queue_handover=True)
+
+        speaker = _mock_speaker("Kitchen")
+        with patch("qobuz_proxy.speaker.Speaker", return_value=speaker) as MockSpeaker:
+            await controller._on_room_found(ROOM)
+
+        assert MockSpeaker.call_args.kwargs["config"].dlna_queue_handover is True
+
+    async def test_off_by_default(self) -> None:
+        controller = _make_controller()
+
+        speaker = _mock_speaker("Kitchen")
+        with patch("qobuz_proxy.speaker.Speaker", return_value=speaker) as MockSpeaker:
+            await controller._on_room_found(ROOM)
+
+        assert MockSpeaker.call_args.kwargs["config"].dlna_queue_handover is False
 
 
 class TestRoomFoundAndLost:
