@@ -761,3 +761,21 @@ coordinator change (needs Baño grouped).
 
 **E3 next:** use the cached event data to skip reads and slow the safety-net
 poll while events are healthy.
+
+### 11.6 Coordinator handoff, live (2026-10-10)
+
+Two real handoffs (Cocina and Baño grouped and ungrouped while playing) showed
+the device carrying on seamlessly and the subscription following the retarget,
+and two faults on the proxy side: the retarget confirmation compared the entry
+as `play()` started it (`item=<track>`) with the published spelling
+(`item=<track>_<item>`) and timed out after 30 s; and the detach (a Stop sent
+to the old device, state `LOADING` reported to the app as stopped) was never
+undone, because the backend's own state stayed `PLAYING` and so never notified
+the player, leaving the app on "stopped" while Sonos played and a Play
+restarting the track. Now: no stop on detach for a device that keeps playing its
+queue; any of our entries confirms a handoff (the new coordinator may be past
+the entry we had); and when the retarget settles the player takes over what the
+device plays (entry, position, state) and reports it, settling on stopped only
+if nothing of ours plays there. Hardware check on Cocina (detach, the device
+moves on by itself to the next entry, retarget): the player went `LOADING` ->
+`PLAYING` on the entry the device was on now.
