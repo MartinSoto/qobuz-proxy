@@ -62,6 +62,11 @@ class SonosQueueBackend(SonosBackend):
         # The Qobuz repeat mode as the device's own play mode (see
         # set_repeat_mode): it plays the queue, so it has to repeat it too.
         self._play_mode = "NORMAL"
+        # The server's next pointer as last told, and the autoplay entries
+        # (items it names that are not in the queue) published after the
+        # queue so the device runs on into them by itself.
+        self._pointer: Optional[EntryKey] = None
+        self._tail: list[EntryKey] = []
 
     @property
     def supports_gapless(self) -> bool:
@@ -166,9 +171,38 @@ class SonosQueueBackend(SonosBackend):
         queue whose snapshot has not arrived yet)."""
         order = await self._queue.play_order() if self._queue is not None else None
         desired = [EntryKey(e.track_id, e.queue_item_id) for e in order] if order else []
+        await self._refresh_tail_state()
+        desired.extend(k for k in self._tail if k not in desired)
         if key not in desired:
             desired.append(key)
         return desired
+
+    async def _refresh_tail_state(self) -> None:
+        """Recompute the autoplay entries that belong after the queue: those up
+        to the one playing now (it is part of what the device holds), plus the
+        entry the server's next pointer names if the queue does not hold it."""
+        current = self._current_key
+        tail = self._tail[: self._tail.index(current) + 1] if current in self._tail else []
+        pointer = self._pointer
+        if (
+            pointer is not None
+            and pointer not in tail
+            and self._queue is not None
+            and await self._queue.contains_item(pointer.queue_item_id) is False
+        ):
+            tail.append(pointer)  # the server is following its autoplay list (O20)
+        self._tail = tail
+
+    async def next_pointer_changed(self, info: Optional[dict]) -> None:
+        self._pointer = (
+            EntryKey(str(info["trackId"]), int(info["queueItemId"])) if info is not None else None
+        )
+        before = list(self._tail)
+        await self._refresh_tail_state()
+        if self._tail != before:
+            if self._tail:
+                logger.info(f"[{self.name}] following the autoplay list: {self._tail[-1]}")
+            await self.queue_changed()
 
     async def _start_transport(self, url: str, didl: str) -> bool:
         parsed = parse_entry_url(url)
@@ -187,6 +221,8 @@ class SonosQueueBackend(SonosBackend):
         key = parsed.key
         self._current_key = key
         generation = self._queue.generation
+        if self._published_generation != generation:
+            self._tail = []  # another queue: what followed the old one is gone
         desired = await self._desired_queue(key)
 
         if self._published_generation == generation and self._sync is not None:
@@ -250,6 +286,8 @@ class SonosQueueBackend(SonosBackend):
         if order is None:
             return  # a delta arrived and its snapshot has not: wait for it
         desired = [EntryKey(e.track_id, e.queue_item_id) for e in order]
+        await self._refresh_tail_state()  # a new snapshot may change what the queue holds
+        desired.extend(k for k in self._tail if k not in desired)
         current = self._current_key
         if current is not None and current not in desired:
             desired.append(current)  # an autoplay track keeps playing

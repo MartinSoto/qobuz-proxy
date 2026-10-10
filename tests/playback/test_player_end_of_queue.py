@@ -69,3 +69,22 @@ class TestPlayWithNothingLoaded:
         assert await player.play() is False
 
         player._send_state_update.assert_awaited_once()
+
+
+class TestNextPointerReachesTheBackend:
+    async def test_a_changed_next_pointer_is_passed_on(self) -> None:
+        pointer = {"trackId": "900", "queueItemId": 900, "contextUuid": None}
+        player, backend = _make_player(next_track_info=pointer)
+        backend.next_pointer_changed = AsyncMock()
+        player._state = PlaybackState.PAUSED
+
+        await player.on_next_track_info_changed()
+
+        backend.next_pointer_changed.assert_awaited_once_with(pointer)
+
+    async def test_a_backend_that_fails_does_not_break_the_player(self) -> None:
+        player, backend = _make_player(next_track_info=None)
+        backend.next_pointer_changed = AsyncMock(side_effect=RuntimeError("boom"))
+        player._state = PlaybackState.PAUSED
+
+        await player.on_next_track_info_changed()  # must not raise

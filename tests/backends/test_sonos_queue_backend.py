@@ -394,3 +394,100 @@ class TestRepeatMode:
         await settled(backend)
 
         assert client.play_modes == []
+
+
+def pointer(item: int) -> dict:
+    return {"trackId": str(item), "queueItemId": item, "contextUuid": None}
+
+
+class TestAutoplayTail:
+    """The server's next pointer leaving the queue (an autoplay track, O20)
+    is published after the queue, so the device runs on into it by itself."""
+
+    async def test_a_pointer_outside_the_queue_is_published_after_it(self) -> None:
+        backend, client, _ = await make([1, 2, 3])
+        await backend.play(meta(3))
+        await settled(backend)
+
+        await backend.next_pointer_changed(pointer(50))
+        await settled(backend)
+
+        assert keys_on(client) == K(1, 2, 3, 50)
+
+    async def test_a_pointer_inside_the_queue_adds_nothing(self) -> None:
+        backend, client, _ = await make([1, 2, 3])
+        await backend.play(meta(1))
+        await settled(backend)
+
+        await backend.next_pointer_changed(pointer(2))
+        await settled(backend)
+
+        assert keys_on(client) == K(1, 2, 3)
+
+    async def test_the_list_is_followed_one_entry_at_a_time(self) -> None:
+        backend, client, _ = await make([1, 2, 3])
+        await backend.play(meta(3))
+        await settled(backend)
+        await backend.next_pointer_changed(pointer(50))
+        await settled(backend)
+
+        backend._current_key = EntryKey("50", 50)  # the device ran on into it
+        await backend.next_pointer_changed(pointer(51))
+        await settled(backend)
+
+        assert keys_on(client) == K(1, 2, 3, 50, 51)
+
+    async def test_a_pointer_that_goes_away_takes_its_entry_with_it(self) -> None:
+        backend, client, _ = await make([1, 2, 3])
+        await backend.play(meta(3))
+        await settled(backend)
+        await backend.next_pointer_changed(pointer(50))
+        await settled(backend)
+
+        await backend.next_pointer_changed(None)  # autoplay switched off: the sentinel
+        await settled(backend)
+
+        assert keys_on(client) == K(1, 2, 3)
+
+    async def test_the_entry_playing_stays_when_the_pointer_goes_away(self) -> None:
+        backend, client, _ = await make([1, 2, 3])
+        await backend.play(meta(3))
+        await settled(backend)
+        await backend.next_pointer_changed(pointer(50))
+        await settled(backend)
+        backend._current_key = EntryKey("50", 50)
+        await backend.next_pointer_changed(pointer(51))
+        await settled(backend)
+
+        await backend.next_pointer_changed(None)
+        await settled(backend)
+
+        assert keys_on(client) == K(1, 2, 3, 50)
+
+    async def test_an_edit_of_the_queue_keeps_the_tail(self) -> None:
+        backend, client, queue = await make([1, 2, 3])
+        await backend.play(meta(3))
+        await settled(backend)
+        await backend.next_pointer_changed(pointer(50))
+        await settled(backend)
+
+        await queue.apply_snapshot([(1, "1"), (3, "3"), (2, "2")])
+        await backend.queue_changed()
+        await settled(backend)
+
+        assert keys_on(client) == K(1, 3, 2, 50)
+
+    async def test_another_queue_starts_without_the_old_tail(self) -> None:
+        backend, client, queue = await make([1, 2, 3])
+        await backend.play(meta(3))
+        await settled(backend)
+        await backend.next_pointer_changed(pointer(50))
+        await settled(backend)
+
+        await queue.set_version(QueueVersion(6, 1))
+        await queue.apply_snapshot([(10, "10"), (11, "11")])
+        backend._pointer = None  # the new load's own next pointer: inside it
+        await backend.play(meta(10))
+        await settled(backend)
+
+        assert keys_on(client) == K(10, 11)

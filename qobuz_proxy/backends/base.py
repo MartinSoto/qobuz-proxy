@@ -225,6 +225,14 @@ class AudioBackend(ABC):
         itself, so the default does nothing."""
         return None
 
+    async def next_pointer_changed(self, info: Optional[dict]) -> None:
+        """The server's next pointer (a dict with trackId, queueItemId, ...,
+        or None for no next track) is now this. A backend that holds the whole
+        queue on the device needs it for the one case the queue does not
+        cover: the pointer leaving the queue into the autoplay list. Default:
+        nothing to do."""
+        return None
+
     async def queue_changed(self) -> None:
         """The Qobuz queue's order or contents changed within the queue
         generation the backend was loaded with (an edit, a shuffle toggle).

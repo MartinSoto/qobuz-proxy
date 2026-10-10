@@ -1797,6 +1797,7 @@ class QobuzPlayer:
 
             await self._send_state_update()
             await self._report_playing(start_position_ms)
+            await self._sync_next_pointer()
             return True
 
         except Exception as e:
@@ -2301,6 +2302,15 @@ class QobuzPlayer:
         await self._report_playing()
         await self._send_state_update()
 
+    async def _sync_next_pointer(self) -> None:
+        """Tell the backend where the server's next pointer is now (it may
+        leave the queue into the autoplay list). Never raises."""
+        try:
+            info = self._get_next_track_callback() if self._get_next_track_callback else None
+            await self.backend.next_pointer_changed(info)
+        except Exception as e:
+            logger.warning(f"Backend could not follow the next pointer: {e}")
+
     async def on_queue_changed(self) -> None:
         """The Qobuz queue's order or contents changed (a snapshot after an
         edit or shuffle toggle): let the backend bring the device's copy up to
@@ -2313,6 +2323,7 @@ class QobuzPlayer:
     async def on_next_track_info_changed(self) -> None:
         """Called when command handler reports the next track info has changed."""
         new_info = self._get_next_track_callback() if self._get_next_track_callback else None
+        await self._sync_next_pointer()
 
         # The server resends the same next track in bursts — if it's already
         # armed, re-arming would queue a duplicate on the backend
