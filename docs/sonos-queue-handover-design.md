@@ -570,9 +570,9 @@ uninterrupted (its position kept advancing).
 Known gaps, in the order they matter:
 - Following the device uses the existing 2 s poll, so the player learns of a
   transition up to ~2 s late (eventing, 9.2, would make it immediate).
-- An item past the last queue entry (the autoplay tail) and a repeat-all wrap
-  that the device does not do itself still go through the end-of-queue stop and
-  the player starting the next track, so they are not gapless.
+- Repeat-all wraps natively on the device (measured, 9.2) and needs nothing
+  more; still not captured: shuffle plus repeat-all (does the device's wrap
+  target equal the server's?).
 - A retarget (coordinator hand-over) drops the published generation, so the
   next play publishes again, but nothing resumes the interrupted track itself.
 - The existing hijack check is unchanged (an own URL, any entry, is not a
@@ -605,3 +605,18 @@ last entry, the player went `PLAYING item 2` -> `STOPPED item 0` within one
 poll, and a bare PLAY played item 0 from the device queue. The landing is in
 `Player._handle_track_ended`, so it applies to every backend, not only the
 handover one.
+
+#### Autoplay tail (2026-10-10)
+
+The server's next pointer is passed to the backend (`next_pointer_changed`,
+from `Player._sync_next_pointer`: on every pointer change, after each start
+and after a queue change). When it names an item the queue does not hold, that
+entry is published after the queue, so the device runs on into it gaplessly
+(O20). The list is followed one entry at a time: entering an autoplay entry
+moves the server's pointer to the next one, which is then published. An entry
+the pointer drops again (autoplay off, a sentinel) is removed unless it is the
+one playing; an edit of the queue keeps the tail; a new queue generation
+starts without one. Hardware check on Cocina (3-entry queue, pointer naming a
+track outside it, seek near the end of the last): the device queue became
+`[0, 1, 2, 900]`, the device ran into entry 900 on its own and the player
+adopted it as queue item 900.
