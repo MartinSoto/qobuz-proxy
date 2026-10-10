@@ -727,3 +727,37 @@ separately and can be reverted on its own.
 - **A flag or not**: proposed no new flag (it lives inside the handover
   backend, which already is one) with the automatic fallback above; a kill
   switch environment variable only if the first live run asks for it.
+
+### 11.5 Progress (2026-10-10)
+
+**E0 done.** Real `LastChange` bodies were captured on Cocina (queue of 3,
+driven by SOAP) and stored as test fixtures (`tests/fixtures/sonos_events/`).
+Findings: events arrive 0.02–0.3 s after the action; Next, Previous, a skip
+over an entry and a play-mode change each give one; a (re)load or a track change
+passes through `TRANSITIONING` and reaches `PLAYING` about 0.75 s later; the end
+of the queue is `STOPPED` back on track 1; the first event after subscribing is
+complete; the track URL is escaped twice (a normal XML parse undoes it);
+`GroupRenderingControl` sends the group volume as an event (E4 is feasible).
+
+**E1 done.** `transport_events.py` (parser, every field optional) and the GENA
+client generalized to any service behind the one NOTIFY route, dispatched by SID
+(`SonosEventSubscriber.subscribe_service/renew_service/unsubscribe_service`).
+
+**E2 done.** `transport_subscription.py` (`TransportEventStream`: subscribe,
+renew before the timeout, resubscribe when the device forgot it, retry, `healthy`
+once the first event arrived) used by `SonosQueueBackend.attach_events`
+(subscribe on attach, move on a retarget, drop on disconnect; the plumbing is an
+`EventSource` handed from the app/controller through `Speaker`). An event wakes
+`_poll_state_loop` through `DLNABackend.wake_poll()`, at least 1 s after the
+previous cycle (the stop-confirmation logic counts cycles); a `TRANSITIONING`
+event does not wake it (its cycle would read the same, and the spacing would
+hold back the `PLAYING` event behind it). Polling and its decision logic are
+untouched, and a failure to subscribe changes nothing. Measured on Cocina,
+Next/Previous to the player noticing, 8 trials each with random phase against
+the 2 s tick: **polling only mean 1.44 s (max 2.81 s); with events mean 0.72 s
+(max 1.13 s)**, the floor being the device's own transitioning time. Not yet
+checked live: renewal at the real timeout (unit-tested with short ones) and a
+coordinator change (needs Baño grouped).
+
+**E3 next:** use the cached event data to skip reads and slow the safety-net
+poll while events are healthy.
