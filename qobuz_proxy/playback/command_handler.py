@@ -124,6 +124,10 @@ class PlaybackCommandHandler:
         self._snapshot_debounce_s = snapshot_debounce_s
         self._snapshot_dirty = False
         self._snapshot_reasons: list[str] = []
+        # The last next-pointer item reported as being outside the queue, so
+        # the server following its autoplay list is logged once per track,
+        # not on every state echo.
+        self._outside_queue_logged: Optional[int] = None
         self._snapshot_task: Optional["asyncio.Task[None]"] = None
 
         # Store next track info for auto-advance (from SET_STATE nextQueueItem)
@@ -291,6 +295,7 @@ class PlaybackCommandHandler:
                     f"Next track stored: queueItemId={next_item.queueItemId}, "
                     f"trackId={next_item.trackId}"
                 )
+                await self._note_if_outside_queue(next_item.queueItemId, next_item.trackId)
         # else: nextQueueItem simply absent from this message — no signal
         # either way (see above); leave whatever's already stored as-is.
 
@@ -571,7 +576,23 @@ class PlaybackCommandHandler:
             return
         loaded = message.srvrCtrlAutoplayTracksLoaded
         await self._note_version(loaded)
-        logger.debug(f"Autoplay suggestions loaded: {len(loaded.tracks)} track(s)")
+        # Info, not debug: the server sends these after queue edits whether or not
+        # the app's autoplay setting is on (docs/queue-and-shuffle-wire-
+        # observations.md, O12/O20), and what plays after the last queue item
+        # follows from them — worth seeing in an ordinary log.
+        logger.info(f"Autoplay suggestions loaded: {len(loaded.tracks)} track(s)")
+
+    async def _note_if_outside_queue(self, queue_item_id: int, track_id: int) -> None:
+        """Log (once per item) when the server's next pointer names an item that
+        is not in the queue: it is following its autoplay list (O20)."""
+        if self._outside_queue_logged == queue_item_id:
+            return
+        if await self.queue.contains_item(queue_item_id) is False:
+            self._outside_queue_logged = queue_item_id
+            logger.info(
+                f"Next track {track_id} (item {queue_item_id}) is not in the queue: "
+                "the server is following its autoplay list"
+            )
 
     async def _note_version(self, payload: Any) -> None:
         """Record the queue version a message carries, if it has one."""

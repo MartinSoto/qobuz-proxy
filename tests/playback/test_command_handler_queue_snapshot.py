@@ -309,3 +309,66 @@ class TestSessionSettings:
         handler, _, _ = _handler()
 
         assert {96, 97, 102, 103} <= set(handler.get_message_types())
+
+
+class TestAutoplayVisibility:
+    """What the server feeds the renderer beyond the queue must be visible in
+    an ordinary (INFO) log: the suggestion lists and the next pointer leaving
+    the queue (O12, O20)."""
+
+    def _set_state_with_next(self, item_id: int) -> pb.QConnectMessage:
+        msg = pb.QConnectMessage()
+        msg.messageType = 41
+        msg.srvrRndrSetState.queueVersion.major = 3
+        msg.srvrRndrSetState.nextQueueItem.queueItemId = item_id
+        msg.srvrRndrSetState.nextQueueItem.trackId = 9000 + item_id
+        return msg
+
+    async def test_suggestions_are_logged_at_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        handler, _, _ = _handler()
+        msg = pb.QConnectMessage()
+        msg.messageType = 103
+        for i in (14, 15, 16):
+            ref = msg.srvrCtrlAutoplayTracksLoaded.tracks.add()
+            ref.queueItemId, ref.trackId = i, 1000 + i
+
+        with caplog.at_level(logging.INFO):
+            await handler.handle_message(103, msg)
+
+        assert "Autoplay suggestions loaded: 3 track(s)" in caplog.text
+
+    async def test_a_next_pointer_outside_the_queue_is_logged_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        handler, _, _ = _handler()
+        await handler._handle_queue_state(_snapshot_msg([1, 2, 3]))
+
+        with caplog.at_level(logging.INFO):
+            for _ in range(3):  # the server repeats the same next pointer every few seconds
+                await handler.handle_message(41, self._set_state_with_next(213))
+
+        assert (
+            caplog.text.count("is not in the queue: the server is following its autoplay list") == 1
+        )
+        assert "item 213" in caplog.text
+
+    async def test_a_next_pointer_inside_the_queue_is_not_reported(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        handler, _, _ = _handler()
+        await handler._handle_queue_state(_snapshot_msg([1, 2, 3]))
+
+        with caplog.at_level(logging.INFO):
+            await handler.handle_message(41, self._set_state_with_next(2))
+
+        assert "autoplay list" not in caplog.text
+
+    async def test_nothing_is_claimed_while_the_queue_is_not_known(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        handler, _, _ = _handler()  # no snapshot yet: membership is not trustworthy
+
+        with caplog.at_level(logging.INFO):
+            await handler.handle_message(41, self._set_state_with_next(213))
+
+        assert "autoplay list" not in caplog.text

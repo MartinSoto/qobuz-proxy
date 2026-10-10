@@ -438,6 +438,16 @@ class QobuzQueue:
         async with self._lock:
             return self._autoplay_mode
 
+    async def contains_item(self, queue_item_id: int) -> Optional[bool]:
+        """Whether the queue holds this item id, or None while the queue's
+        membership is not trustworthy yet (see QueueMembership). An id the
+        queue does not hold, named by the server as the next track, is an
+        autoplay track."""
+        async with self._lock:
+            if not self._membership.trustworthy:
+                return None
+            return queue_item_id in self._membership.by_item
+
     async def current_track_ids(self) -> Optional[frozenset[str]]:
         """The current queue's track ids, or None if membership isn't
         trustworthy yet (see QueueMembership) — the one consumer today is
