@@ -1077,3 +1077,58 @@ class TestRequestQueueState:
         assert await ws_manager.request_queue_state() is True
 
         assert ws.send.await_count == 1
+
+
+class TestAcknowledgedMessageTypes:
+    """Routine broadcasts nothing acts on are acknowledged quietly; a
+    genuinely unknown type still warns."""
+
+    @staticmethod
+    def _batch(msg_type: int) -> MagicMock:
+        msg = MagicMock()
+        msg.messageType = msg_type
+        batch = MagicMock()
+        batch.messages = [msg]
+        return batch
+
+    @pytest.mark.parametrize("msg_type", [82, 83, 100])
+    async def test_known_ignored_types_do_not_warn(
+        self, config: Config, caplog: pytest.LogCaptureFixture, msg_type: int
+    ) -> None:
+        ws_manager = WsManager(config)
+        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
+            return_value=self._batch(msg_type)
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await ws_manager._handle_payload(MagicMock(payload=b"x"))
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            "Ignoring" in r.getMessage() and r.levelno == logging.DEBUG for r in caplog.records
+        )
+
+    async def test_an_unknown_type_still_warns(
+        self, config: Config, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        ws_manager = WsManager(config)
+        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
+            return_value=self._batch(9999)
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await ws_manager._handle_payload(MagicMock(payload=b"x"))
+
+        assert "No handler for message type 9999" in caplog.text
+
+    async def test_a_registered_handler_wins_over_the_ignore_list(self, config: Config) -> None:
+        ws_manager = WsManager(config)
+        handler = MagicMock()
+        ws_manager._handlers[82] = handler
+        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
+            return_value=self._batch(82)
+        )
+
+        await ws_manager._handle_payload(MagicMock(payload=b"x"))
+
+        handler.assert_called_once()

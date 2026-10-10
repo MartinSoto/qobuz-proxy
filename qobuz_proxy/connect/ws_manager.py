@@ -130,6 +130,19 @@ _QUEUE_POSITION_MESSAGE_TYPES = {
     105: "SRVR_CTRL_QUEUE_VERSION_CHANGED",
 }
 
+# Controller-role broadcasts that arrive routinely and that nothing here has
+# any use for, acknowledged at debug level so they stop looking like a missing
+# handler: the server echoes every renderer's state report back to all
+# Controllers (82 — a heartbeat's worth every few seconds while playing),
+# announces renderers joining the session (83), and echoes our own file-quality
+# report (100). Anything not listed here and not handled still warns, which is
+# what keeps a genuinely new or unexpected message type visible.
+_ACKNOWLEDGED_MESSAGE_TYPES = {
+    82: "SRVR_CTRL_RENDERER_STATE_UPDATED",
+    83: "SRVR_CTRL_ADD_RENDERER",
+    100: "SRVR_CTRL_FILE_AUDIO_QUALITY_CHANGED",
+}
+
 # TEMP, investigative (2026-09-13) — a dedicated logger for the raw bytes
 # of every WS frame this proxy sends or receives, one line each, so a
 # capture from a real session can be diffed against a browser HAR of the
@@ -951,6 +964,8 @@ class WsManager:
                 # are easy to spot and inspect if/when they show up.
                 type_name = _QUEUE_POSITION_MESSAGE_TYPES[msg_type]
                 logger.info(f"Observed queue message {type_name} (type {msg_type}): {msg}")
+            elif msg_type in _ACKNOWLEDGED_MESSAGE_TYPES:
+                logger.debug(f"Ignoring {_ACKNOWLEDGED_MESSAGE_TYPES[msg_type]} (type {msg_type})")
             else:
                 logger.warning(f"No handler for message type {msg_type}: {msg}")
 
