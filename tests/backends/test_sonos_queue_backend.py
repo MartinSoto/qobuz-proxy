@@ -4,6 +4,8 @@ which entry the device plays. The device is a fake queue behind a real
 SonosClient subclass, so the whole play() path runs."""
 
 import asyncio
+
+import pytest
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlsplit
 
@@ -841,6 +843,12 @@ class TestEventsThatMissedAChange:
     """If the slow poll finds a change no event announced, the events cannot be
     relied on right now: poll closely and subscribe afresh."""
 
+    @pytest.fixture(autouse=True)
+    def _distrust_on(self, monkeypatch):  # type: ignore[no-untyped-def]
+        from qobuz_proxy.backends.dlna.sonos import queue_backend as module
+
+        monkeypatch.setattr(module, "DISTRUST_EVENTS_ON_MISS", True)
+
     def _slow(self):  # type: ignore[no-untyped-def]
         import time as _time
 
@@ -917,3 +925,21 @@ class TestEventsThatMissedAChange:
 
         assert order == ["wake", "follow"]
         assert backend._last_event_at > 0
+
+
+class TestMissedEventsOnlyLogged:
+    """While the events are being judged on their own, a miss is only logged."""
+
+    def test_nothing_changes_but_the_log(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        import logging
+        import time as _time
+
+        backend = SonosQueueBackend("10.0.0.5")
+        backend._polling_slowly = True
+        backend._last_event_at = _time.monotonic() - 60
+
+        with caplog.at_level(logging.WARNING):
+            backend._poll_observed("state")
+
+        assert backend._distrust_events_until == 0.0
+        assert "no event announced" in caplog.text

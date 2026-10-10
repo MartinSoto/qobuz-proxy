@@ -66,6 +66,9 @@ SAFETY_NET_POLL_INTERVAL_SECONDS = 10.0
 # by an event within this long; if not, the events are distrusted for a while.
 EVENT_ANNOUNCE_WINDOW_SECONDS = 5.0
 EVENT_DISTRUST_SECONDS = 300.0
+# Whether such a miss makes the poll go back to 2 s (and subscribe afresh), or is
+# only logged so the events can be judged on their own.
+DISTRUST_EVENTS_ON_MISS = False
 # A NOTIFY is answered once its handler is done: never keep the device waiting
 # longer than this on following an entry.
 EVENT_HANDLING_TIMEOUT_SECONDS = 5.0
@@ -260,6 +263,12 @@ class SonosQueueBackend(SonosBackend):
             return
         now = time.monotonic()
         if now - self._last_event_at <= EVENT_ANNOUNCE_WINDOW_SECONDS:
+            return
+        if not DISTRUST_EVENTS_ON_MISS:
+            logger.warning(
+                f"[{self.name}] the poll noticed a {kind} change no event announced "
+                f"(last event {now - self._last_event_at:.0f}s ago)"
+            )
             return
         logger.warning(
             f"[{self.name}] the poll noticed a {kind} change no event announced: "
