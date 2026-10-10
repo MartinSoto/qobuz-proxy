@@ -795,3 +795,21 @@ and every decision in it are exactly as before, so nothing relies on cached
 event data. Measured numbers (SOAP calls per minute playing, reaction times)
 were not taken on hardware because every room was in use at the time; the
 production run is the check, and the revert is one line (`_poll_interval`).
+
+### 11.8 A queue re-sent unchanged (2026-10-10)
+
+Live failure after a rejoin: the phone grabbed the active renderer and re-sent
+the same 14-track queue five times within a second (majors 72 to 76), then
+handed the renderer back. Every entry the device held (`v=71`) became stale at
+once, so after a Play the device ran through the whole queue skipping each
+entry (410) while the proxy reported every step, and the proxy kept reporting
+an autoplay item id (259) that the server no longer knew ("Current track not
+found in queue nor autoplay") every 5 s, so the app lost the time. Fix for the
+first half: `QobuzQueue.same_generation()`; a major bump whose snapshot carries
+exactly the previous items (ids and tracks) makes the earlier majors aliases,
+so their URLs are served and the published queue stays current; a queue that
+differs makes them stale as before. Hardware check on Cocina: identical re-send,
+the device went on into the next entry normally; different content, the entries
+were refused and it landed stopped on the first. Still open: an autoplay item
+the server forgot after a reload (its ids are regenerated) is not found by id;
+the proxy keeps reporting it.
