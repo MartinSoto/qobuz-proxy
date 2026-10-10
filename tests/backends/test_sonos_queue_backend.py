@@ -4,6 +4,7 @@ which entry the device plays. The device is a fake queue behind a real
 SonosClient subclass, so the whole play() path runs."""
 
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import urlsplit
 
 from qobuz_proxy.backends.dlna.capabilities import DLNACapabilities, QOBUZ_QUALITY_CD
 from qobuz_proxy.backends.dlna.sonos.audio_url import EntryKey, parse_entry_url
@@ -494,6 +495,28 @@ class TestAutoplayTail:
         await settled(backend)
 
         assert keys_on(client) == K(10, 11)
+
+
+class TestOwnUrls:
+    async def test_an_entry_naming_another_rooms_proxy_port_is_still_ours(self) -> None:
+        backend, client, _ = await make([1, 2])
+        await backend.play(meta(1))
+        await settled(backend)
+        url = client.device.urls[0]
+        own_port = urlsplit(backend._proxy_server.base_url).port
+        other = url.replace(f":{own_port}/", f":{(own_port or 0) + 3}/")
+        assert other != url
+
+        assert backend._is_own_proxy_url(url)
+        assert backend._is_own_proxy_url(other)
+
+    async def test_foreign_urls_are_not(self) -> None:
+        backend, _, _ = await make([1])
+        host = urlsplit(backend._proxy_server.base_url).hostname
+
+        assert not backend._is_own_proxy_url("http://elsewhere:7120/audio/1?x=1")
+        assert not backend._is_own_proxy_url(f"http://{host}:7120/other/1")
+        assert not backend._is_own_proxy_url("x-rincon-queue:RINCON_1#0")
 
 
 class TestCarryingOn:

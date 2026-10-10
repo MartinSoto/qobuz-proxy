@@ -19,6 +19,7 @@ import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlsplit
 
 from qobuz_proxy.backends.types import (
     AdoptedPlayback,
@@ -77,6 +78,21 @@ class SonosQueueBackend(SonosBackend):
     def supports_gapless(self) -> bool:
         """The device advances through its own queue; nothing is armed."""
         return False
+
+    def _is_own_proxy_url(self, uri: str) -> bool:
+        """Any of our entries, whichever room's proxy port it names: the ports
+        are handed out in the order the rooms come up, so after a restart an
+        entry the device holds can name a port another room has now (any of
+        our proxies serves it, the URL says everything the stream needs)."""
+        proxy = self._proxy_server
+        if proxy is None:
+            return False
+        ours, theirs = urlsplit(proxy.base_url), urlsplit(uri)
+        return (
+            theirs.scheme == ours.scheme
+            and theirs.hostname == ours.hostname
+            and theirs.path.startswith("/audio/")
+        )
 
     @property
     def keeps_playing_on_shutdown(self) -> bool:
