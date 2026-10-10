@@ -488,6 +488,44 @@ class TestReceiveLoopIdleShutdown:
         assert task.done() is False
         task.cancel()
 
+    async def test_does_not_raise_for_a_freshly_connected_socket(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        """Regression for a live 2026-09-16 case: a device that had sat
+        paused long enough to already exceed Player's cumulative idle
+        window (is_worth_keeping_alive() == False) got its WS closed by
+        this check within about a second of the app freshly reconnecting
+        — before the app had any chance to do anything with it, which
+        looked indistinguishable from the proxy rejecting the connection
+        outright. _connected_at (set once _connect_and_run finishes
+        authenticating) must hold this check off until
+        MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS has actually passed,
+        even though is_worth_keeping_alive() already says False."""
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+        ws_manager._ws = self._make_timing_out_ws()
+        ws_manager._connected_at = time.monotonic()
+
+        task = asyncio.create_task(ws_manager._receive_loop())
+        await asyncio.sleep(0.05)
+        assert task.done() is False
+        task.cancel()
+
+    async def test_raises_once_a_freshly_connected_socket_ages_past_the_grace_period(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+        ws_manager._ws = self._make_timing_out_ws()
+        ws_manager._connected_at = (
+            time.monotonic() - ws_manager_module.MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS
+        )
+
+        with pytest.raises(IdleShutdownRequired):
+            await ws_manager._receive_loop()
+
     async def test_token_expiry_takes_priority_over_idle_shutdown(self, config: Config) -> None:
         """Both conditions can be true on the same tick (a long-expired
         token on a connection that also happens to be idle) —

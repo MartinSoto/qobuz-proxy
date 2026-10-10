@@ -42,6 +42,25 @@ SELF_REFRESH_RETRY_SECONDS = 30.0
 # normal reconnect cycle resume — see its docstring.
 HIJACK_RECONNECT_HOLD_SECONDS = 8.0
 
+# Minimum age a connection must reach before the receive loop's proactive
+# idle-close (see IdleShutdownRequired) is allowed to fire. Player.
+# is_worth_keeping_ws_alive() tracks *cumulative* non-playing time since
+# playback last actually ran — it is never reset just because the app
+# handed over a fresh session (only a transition to PLAYING resets it; see
+# that method's own docstring). So once a device has sat paused for longer
+# than its idle window in total, a brand new connection the app just
+# opened would otherwise already read as "not worth keeping" on the very
+# first RECV_TIMEOUT tick and get closed within about a second of
+# connecting — before the app can receive state or send anything at all.
+# From the app's side this looks indistinguishable from the proxy
+# rejecting the connection outright (confirmed live 2026-09-16: connect,
+# fully authenticate, then self-close ~1.1s later). This grace period
+# gives a freshly (re)established connection a real window to be used —
+# e.g. for the app to resume playback, which flips
+# is_worth_keeping_ws_alive() back to True — before the idle-close check
+# is honored again.
+MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS = 30.0
+
 # A SRVR_CTRL_ADD_RENDERER entry for a Sonos-backed speaker used to never
 # get reaped once its WS connection ended (2026-09-12 investigation,
 # against a real household): a plain graceful close and an explicit
@@ -198,6 +217,9 @@ class WsManager:
         self._session_uuid: Optional[bytes] = None
         self._is_connected = False
         self._should_run = False
+        # monotonic() timestamp of when the current connection finished
+        # authenticating — see MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS.
+        self._connected_at: Optional[float] = None
 
         # Reconnection state
         self._reconnect_delay = INITIAL_RECONNECT_DELAY
@@ -668,6 +690,7 @@ class WsManager:
                 await self._send_ask_for_queue_state()
 
                 self._is_connected = True
+                self._connected_at = time.monotonic()
                 self._reconnect_delay = INITIAL_RECONNECT_DELAY  # Reset backoff
                 logger.info("Connected and authenticated")
 
@@ -690,6 +713,7 @@ class WsManager:
         finally:
             self._is_connected = False
             self._ws = None
+            self._connected_at = None
 
     async def _authenticate(self) -> bool:
         """Send AUTHENTICATE message."""
@@ -839,7 +863,16 @@ class WsManager:
                 # already stops a *new* connection from opening in the same
                 # situation, so this is purely about tearing down one that's
                 # already open and no longer earning its keep.
-                if self._is_worth_keeping_alive is not None and not self._is_worth_keeping_alive():
+                connection_age = (
+                    time.monotonic() - self._connected_at
+                    if self._connected_at is not None
+                    else MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS
+                )
+                if (
+                    self._is_worth_keeping_alive is not None
+                    and not self._is_worth_keeping_alive()
+                    and connection_age >= MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS
+                ):
                     logger.info(
                         "Playback idle past the keep-alive window — closing the "
                         "control WebSocket ourselves instead of holding it open unused"
