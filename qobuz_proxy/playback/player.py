@@ -982,6 +982,7 @@ class QobuzPlayer:
         position_ms: Optional[int],
         playing_state: Optional[int],
         context_uuid: Optional[bytes] = None,
+        force_reload: bool = False,
     ) -> None:
         """Apply a full SET_STATE intent from the app atomically.
 
@@ -1002,6 +1003,12 @@ class QobuzPlayer:
                 or None if the message had no playingState.
             context_uuid: Album/playlist context bytes for the target track, used
                 for play reporting (listening history / scrobbles).
+            force_reload: Load the track even if it is already the current one.
+                Set for an explicit queue load (QUEUE_TRACKS_LOADED): a load
+                starts a new queue generation, the stream URL the device
+                holds for the playing track belongs to the previous one
+                (the Sonos proxy refuses those, see QobuzQueue.generation)
+                and the app expects a tapped track to restart anyway.
         """
         # Detect a stale session-restore snapshot (server replays an old
         # PAUSED position after a reconnect while we're still playing). Done
@@ -1026,7 +1033,7 @@ class QobuzPlayer:
         loaded_new_track = False
         if track_id is not None:
             cur = self._current_track
-            if cur is None or cur.track_id != track_id:
+            if cur is None or cur.track_id != track_id or force_reload:
                 if self._superseded_by_newer_command():
                     # A newer coalescible command is already queued right
                     # behind this one (see enqueue()) — e.g. a burst of

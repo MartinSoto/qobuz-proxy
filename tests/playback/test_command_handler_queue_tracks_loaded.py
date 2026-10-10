@@ -56,6 +56,20 @@ class TestQueueTracksLoadedPlaysSelectedTrack:
         assert backend.played == ["3002"]
         assert player.state == PlaybackState.PLAYING
 
+    async def test_loading_the_track_already_playing_republishes_it(self) -> None:
+        """A load starts a new queue generation; the device must get the
+        current track again (new stream URL), not just a seek back to 0 —
+        its old URL belongs to the previous generation."""
+        player, backend = _make_player()
+        player._is_active_renderer = True
+        handler = PlaybackCommandHandler(player)
+        tracks = [(0, 3001), (1, 3002)]
+
+        await handler._handle_queue_tracks_loaded(_queue_tracks_loaded_msg(tracks=tracks))
+        await handler._handle_queue_tracks_loaded(_queue_tracks_loaded_msg(tracks=tracks))
+
+        assert backend.played == ["3001", "3001"]
+
     async def test_absent_queue_position_defaults_to_the_first_track(self) -> None:
         """queuePosition absent from the message reads as 0 — matches the
         server's own convention (confirmed live: the first

@@ -407,6 +407,10 @@ class PlaybackCommandHandler:
             position_ms=0,
             playing_state=_PLAYING_STATE_PLAYING,
             context_uuid=context_uuid,
+            # An explicit load starts a new queue generation: even if it
+            # names the track already playing, that track must be republished
+            # under the new generation, not just seeked back to 0.
+            force_reload=True,
         )
 
         # Populate next-track info for gapless, the same way a SET_STATE's
