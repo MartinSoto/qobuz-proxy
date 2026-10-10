@@ -148,7 +148,8 @@ The Sonos URL becomes
   `get_tracks_audio_info`) returned 15 of 15 tracks in one call with title,
   performer, album title and cover art, duration, `maximum_sampling_rate`,
   `maximum_bit_depth` and `hires_streamable` — everything DIDL-Lite and the
-  container rule need. The maximum ids per call is unknown (Phase 1 checks it).
+  container rule need. **At most 50 ids per call** (51 returns HTTP 400, measured in Phase 1), so a
+  1000-track queue is 20 calls.
 - DIDL `res` attributes `sampleFrequency`/`bitsPerSample` can be omitted: on the
   Sonos One the seek offset comes from the WAV header, not the DIDL (9.2). The
   repo's DIDL builder still documents that a renderer trusting wrong values
@@ -255,8 +256,8 @@ path keeps all of it.
   is the only defense, so its latency and failure handling matter.
 - **Retarget and coordinator handover** replay the whole queue onto a new
   device (the existing retarget path was written around the current one-track-plus-next model).
-- **Metadata volume** for large playlists: one `track/getList` call returned
-  15 tracks; the per-call maximum is not yet known (Phase 1).
+- **Metadata volume** for large playlists: `track/getList` takes at most 50
+  ids per call (20 calls for 1000 tracks, about 0.5 s each).
 - **Publish-time container prediction** can disagree with what the stream
   turns out to be only in the safe direction (a `wav` entry can transcode
   anything; a `flac` entry is published only when every tier fits), but a
@@ -419,6 +420,39 @@ Audio was a 3 %-amplitude 220 Hz WAV at volume 8.
   (group reshuffle, Baño taking over): not tested, since it would change the
   household's groups.
 - An **audible** gap check across mixed entries (the spike ran muted).
-- How many ids `track/getList` accepts per call (Phase 1).
 - A queue beyond 5008 entries (no limit found; likely irrelevant).
 - Behavior with a real, long playlist end to end (Phases 3–5).
+
+## 10. Progress
+
+### Phase 1 — protocol and queue model (2026-10-10)
+Done, each as its own commit, with tests (1175 passing; ruff clean; mypy at its
+pre-existing 79 errors, none in the touched code):
+- `0c09493` **proto fix**: `SrvrCtrlAutoplayModeSet` is `{queueVersion=1,
+  actionUuid=2, autoplayOn=3, flag=4}`; `SrvrCtrlShuffleModeSet` field 4 is the
+  shuffle seed, not an item id. Only `qconnect_payload_pb2.py` regenerated.
+- `5439c04` **ordered queue model**: `QobuzQueue` keeps the original order and
+  the server's shuffled indexes from full snapshots (`QueueOrder`); deltas keep
+  membership current and mark the order stale. Replay tests use the real index
+  lists of the capture (O16, O19).
+- `ddfea70` **handlers**: type 90 snapshots applied (with the shuffled order);
+  every edit (92–95) and shuffle toggle (96) triggers a debounced (150 ms)
+  `AskForQueueState` via the new `WsManager.request_queue_state()`; type 97
+  repeat now reaches the Player after connect for every backend (it was
+  ignored, O10); 102 and 103 handled; the TEMP diagnostic is gone.
+- `384b52a` **repeat-one on the gapless path**: no next track is armed while
+  repeat-one is on, an armed one is cleared when it is switched on and re-armed
+  when it is switched off (O11).
+- Measured: `track/getList` takes 50 ids per call.
+
+Not done, deliberately:
+- **Decision 3's "follow a snapshot with a higher major while active"** is not
+  implemented. Interpreted literally it would also fire when a reconnect hands
+  us a restored session (our own connect-time ask returns the restored queue at
+  a higher major than our empty model), which would start playback unasked.
+  The narrow, safe variant that fixes the first-load hang (O3) is: act only when
+  the model's previous snapshot was **empty** (or the version still 0) and a
+  non-empty one arrives with a higher major while we are the active renderer and
+  idle; log every other higher-major snapshot. Needs confirmation before it is
+  built; it changes playback start for all backends.
+- No change to Sonos playback yet; that starts in Phase 2.
