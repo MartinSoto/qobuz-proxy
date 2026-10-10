@@ -25,6 +25,9 @@ BufferStatusCallback = Callable[[BufferStatus], None]
 TrackEndedCallback = Callable[[], None]
 PlaybackErrorCallback = Callable[[str], None]  # error_message
 NextTrackStartedCallback = Callable[[], None]
+# The device moved on to another queue entry by itself: (track id, queue item id,
+# what was resolved for it, if known). See AudioBackend.on_item_changed.
+ItemChangedCallback = Callable[[str, int, Optional[PlayResult]], None]
 ExternalTakeoverCallback = Callable[[], None]
 VolumeUpdateCallback = Callable[[int], None]  # volume (0-100)
 
@@ -63,6 +66,7 @@ class AudioBackend(ABC):
         self._on_track_ended: Optional[TrackEndedCallback] = None
         self._on_playback_error: Optional[PlaybackErrorCallback] = None
         self._on_next_track_started: Optional[NextTrackStartedCallback] = None
+        self._on_item_changed: Optional[ItemChangedCallback] = None
         self._on_external_takeover: Optional[ExternalTakeoverCallback] = None
         self._on_volume_update: Optional[VolumeUpdateCallback] = None
 
@@ -201,6 +205,25 @@ class AudioBackend(ABC):
     def on_next_track_started(self, callback: Optional[NextTrackStartedCallback]) -> None:
         """Register callback for gapless transition events."""
         self._on_next_track_started = callback
+
+    # =========================================================================
+    # Queue handover - Optional
+    # =========================================================================
+
+    def on_item_changed(self, callback: Optional[ItemChangedCallback]) -> None:
+        """Register callback for the device advancing to another entry of the
+        queue it holds, on its own (a natural transition, a skipped entry, a
+        wrap-around). Default: never fired — only a backend that hands the
+        whole queue to the device (see SonosQueueBackend) has anything to
+        report; every other backend sequences the queue itself."""
+        self._on_item_changed = callback
+
+    async def queue_changed(self) -> None:
+        """The Qobuz queue's order or contents changed within the queue
+        generation the backend was loaded with (an edit, a shuffle toggle).
+        A backend that holds the queue on the device brings it up to date;
+        default: nothing to do."""
+        return None
 
     # =========================================================================
     # Lifecycle - Required
@@ -374,6 +397,16 @@ class AudioBackend(ABC):
                 self._on_next_track_started()
             except Exception as e:
                 logger.error(f"Next track started callback error: {e}")
+
+    def _notify_item_changed(
+        self, track_id: str, queue_item_id: int, result: Optional[PlayResult] = None
+    ) -> None:
+        """Notify listeners that the device moved on to another queue entry."""
+        if self._on_item_changed:
+            try:
+                self._on_item_changed(track_id, queue_item_id, result)
+            except Exception as e:
+                logger.error(f"Item changed callback error: {e}")
 
     def _notify_external_takeover(self) -> None:
         """Notify listeners that another source has taken over this renderer."""

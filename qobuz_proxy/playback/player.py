@@ -14,6 +14,7 @@ from qobuz_proxy.backends import (
     AudioBackend,
     BackendTrackMetadata,
     PlaybackState,
+    PlayResult,
     BufferStatus,
 )
 from .queue import QobuzQueue, QueueTrack, RepeatMode
@@ -320,6 +321,7 @@ class QobuzPlayer:
         self.backend.on_playback_error(self._on_playback_error)
         self.backend.on_position_update(self._on_position_update)
         self.backend.on_next_track_started(self._on_next_track_started)
+        self.backend.on_item_changed(self._on_item_changed)
         self.backend.on_state_change(self._on_state_change)
         self.backend.on_external_takeover(self._on_external_takeover)
         self.backend.on_volume_update(self._on_volume_update)
@@ -2152,6 +2154,69 @@ class QobuzPlayer:
 
         # Try to arm the next next track
         await self._prepare_next_track_for_gapless()
+
+    def _on_item_changed(
+        self, track_id: str, queue_item_id: int, result: Optional[PlayResult]
+    ) -> None:
+        """Callback when the device moved on to another entry of the queue it
+        holds (queue handover, see SonosQueueBackend). Enqueued like a gapless
+        transition and for the same reason: it already happened on the device,
+        so only bookkeeping is left, and it must be ordered against whatever
+        else is driving playback."""
+        self.enqueue(functools.partial(self._handle_item_changed, track_id, queue_item_id, result))
+
+    async def _handle_item_changed(
+        self, track_id: str, queue_item_id: int, result: Optional[PlayResult]
+    ) -> None:
+        """The device is playing another queue entry than the one we have as
+        current: adopt it (no stop/start cycle) and report it, the way a
+        gapless transition is reported."""
+        previous = self._current_track
+        if (
+            previous is not None
+            and previous.track_id == track_id
+            and previous.queue_item_id == queue_item_id
+        ):
+            return  # already the current track (e.g. the device confirmed our own load)
+
+        logger.info(f"Device moved on to track {track_id} (queue item {queue_item_id})")
+        meta = await self._get_track_metadata(track_id)
+        track = QueueTrack(
+            queue_item_id=queue_item_id,
+            track_id=track_id,
+            # Entries of one queue load share their context (album/playlist);
+            # the previous track's is the best available guess for this one.
+            context_uuid=previous.context_uuid if previous else None,
+            metadata=meta or {},
+            duration_ms=meta.get("duration_ms", 0) if meta else 0,
+        )
+        if result is not None:
+            self.queue.set_track_stream_info(track, result.blob, result.format_id)
+        self._current_track = track
+        self._current_duration_ms = track.duration_ms
+        self._position_value_ms = 0
+        self._position_timestamp_ms = int(time.time() * 1000)
+
+        # Anything armed or remembered as "next" belonged to the old position.
+        self._transition_generation += 1
+        self._gapless_armed = False
+        self._pending_next_track = None
+        if self._clear_next_track_callback:
+            self._clear_next_track_callback()
+
+        if self._file_quality_report_callback and track.actual_quality and self._is_active_renderer:
+            await self._file_quality_report_callback(track.actual_quality)
+        await self._report_playing()
+        await self._send_state_update()
+
+    async def on_queue_changed(self) -> None:
+        """The Qobuz queue's order or contents changed (a snapshot after an
+        edit or shuffle toggle): let the backend bring the device's copy up to
+        date. Never raises into the message handler that called it."""
+        try:
+            await self.backend.queue_changed()
+        except Exception as e:
+            logger.warning(f"Backend could not follow the queue change: {e}")
 
     async def on_next_track_info_changed(self) -> None:
         """Called when command handler reports the next track info has changed."""

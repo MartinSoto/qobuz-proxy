@@ -136,6 +136,10 @@ class PlaybackCommandHandler:
         # Callback when next track info changes (for gapless re-arming)
         self._on_next_track_changed: Optional[Callable[[], Awaitable[None]]] = None
 
+        # Callback when a snapshot changed the queue (a backend that holds the
+        # whole queue on the device brings its copy up to date)
+        self._on_queue_changed: Optional[Callable[[], Awaitable[None]]] = None
+
     def get_message_types(self) -> list[int]:
         """Get list of message types this handler processes."""
         return [
@@ -448,6 +452,11 @@ class PlaybackCommandHandler:
         """Clear the stored next track info after it's been used."""
         self._next_track_info = None
 
+    def set_on_queue_changed(self, callback: Optional[Callable[[], Awaitable[None]]]) -> None:
+        """Set callback for when a queue snapshot has been applied (see
+        _handle_queue_state): the queue's order or contents may have changed."""
+        self._on_queue_changed = callback
+
     def set_on_next_track_changed(self, callback: Optional[Callable[[], Awaitable[None]]]) -> None:
         """Set callback for when next track info changes (for gapless re-arming)."""
         self._on_next_track_changed = callback
@@ -474,6 +483,8 @@ class PlaybackCommandHandler:
             f"version {state.queueVersion.major}.{state.queueVersion.minor}, "
             f"shuffle {'on' if shuffled else 'off'}"
         )
+        if self._on_queue_changed:
+            await self._on_queue_changed()
 
     async def _handle_queue_tracks_added(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksAdded (type 93) — a genuine

@@ -7,6 +7,7 @@ Provides abstract interface and factory for audio output backends.
 from .base import (
     AudioBackend,
     BufferStatusCallback,
+    ItemChangedCallback,
     NextTrackStartedCallback,
     PlaybackErrorCallback,
     PositionUpdateCallback,
@@ -51,6 +52,7 @@ __all__ = [
     "AudioBackend",
     # Callback types
     "BufferStatusCallback",
+    "ItemChangedCallback",
     "NextTrackStartedCallback",
     "PlaybackErrorCallback",
     "PositionUpdateCallback",

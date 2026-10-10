@@ -372,3 +372,29 @@ class TestAutoplayVisibility:
             await handler.handle_message(41, self._set_state_with_next(213))
 
         assert "autoplay list" not in caplog.text
+
+
+class TestQueueChangedCallback:
+    async def test_a_snapshot_tells_the_owner_the_queue_may_have_changed(self) -> None:
+        handler, _, _ = _handler()
+        changed = AsyncMock()
+        handler.set_on_queue_changed(changed)
+
+        await handler._handle_queue_state(_snapshot_msg([1, 2, 3]))
+
+        changed.assert_awaited_once()
+
+    async def test_edits_alone_do_not(self) -> None:
+        """The snapshot requested after an edit is what carries the new order."""
+        handler, _, _ = _handler()
+        changed = AsyncMock()
+        handler.set_on_queue_changed(changed)
+
+        await handler._handle_queue_tracks_added(_edit_msg("added"))
+
+        changed.assert_not_awaited()
+
+    async def test_no_callback_is_fine(self) -> None:
+        handler, _, _ = _handler()
+
+        await handler._handle_queue_state(_snapshot_msg([1]))  # must not raise

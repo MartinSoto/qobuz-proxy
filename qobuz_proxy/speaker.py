@@ -654,6 +654,10 @@ class Speaker:
                     self._player.on_next_track_info_changed
                 )
 
+                # A snapshot after a queue edit or shuffle toggle: a backend that
+                # holds the whole queue on the device brings it up to date.
+                self._playback_handler.set_on_queue_changed(self._player.on_queue_changed)
+
                 # Register all message-type handlers. Each dispatch is
                 # enqueued on the player's command queue rather than
                 # spawned as its own bare task — a single consumer running

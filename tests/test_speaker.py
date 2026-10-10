@@ -548,6 +548,7 @@ class TestSpeakerWebSocket:
 
         assert speaker._playback_handler is not None
         assert speaker._playback_handler._request_queue_state is mock_ws.request_queue_state
+        assert speaker._playback_handler._on_queue_changed is player.on_queue_changed
 
     async def test_setup_websocket_records_the_session_on_the_queue(self):
         """Stream URLs are tagged with the session (QobuzQueue.generation)."""
