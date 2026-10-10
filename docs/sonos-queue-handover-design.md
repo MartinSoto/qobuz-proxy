@@ -779,3 +779,19 @@ device plays (entry, position, state) and reports it, settling on stopped only
 if nothing of ours plays there. Hardware check on Cocina (detach, the device
 moves on by itself to the next entry, retarget): the player went `LOADING` ->
 `PLAYING` on the entry the device was on now.
+
+### 11.7 E3/E4 (2026-10-10)
+
+Switched on in full for the handover backend: besides the AVTransport events a
+room subscribes to its coordinator's `GroupRenderingControl` (volume and mute
+changes wake the loop like transport events; the loop's own volume read then
+reports them). While both streams are `healthy` (the first event arrived on the
+subscription) and nothing is in flux (`SonosQueueBackend._events_settled`: no
+stop, seek or retarget awaiting confirmation, no unresolved takeover, past the
+5 s start grace) `_poll_interval()` is 10 s instead of 2 s; a backed-off or idle
+interval is left as it is, and any unhealthy stream, lapsed subscription or
+unsubscribable device brings the 2 s poll back by itself. The reads in a cycle
+and every decision in it are exactly as before, so nothing relies on cached
+event data. Measured numbers (SOAP calls per minute playing, reaction times)
+were not taken on hardware because every room was in use at the time; the
+production run is the check, and the revert is one line (`_poll_interval`).
