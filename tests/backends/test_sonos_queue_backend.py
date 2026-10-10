@@ -771,3 +771,66 @@ class TestSafetyNetPolling:
         await backend._on_volume_event(GroupVolumeEvent(volume=20))
 
         backend.wake_poll.assert_called_once()
+
+
+class TestEntryFromEvents:
+    """The entry an event names is followed at once, not at the next cycle."""
+
+    async def _playing(self):  # type: ignore[no-untyped-def]
+        backend, client, _ = await make([1, 2, 3])
+        await backend.play(meta(1))
+        await settled(backend)
+        backend._current_track_confirmed = True
+        changed: list[tuple[str, int]] = []
+        backend.on_item_changed(lambda track, item, result: changed.append((track, item)))
+        backend.wake_poll = MagicMock()  # type: ignore[method-assign]
+        return backend, client, changed
+
+    async def test_a_transitioning_event_naming_another_entry_is_followed_at_once(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos.transport_events import TransportEvent
+
+        backend, client, changed = await self._playing()
+
+        await backend._on_transport_event(
+            TransportEvent(transport_state="TRANSITIONING", current_track_uri=client.device.urls[2])
+        )
+
+        assert changed == [("3", 3)]
+        backend.wake_poll.assert_not_called()  # the PLAYING event behind it wakes the loop
+
+    async def test_the_entry_we_are_on_is_not_a_change(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos.transport_events import TransportEvent
+
+        backend, client, changed = await self._playing()
+
+        await backend._on_transport_event(
+            TransportEvent(transport_state="PLAYING", current_track_uri=client.device.urls[0])
+        )
+
+        assert changed == []
+
+    async def test_a_stopped_device_landing_on_the_first_entry_is_not_the_device_moving_on(
+        self,
+    ) -> None:
+        from qobuz_proxy.backends.dlna.sonos.transport_events import TransportEvent
+
+        backend, client, changed = await self._playing()
+        backend._current_key = EntryKey("3", 3)  # the last entry was playing
+
+        await backend._on_transport_event(
+            TransportEvent(transport_state="STOPPED", current_track_uri=client.device.urls[0])
+        )
+
+        assert changed == []
+
+    async def test_an_event_arriving_before_the_device_confirmed_our_entry_is_ignored(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos.transport_events import TransportEvent
+
+        backend, client, changed = await self._playing()
+        backend._current_track_confirmed = False  # we just switched; the old entry may still show
+
+        await backend._on_transport_event(
+            TransportEvent(transport_state="PLAYING", current_track_uri=client.device.urls[1])
+        )
+
+        assert changed == []

@@ -64,6 +64,10 @@ _STALE_SNAPSHOT_THRESHOLD_MS = 5000
 # after a transition even once it's normally trustworthy.
 _RECONNECT_STALE_GRACE_SECONDS = 5.0
 
+# A polled position this far from where the interpolated clock says the track
+# should be is a seek, not drift (RelTime has one-second resolution).
+_POSITION_JUMP_MS = 2500
+
 # How long after claiming the device the first replayed state may still be
 # answered by carrying on with what the device is already playing.
 _ADOPTION_WINDOW_SECONDS = 30.0
@@ -2139,7 +2143,17 @@ class QobuzPlayer:
         bare task, so it runs properly ordered against everything else
         driving playback instead of racing it — see enqueue().
         """
+        # A position that is not where the clock says it should be is a seek
+        # made elsewhere (the Sonos app): tell the app now, not at the next
+        # heartbeat (up to 5 s later).
+        jumped = (
+            self._state == PlaybackState.PLAYING
+            and self._current_track is not None
+            and abs(position_ms - self.current_position_ms) > _POSITION_JUMP_MS
+        )
         self._set_position(position_ms)
+        if jumped:
+            self.enqueue(self._send_state_update)
         if not self._gapless_armed:
             self.enqueue(self._prepare_next_track_for_gapless)
 
@@ -2399,6 +2413,11 @@ class QobuzPlayer:
         self._pending_next_track = None
         if self._clear_next_track_callback:
             self._clear_next_track_callback()
+
+        if self._state == PlaybackState.LOADING and self._intended_playing:
+            # The device is between entries (TRANSITIONING) and was playing: the
+            # app must not be told "stopped" for the instant it takes.
+            self._state = PlaybackState.PLAYING
 
         if self._file_quality_report_callback and track.actual_quality and self._is_active_renderer:
             await self._file_quality_report_callback(track.actual_quality)

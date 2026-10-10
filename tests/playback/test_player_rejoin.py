@@ -300,3 +300,43 @@ class TestHandoffOfADeviceThatKeepsPlaying:
 
         backend.adopt.assert_not_called()
         assert player._state == PlaybackState.LOADING
+
+
+class TestSeekAndTrackChangeFromTheSonosSide:
+    async def test_a_position_that_jumps_is_reported_at_once(self) -> None:
+        player, _ = _playing_player()
+        player.enqueue = lambda fn, **k: calls.append(fn)  # type: ignore[method-assign, assignment]
+        calls: list = []
+
+        player._on_position_update(player.current_position_ms + 120_000)  # a seek forward
+
+        assert player._send_state_update in calls
+
+    async def test_ordinary_drift_is_not_a_jump(self) -> None:
+        player, _ = _playing_player()
+        calls: list = []
+        player.enqueue = lambda fn, **k: calls.append(fn)  # type: ignore[method-assign, assignment]
+
+        player._on_position_update(player.current_position_ms + 900)
+
+        assert player._send_state_update not in calls
+
+    async def test_a_position_while_not_playing_is_not_a_jump(self) -> None:
+        player, _ = _playing_player()
+        player._state = PlaybackState.PAUSED
+        calls: list = []
+        player.enqueue = lambda fn, **k: calls.append(fn)  # type: ignore[method-assign, assignment]
+
+        player._on_position_update(player.current_position_ms + 120_000)
+
+        assert player._send_state_update not in calls
+
+    async def test_the_app_is_not_told_stopped_while_the_device_moves_between_entries(self) -> None:
+        player, _ = _playing_player()
+        player._get_track_metadata = AsyncMock(return_value={"duration_ms": 1000})  # type: ignore[method-assign]
+        player._intended_playing = True
+        player._state = PlaybackState.LOADING  # TRANSITIONING seen by the poll
+
+        await player._handle_item_changed("444", 4, None)
+
+        assert player._state == PlaybackState.PLAYING

@@ -238,6 +238,13 @@ class SonosQueueBackend(SonosBackend):
     async def _on_transport_event(self, event: TransportEvent) -> None:
         """The device says something changed: look now rather than at the next
         tick. What it changed is read the usual way (see _poll_state_loop)."""
+        if event.current_track_uri and event.transport_state in ("PLAYING", "TRANSITIONING"):
+            # The event names the entry the device is on: no need to wait for the
+            # cycle (a sudden track change reaches the app ~0.75 s earlier than
+            # through the PLAYING event that follows it). Only while playing, like
+            # the poll: a STOPPED device names the first entry it landed back on
+            # at the end of the queue, which is not the device moving on.
+            await self._observe_polled_uri(event.current_track_uri)
         if event.transport_state == "TRANSITIONING":
             # The device is between entries and says nothing yet: a cycle now
             # would read the same, and its spacing would then hold back the
