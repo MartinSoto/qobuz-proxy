@@ -456,3 +456,38 @@ Not done, deliberately:
   idle; log every other higher-major snapshot. Needs confirmation before it is
   built; it changes playback start for all backends.
 - No change to Sonos playback yet; that starts in Phase 2.
+
+### Phase 2 — URLs and proxy (2026-10-10)
+Done, each as its own commit, 1240 tests passing:
+- `38eb2b7` **generation-tagged URLs, 410 for stale ones**: every Sonos proxy
+  URL carries `&s=<session tag>&v=<major version>&i=<queue item id>` (the
+  existing `format`/`depth`/`rate`/`item` parameters are unchanged). A request
+  naming an earlier generation gets 410, which the device requests once and
+  skips (9.2). Not stale: minor bumps (shuffle, edits, autoplay), URLs without
+  `s`/`v` (older entries, or built before the session was known) and any
+  request while the current generation is itself unknown (fresh start). The
+  player hands the queue item id to the backend through `BackendTrackMetadata`,
+  the speaker records the session on the queue when the tokens arrive.
+- `22905bc` **explicit loads republish the current track**: `apply_remote_state`
+  only loaded a track that differed from the current one, so re-selecting the
+  playing track (a new generation) merely seeked it to 0 and left the device on
+  a URL the proxy would now refuse on the next ranged request. Type 91 now
+  passes `force_reload`. A restart was what the app wanted anyway.
+- `5431bb6` **batch metadata**: `get_tracks_metadata` (display data plus
+  `max_sample_rate_hz`/`max_bit_depth`) and chunking of every `track/getList`
+  lookup at 50 ids. This also fixed an existing latent bug: the Sonos gain
+  feature (`get_tracks_audio_info`) sent a whole queue in one request and so
+  silently lost its data for queues longer than 50 tracks.
+- `9431287` **publish-time container choice**: `choose_container` and
+  `SonosAudioProxyServer.publish_track` build an entry's URL from the track's
+  metadata with no stream request (blob left empty until the device asks).
+  A test requires them to equal `resolve_track`'s result across 6 source formats ×
+  downsampling/gain × 4 quality overrides × 4 device types. One deliberate
+  difference: a manual FLAC-tier override on a device that cannot play FLAC
+  still serves FLAC at request time; publish time gives it MP3.
+
+Nothing in playback uses `publish_track` yet (Phase 3 does). Not done from the
+plan: handing the stream `blob` to the player when the device requests an entry
+(Phase 4, it is the first thing needed there); "capabilities handed in once" is
+unnecessary since `publish_track` takes them as an argument.
+
