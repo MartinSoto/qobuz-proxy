@@ -573,8 +573,6 @@ Known gaps, in the order they matter:
 - An item past the last queue entry (the autoplay tail) and a repeat-all wrap
   that the device does not do itself still go through the end-of-queue stop and
   the player starting the next track, so they are not gapless.
-- End of queue is not yet reported as "back on the first track, stopped"
-  (O2/O22) and a play press after the end still fails silently.
 - A retarget (coordinator hand-over) drops the published generation, so the
   next play publishes again, but nothing resumes the interrupted track itself.
 - The existing hijack check is unchanged (an own URL, any entry, is not a
@@ -595,3 +593,15 @@ shows its full queue. Unverified guess: the app decides from the item's
 service/source descriptor, which our plain `http-get` entries lack (all
 entries also show the device-filled `r:origID="1"`). Cosmetic for now since
 edits made in the Sonos app are out of scope.
+
+#### End of queue (2026-10-10)
+
+At the end of the queue the player now lands on the first item of the play
+order, stopped at position 0, and reports its real id and duration; a bare PLAY
+then starts it, and a PLAY with nothing loaded is answered with a state report
+instead of silence (O2, O21, O22). Hardware check on Cocina (3-entry queue,
+seek near the end of the last item): the device stopped on `Track 1` after the
+last entry, the player went `PLAYING item 2` -> `STOPPED item 0` within one
+poll, and a bare PLAY played item 0 from the device queue. The landing is in
+`Player._handle_track_ended`, so it applies to every backend, not only the
+handover one.
