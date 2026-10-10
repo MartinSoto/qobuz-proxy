@@ -74,6 +74,7 @@ from ..capabilities import (
 )
 from ..proxy_server import ResolvedTrack
 from .cdn_block_cache import CDNBlockCache
+from .container import choose_container
 from .gain import QueueGainResolver
 from .passthrough_stream import PassthroughStreamHandler
 from .transcode_stream import TranscodeStreamHandler
@@ -343,6 +344,91 @@ class SonosAudioProxyServer:
             return False
         return url_tag != current_tag or url_major != current_major
 
+    def _make_url(
+        self,
+        track_id: str,
+        fmt: str,
+        depth: int,
+        rate: int,
+        item: str,
+        queue_item_id: Optional[int],
+        gain_db: float,
+    ) -> str:
+        """The self-describing proxy URL (see module docstring).
+
+        `gain_db` is self-describing like every other part of the URL — no
+        server-side state to look up at serve time. It is only meaningful
+        for the transcode path (plain passthrough bytes are never touched,
+        so there is nothing to apply gain to); callers pass 0 otherwise.
+        """
+        url = (
+            f"{self.base_url}/audio/{track_id}?format={fmt}&depth={depth}&rate={rate}&item={item}"
+            f"{self._generation_query(queue_item_id)}"
+        )
+        if gain_db:
+            url += f"&gain_db={gain_db:.3f}"
+        return url
+
+    def publish_track(
+        self,
+        track_id: str,
+        capabilities: Optional["DLNACapabilities"],
+        *,
+        max_sample_rate_hz: int,
+        max_bit_depth: int,
+        proxy_key: Optional[str] = None,
+        forced_format_id: Optional[int] = None,
+        queue_item_id: Optional[int] = None,
+        gain_db: float = 0.0,
+    ) -> ResolvedTrack:
+        """Build a track's proxy URL **without asking Qobuz for the stream**:
+        the container is chosen from the track's best available format
+        (see container.choose_container) and the stream itself is only
+        resolved when the device requests it. This is what makes publishing
+        a whole queue cheap — one metadata batch instead of a getFileUrl
+        per track.
+
+        The returned ResolvedTrack has an empty `blob`: that token comes
+        from the stream request, so it is not known until the device asks
+        for the entry.
+
+        Args:
+            track_id: Qobuz track id.
+            capabilities: What the device can play (None if never discovered).
+            max_sample_rate_hz / max_bit_depth: The track's best format, from
+                QobuzAPIClient.get_tracks_metadata (0 if unknown).
+            proxy_key, forced_format_id, queue_item_id: As for resolve_track.
+            gain_db: Playback gain to apply, if any (only applies when the
+                track is transcoded; the caller resolves it, see gain.py).
+        """
+        choice = choose_container(
+            max_sample_rate_hz,
+            max_bit_depth,
+            capabilities,
+            hires_downsampling=self._hires_downsampling,
+            force_transcode=self._gain_resolver is not None,
+            forced_format_id=forced_format_id,
+        )
+        item = proxy_key or track_id
+        proxy_url = self._make_url(
+            track_id,
+            choice.fmt,
+            choice.depth,
+            choice.rate,
+            item,
+            queue_item_id,
+            gain_db if choice.fmt == "wav" else 0.0,
+        )
+        logger.debug(f"Published track {track_id} (item={item}) -> {proxy_url} [{choice.fmt}]")
+        return ResolvedTrack(
+            proxy_url=proxy_url,
+            content_type=choice.content_type,
+            sample_rate=choice.sample_rate,
+            bit_depth=choice.bit_depth,
+            format_id=choice.format_id,
+            blob="",
+        )
+
     def _resolved_track(
         self,
         track_id: str,
@@ -382,17 +468,15 @@ class SonosAudioProxyServer:
             bit_depth = stream.bit_depth
 
         item = proxy_key or track_id
-        proxy_url = (
-            f"{self.base_url}/audio/{track_id}?format={fmt}&depth={depth}&rate={rate}&item={item}"
-            f"{self._generation_query(queue_item_id)}"
+        proxy_url = self._make_url(
+            track_id,
+            fmt,
+            depth,
+            rate,
+            item,
+            queue_item_id,
+            gain_db if transcode_to_sample_rate is not None else 0.0,
         )
-        if transcode_to_sample_rate is not None and gain_db:
-            # Self-describing, like every other part of this URL (see
-            # module docstring) — no server-side state to look up at
-            # serve time. Only meaningful for the transcode path: plain
-            # passthrough bytes are never touched, so there's nothing to
-            # apply gain to.
-            proxy_url += f"&gain_db={gain_db:.3f}"
         kind = (
             f"transcode {stream.sample_rate}Hz -> {rate}Hz"
             if transcode_to_sample_rate
