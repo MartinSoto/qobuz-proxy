@@ -620,3 +620,19 @@ starts without one. Hardware check on Cocina (3-entry queue, pointer naming a
 track outside it, seek near the end of the last): the device queue became
 `[0, 1, 2, 900]`, the device ran into entry 900 on its own and the player
 adopted it as queue item 900.
+
+#### Rejoining a restarted proxy (2026-10-10)
+
+After a container restart the device kept playing (the proxy accepts an entry
+of a generation it does not know yet), but the app rejoining made the fresh
+proxy stop it (`claim_device` with nothing loaded) and then load the server's
+replay (item 2 paused at 154 s, from before) over what the device did. Now
+`claim_device` asks the backend what the device plays (`playing_entry`: the
+entry's URL names session and major version); an entry of the current session
+is kept playing, and the first replayed state within 30 s is answered by
+adopting it (`Player._adopt_playing_device`, `backend.adopt` re-reads the
+device queue so edits and transitions follow). An entry of an older major
+version is stopped and the replay applied as before. Hardware check on Cocina
+(a first run "died" without a stop, a fresh one found item 1 at 63 s, ignored
+the replay of "item 0 paused" and followed the device on into item 2). Not
+covered: a device playing something else of ours from another session.
