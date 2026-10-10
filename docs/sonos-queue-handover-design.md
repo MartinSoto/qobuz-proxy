@@ -536,3 +536,47 @@ Findings during the work: removing a range that runs past the end is refused
 Not yet done: the runtime wiring, play-mode (repeat) relay, following the device
 (item-change events) and reporting: Phases 4 and 5.
 
+### Phase 4 — wiring and following the device (2026-10-10)
+Done, each as its own commit; 1383 tests passing. The whole feature is behind
+`sonos_queue_handover` (YAML key, `QOBUZPROXY_SONOS_QUEUE_HANDOVER`,
+`--sonos-queue-handover`), off by default:
+- `52ccf02` **hooks**: `AudioBackend.on_item_changed` (the device moved to
+  another entry by itself) and `queue_changed`; the player adopts and reports
+  an entry it did not arm, like a gapless transition; the command handler tells
+  the player when a snapshot changed the queue.
+- `79339ad` **`SonosQueueBackend`** (`dlna/sonos/queue_backend.py`): the first
+  play of a queue generation publishes the whole queue in play order and starts
+  as soon as the first batch is on the device; later plays within the generation
+  are just a jump to the entry; a changed order (a snapshot after an edit or
+  shuffle toggle) is reconciled around the playing entry; the entry the device
+  moves to is noticed in the poll loop (two small hooks in the base loop) and
+  reported. Gapless arming is switched off (the device's next entry is simply
+  the next one), which retires the retire-the-previous-entry bookkeeping.
+- `51f2f07` **the switch**, threaded like the gain flag (config → speaker
+  configs and the auto-discovery controller → `DLNAConfig` → `BackendFactory`).
+- the repeat mode is relayed to the device's play mode (`NORMAL`/`REPEAT_ONE`/
+  `REPEAT_ALL`), re-applied when a fresh queue is started; checked on the
+  device through the new client path.
+
+End-to-end hardware check (real `QobuzPlayer`, `SonosQueueBackend`, proxy and
+Qobuz tracks on a Sonos One, muted, 11-track album): the first track played and
+the whole queue was on the device within 5 s; a jump to item 6 was a jump (the
+queue was not rewritten); with the track seeked to 12 s before its end the
+device advanced by itself and the player followed (`Device moved on to track …
+(queue item 7)`) within about 14 s (poll cadence); a shuffle applied while
+playing put the device queue in exactly that order with the playing entry
+uninterrupted (its position kept advancing).
+
+Known gaps, in the order they matter:
+- Following the device uses the existing 2 s poll, so the player learns of a
+  transition up to ~2 s late (eventing, 9.2, would make it immediate).
+- An item past the last queue entry (the autoplay tail) and a repeat-all wrap
+  that the device does not do itself still go through the end-of-queue stop and
+  the player starting the next track, so they are not gapless.
+- End of queue is not yet reported as "back on the first track, stopped"
+  (O2/O22) and a play press after the end still fails silently.
+- A retarget (coordinator hand-over) drops the published generation, so the
+  next play publishes again, but nothing resumes the interrupted track itself.
+- The existing hijack check is unchanged (an own URL, any entry, is not a
+  takeover); the redefinition in 5.5 is not needed so far.
+
