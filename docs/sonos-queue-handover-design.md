@@ -137,9 +137,10 @@ and rate parameters where they still apply)
   each, see 5.6).
 - DIDL-Lite per entry still needs title/artist/album/art/duration: fetched in
   batches in the background with a concurrency cap; rate/depth attributes in
-  `res` are approximate or omitted until known; whether Sonos uses them for
-  seeks into a transcoded WAV is still *(verify)* (the repo's DIDL builder
-  documents that a wrong value garbles seeks).
+  `res` can be omitted until known: on the Sonos One the seek offset comes from
+  the WAV header, not the DIDL (Phase 0, 9.2). The repo's DIDL builder still
+  documents that a renderer trusting wrong values garbles seeks, so this is
+  verified for Sonos only, not for other renderers.
 - Reporting needs the stream `blob`; the proxy records what it resolved when it
   served the request and hands it to the Player on item change, falling back to
   a cached resolve.
@@ -367,6 +368,7 @@ Audio was a 3 %-amplitude 220 Hz WAV at volume 8.
 | End of queue, `NORMAL` | Playback **stops with `Track` back at 1** (the first entry) — the "land on the first track, stopped" rule of O22 is the device's own behavior. |
 | `REPEAT_ALL` | Wraps 3 → 1 seamlessly. |
 | `REPEAT_ONE` | Stays on the entry. |
+| Do DIDL `sampleFrequency`/`bitsPerSample` affect a seek into a transcoded WAV? | **No.** Real proxy path (96 kHz FLAC downsampled to 48 kHz/24-bit WAV, 82 MB, 285 s), muted, one queue entry, `Seek REL_TIME` to 60 s and 120 s under four DIDL variants — correct 48000/24, attributes omitted, wrong 96000/24, wrong 44100/16. **All four gave identical Range requests** (`bytes=17268736-` and `bytes=34553856-`), which is the WAV-header-derived offset (about 4 KB aligned, not frame aligned: the proxy aligns it to a frame itself). Reported position afterwards was 1:02 and 2:02. Only a plain `GET` first, then the ranged `GET`; no `HEAD`. |
 | AVTransport eventing (GENA `LastChange`) | Subscription works. Events arrive within ~0.1–0.5 s of a change and carry `TransportState`, `CurrentTrack`, `NumberOfTracks`, `CurrentPlayMode`, `CurrentTrackURI`, `CurrentTransportActions`, `CurrentTrackDuration`. A skipped entry produces no event (track 2 → 4). The initial subscription event arrives immediately. |
 
 ### 9.3 Consequences for the design
@@ -380,13 +382,13 @@ Audio was a 3 %-amplitude 220 Hz WAV at volume 8.
   mirror must be re-derived from `Browse` or from the `CurrentTrackURI` events.
 - Item-change tracking can use eventing instead of the 2 s poll, which also
   helps the weak coordinator. Polling stays as fallback.
+- Lazy resolution may publish entries without `sampleFrequency`/
+  `bitsPerSample` in the DIDL; Sonos ignores them for seeks (9.2).
 - A refused or stale entry costs one skipped track, not a stopped player.
 - End-of-queue landing is native on the device; the proxy must report it
   (and not gate PLAY on its own `_current_track`, O22).
 
 ### 9.4 Still open for Phase 0
-- Seeking into a transcoded WAV entry published with approximate or missing
-  `sampleFrequency`/`bitsPerSample` in its DIDL (needs the real proxy path).
 - Gapless across mixed passthrough/WAV entries, with real tracks.
 - Eventing and `CurrentTrackURI` on a **grouped** room (the four-room group),
   and what happens to the queue on a coordinator change.
