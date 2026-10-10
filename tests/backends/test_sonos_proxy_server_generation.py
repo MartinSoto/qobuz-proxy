@@ -217,3 +217,30 @@ class TestStaleRequestsGetGone:
         queue = await _queue(major=5)
 
         assert await self._run(queue, "") == 200
+
+
+class TestRewrittenQueue:
+    """The same queue re-sent under a new major version keeps its entries
+    playable; a different one makes them stale."""
+
+    async def test_an_entry_of_an_unchanged_queue_is_still_served(self) -> None:
+        queue = await _queue(major=5)
+        await queue.apply_snapshot([(0, "42"), (1, "43")])
+        proxy = _proxy(queue)
+        url = (await proxy.resolve_track("42", CAPS, queue_item_id=0)).proxy_url  # type: ignore[union-attr]
+
+        await queue.set_version(QueueVersion(major=6, minor=1))
+        await queue.apply_snapshot([(0, "42"), (1, "43")])
+
+        assert not proxy._is_stale_generation(_params(url))
+
+    async def test_an_entry_of_a_replaced_queue_is_refused(self) -> None:
+        queue = await _queue(major=5)
+        await queue.apply_snapshot([(0, "42"), (1, "43")])
+        proxy = _proxy(queue)
+        url = (await proxy.resolve_track("42", CAPS, queue_item_id=0)).proxy_url  # type: ignore[union-attr]
+
+        await queue.set_version(QueueVersion(major=6, minor=1))
+        await queue.apply_snapshot([(0, "42"), (1, "99")])
+
+        assert proxy._is_stale_generation(_params(url))

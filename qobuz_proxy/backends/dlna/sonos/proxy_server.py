@@ -342,7 +342,7 @@ class SonosAudioProxyServer:
         current_tag, current_major = self._queue.generation
         if not current_tag or current_major == 0 or url_major == 0:
             return False
-        return url_tag != current_tag or url_major != current_major
+        return not self._queue.same_generation(url_tag, url_major)
 
     async def gain_for(self, track_id: str) -> float:
         """The playback gain (dB) to apply when `track_id` is transcoded, or 0

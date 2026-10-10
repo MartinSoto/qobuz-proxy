@@ -210,6 +210,11 @@ class QobuzQueue:
         # (see PlaybackCommandHandler._handle_set_state), echoed back in
         # outbound state reports.
         self._version: QueueVersion = QueueVersion()
+        # Earlier major versions whose queue was re-sent unchanged (a client
+        # reloading the very same queue): stream URLs of those stay valid, see
+        # same_generation().
+        self._aliases: frozenset[int] = frozenset()
+        self._alias_candidates: Optional[frozenset[int]] = None
 
         # Callback for fetching metadata
         self._get_metadata_callback: Optional[MetadataCallback] = None
@@ -292,7 +297,11 @@ class QobuzQueue:
     def set_session(self, session_id: str) -> None:
         """Record which Qobuz session this queue belongs to (known once the
         WebSocket tokens arrive)."""
-        self._session_tag = session_tag(session_id)
+        tag = session_tag(session_id)
+        if tag != self._session_tag:
+            self._aliases = frozenset()
+            self._alias_candidates = None
+        self._session_tag = tag
 
     @property
     def generation(self) -> tuple[str, int]:
@@ -303,6 +312,13 @@ class QobuzQueue:
         lock on purpose: two plain attribute reads, called from request
         handlers that must not wait on queue updates."""
         return self._session_tag, self._version.major
+
+    def same_generation(self, tag: str, major: int) -> bool:
+        """Whether a stream URL's (tag, major) names the current queue: this
+        generation, or an earlier one whose queue came back unchanged (the
+        version moved on but nothing in the queue did, so what was published
+        for it is still right)."""
+        return tag == self._session_tag and (major == self._version.major or major in self._aliases)
 
     async def get_version(self) -> QueueVersion:
         """Get current queue version."""
@@ -330,6 +346,12 @@ class QobuzQueue:
                 )
                 self._membership = QueueMembership()
                 self._order = QueueOrder()
+                self._aliases = frozenset()
+                self._alias_candidates = None
+            elif version.major > self._version.major and self._version.major != 0:
+                # Whether this is a new queue or the same one re-sent is only
+                # known once its snapshot arrives (see apply_snapshot).
+                self._alias_candidates = self._aliases | {self._version.major}
             self._version = version
 
     # =========================================================================
@@ -367,6 +389,12 @@ class QobuzQueue:
             logger.warning("Shuffle is on but the snapshot carries no usable shuffled order")
         entries = [QueueEntry(queue_item_id, track_id) for queue_item_id, track_id in items]
         async with self._lock:
+            if self._alias_candidates is not None:
+                unchanged = [(e.queue_item_id, e.track_id) for e in self._order.entries] == list(
+                    items
+                )
+                self._aliases = self._alias_candidates if unchanged and items else frozenset()
+                self._alias_candidates = None
             self._membership = QueueMembership(by_item=dict(items), trustworthy=True)
             self._order = QueueOrder(
                 entries=entries,

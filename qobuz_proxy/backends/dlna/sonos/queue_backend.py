@@ -376,11 +376,11 @@ class SonosQueueBackend(SonosBackend):
         key = parsed.key
         self._current_key = key
         generation = self._queue.generation
-        if self._published_generation != generation:
+        if not self._published_is_current():
             self._tail = []  # another queue: what followed the old one is gone
         desired = await self._desired_queue(key)
 
-        if self._published_generation == generation and self._sync is not None:
+        if self._published_is_current() and self._sync is not None:
             await runner.wait_idle()  # a publish still in flight finishes first
             if key not in self._sync.mirror:
                 runner.request_reconcile(desired, anchor=None)
@@ -470,16 +470,18 @@ class SonosQueueBackend(SonosBackend):
     # Following the Qobuz queue and the device
     # ------------------------------------------------------------------
 
+    def _published_is_current(self) -> bool:
+        """Whether what the device holds was published for the queue we have now
+        (or for an earlier version of it that came back unchanged)."""
+        published, queue = self._published_generation, self._queue
+        return published is not None and queue is not None and queue.same_generation(*published)
+
     async def queue_changed(self) -> None:
         """The queue's order changed within the generation on the device (an
         edit, a shuffle toggle): bring the device's copy up to date around
         the entry that is playing."""
         runner = self._runner
-        if (
-            runner is None
-            or self._queue is None
-            or self._published_generation != self._queue.generation
-        ):
+        if runner is None or self._queue is None or not self._published_is_current():
             return  # nothing of this generation on the device yet
         order = await self._queue.play_order()
         if order is None:
