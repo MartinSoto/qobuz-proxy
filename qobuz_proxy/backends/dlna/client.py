@@ -59,6 +59,10 @@ class DLNADeviceInfo:
     av_transport_url: str = ""
     rendering_control_url: str = ""
     connection_manager_url: str = ""
+    # ContentDirectory (the device's media-server half). On a Sonos it is
+    # where the playback queue ("Q:0") can be read back — see
+    # sonos.client.SonosClient.browse_queue.
+    content_directory_url: str = ""
     # Present only on a device that groups renderers together and exposes
     # a group-wide volume control (in practice: a Sonos coordinator) — see
     # sonos.client.SonosClient, the only thing that ever reads this. Just
@@ -695,6 +699,12 @@ class DLNAClient:
                     else:
                         info.rendering_control_url = control_url
 
+                elif "ContentDirectory" in service_type and control_url:
+                    if control_url.startswith("/"):
+                        info.content_directory_url = base_url + control_url
+                    else:
+                        info.content_directory_url = control_url
+
                 elif "ConnectionManager" in service_type and control_url:
                     if control_url.startswith("/"):
                         info.connection_manager_url = base_url + control_url
@@ -746,6 +756,7 @@ class DLNAClient:
         action: str,
         args: Dict[str, str],
         max_retries: Optional[int] = None,
+        retry_upnp_errors: bool = True,
     ) -> SoapResult:
         """
         Send SOAP action with retry logic, returning detailed result.
@@ -760,7 +771,9 @@ class DLNAClient:
             SoapResult with success/failure info and UPnP error codes
         """
         async with self._call_lock:
-            return await self._soap_action_locked(url, service, action, args, max_retries)
+            return await self._soap_action_locked(
+                url, service, action, args, max_retries, retry_upnp_errors
+            )
 
     async def _soap_action_locked(
         self,
@@ -769,9 +782,15 @@ class DLNAClient:
         action: str,
         args: Dict[str, str],
         max_retries: Optional[int] = None,
+        retry_upnp_errors: bool = True,
     ) -> SoapResult:
         """The actual SOAP call + retry loop — see _soap_action_detailed,
-        which holds self._call_lock for the whole of this."""
+        which holds self._call_lock for the whole of this.
+
+        With retry_upnp_errors False, an answer carrying a UPnP error code
+        is final: the device understood the request and refused it, so
+        repeating it cannot help (a stale UpdateID stays stale), and an
+        action that changes state must not be sent twice by a retry."""
         if not url or not self._session:
             logger.warning(f"No URL for service {service}")
             return SoapResult(success=False)
@@ -815,7 +834,9 @@ class DLNAClient:
                         # Don't retry permanent failures — the device
                         # answered, it just doesn't support this action, so
                         # it's reachable/healthy as far as backoff cares.
-                        if last_error_code in (401, 602):
+                        if last_error_code in (401, 602) or (
+                            not retry_upnp_errors and last_error_code is not None
+                        ):
                             self.consecutive_failures = 0
                             return SoapResult(
                                 success=False,
