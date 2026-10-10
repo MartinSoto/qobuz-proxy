@@ -218,6 +218,13 @@ class AudioBackend(ABC):
         report; every other backend sequences the queue itself."""
         self._on_item_changed = callback
 
+    async def set_repeat_mode(self, mode: str) -> None:
+        """The repeat mode changed: "off", "one" or "all". A backend that
+        lets the device run through the queue on its own relays it to the
+        device (SonosQueueBackend); every other backend sequences the queue
+        itself, so the default does nothing."""
+        return None
+
     async def queue_changed(self) -> None:
         """The Qobuz queue's order or contents changed within the queue
         generation the backend was loaded with (an edit, a shuffle toggle).

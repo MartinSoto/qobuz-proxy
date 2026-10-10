@@ -18,6 +18,7 @@ REPEAT_OFF, REPEAT_ONE, REPEAT_ALL = 1, 2, 3  # protocol LoopMode values
 def _make_player(next_track_info=None):  # type: ignore[no-untyped-def]
     player, backend = _make_gapless_player(next_track_info=next_track_info)
     player.queue.set_repeat_mode = AsyncMock()  # the shared helper's queue is a plain mock
+    backend.set_repeat_mode = AsyncMock()  # and so is its backend
     return player, backend
 
 
@@ -101,3 +102,31 @@ class TestRepeatOneAndGapless:
         await player.set_loop_mode(REPEAT_ONE)
 
         backend.clear_next_track.assert_not_called()
+
+
+class TestRepeatModeIsRelayedToTheBackend:
+    async def test_a_change_reaches_the_backend(self) -> None:
+        player, backend = _make_player()
+
+        await player.set_loop_mode(REPEAT_ONE)
+        await player.set_loop_mode(REPEAT_ALL)
+        await player.set_loop_mode(REPEAT_OFF)
+
+        assert [c.args[0] for c in backend.set_repeat_mode.await_args_list] == ["one", "all", "off"]
+
+    async def test_the_same_announcement_twice_is_relayed_once(self) -> None:
+        """Type 97 arrives twice per change."""
+        player, backend = _make_player()
+
+        await player.set_loop_mode(REPEAT_ONE)
+        await player.set_loop_mode(REPEAT_ONE)
+
+        backend.set_repeat_mode.assert_awaited_once_with("one")
+
+    async def test_a_backend_failure_does_not_break_the_mode_change(self) -> None:
+        player, backend = _make_player()
+        backend.set_repeat_mode = AsyncMock(side_effect=RuntimeError("device gone"))
+
+        await player.set_loop_mode(REPEAT_ONE)  # must not raise
+
+        player.queue.set_repeat_mode.assert_awaited_once()

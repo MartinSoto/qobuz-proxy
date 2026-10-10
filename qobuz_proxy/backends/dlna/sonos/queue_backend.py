@@ -37,6 +37,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The Qobuz repeat mode in the device's own play modes.
+_PLAY_MODES = {"off": "NORMAL", "one": "REPEAT_ONE", "all": "REPEAT_ALL"}
+
 # How long starting playback may take, publishing the first batch included.
 START_TIMEOUT_SECONDS = 30.0
 
@@ -56,6 +59,9 @@ class SonosQueueBackend(SonosBackend):
         # last loaded for; None when it holds nothing of ours that is current.
         self._published_generation: Optional[tuple[str, int]] = None
         self._start_result: Optional["asyncio.Future[bool]"] = None
+        # The Qobuz repeat mode as the device's own play mode (see
+        # set_repeat_mode): it plays the queue, so it has to repeat it too.
+        self._play_mode = "NORMAL"
 
     @property
     def supports_gapless(self) -> bool:
@@ -129,6 +135,19 @@ class SonosQueueBackend(SonosBackend):
     # Starting playback
     # ------------------------------------------------------------------
 
+    async def set_repeat_mode(self, mode: str) -> None:
+        """Relay the repeat mode: the device is the one running through the
+        queue, so repeat-one and repeat-all are its own play modes. Shuffle is
+        never relayed that way: the published order already is the shuffle."""
+        self._play_mode = _PLAY_MODES.get(mode, "NORMAL")
+        await self._apply_play_mode()
+
+    async def _apply_play_mode(self) -> None:
+        if isinstance(self._client, SonosClient) and not await self._client.set_play_mode(
+            self._play_mode
+        ):
+            logger.warning(f"[{self.name}] could not set the play mode to {self._play_mode}")
+
     async def _desired_queue(self, key: EntryKey) -> list[EntryKey]:
         """The queue to put on the device: the server's play order, plus the
         entry about to play if it is not part of it (an autoplay track, or a
@@ -185,6 +204,8 @@ class SonosQueueBackend(SonosBackend):
         self._start_result = started
 
         async def begin(position: int) -> None:
+            if self._play_mode != "NORMAL":
+                await self._apply_play_mode()  # a fresh queue must repeat like the last one
             ok = await client.play_from_queue(position - 1)
             if not started.done():
                 started.set_result(ok)

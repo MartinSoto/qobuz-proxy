@@ -38,6 +38,7 @@ class FakeClient(SonosClient):
         self.device = FakeSonosQueue()
         self.played_from: list[int] = []
         self.play_ok = True
+        self.play_modes: list[str] = []
 
     async def clear_queue(self) -> bool:
         return await self.device.clear_queue()
@@ -53,6 +54,10 @@ class FakeClient(SonosClient):
 
     async def browse_queue(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         return await self.device.browse_queue(*args, **kwargs)
+
+    async def set_play_mode(self, mode: str) -> bool:
+        self.play_modes.append(mode)
+        return True
 
     async def play_from_queue(self, index: int = 0) -> bool:
         self.played_from.append(index)
@@ -345,3 +350,37 @@ class TestLifecycle:
         assert ok
         client.add_uri_to_queue.assert_awaited_once()
         assert client.device.entries == []  # nothing of the queue was published
+
+
+class TestRepeatMode:
+    async def test_the_qobuz_modes_become_the_devices_play_modes(self) -> None:
+        backend, client, _ = await make([1, 2, 3])
+
+        for qobuz, device in (("one", "REPEAT_ONE"), ("all", "REPEAT_ALL"), ("off", "NORMAL")):
+            await backend.set_repeat_mode(qobuz)
+            assert client.play_modes[-1] == device
+
+    async def test_an_unknown_mode_means_normal(self) -> None:
+        backend, client, _ = await make([1, 2, 3])
+
+        await backend.set_repeat_mode("bogus")
+
+        assert client.play_modes == ["NORMAL"]
+
+    async def test_a_fresh_queue_is_started_in_the_current_repeat_mode(self) -> None:
+        backend, client, _ = await make([1, 2, 3])
+        await backend.set_repeat_mode("one")
+        client.play_modes.clear()
+
+        await backend.play(meta(1))
+        await settled(backend)
+
+        assert client.play_modes == ["REPEAT_ONE"]
+
+    async def test_the_normal_mode_is_not_re_sent_on_every_load(self) -> None:
+        backend, client, _ = await make([1, 2, 3])
+
+        await backend.play(meta(1))
+        await settled(backend)
+
+        assert client.play_modes == []

@@ -1600,6 +1600,11 @@ class QobuzPlayer:
         previous = self._repeat_mode
         self._repeat_mode = repeat_mode
         await self.queue.set_repeat_mode(repeat_mode)
+        if repeat_mode != previous:
+            try:
+                await self.backend.set_repeat_mode(repeat_mode.value)
+            except Exception as e:
+                logger.warning(f"Backend could not apply repeat mode {repeat_mode.value}: {e}")
         if (repeat_mode == RepeatMode.ONE) != (previous == RepeatMode.ONE):
             await self._rearm_gapless_for_repeat_change()
 
