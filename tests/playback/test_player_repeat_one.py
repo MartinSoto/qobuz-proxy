@@ -130,3 +130,27 @@ class TestRepeatModeIsRelayedToTheBackend:
         await player.set_loop_mode(REPEAT_ONE)  # must not raise
 
         player.queue.set_repeat_mode.assert_awaited_once()
+
+
+class TestNoArmingWithoutGaplessSupport:
+    """A backend that does not arm tracks must never be asked to, whichever
+    path wants a next track armed (a changed next pointer included)."""
+
+    async def test_a_changed_next_pointer_arms_nothing(self) -> None:
+        player, backend = _make_player(next_track_info=NEXT)
+        backend.supports_gapless = False
+        player._state = PlaybackState.PLAYING
+
+        await player.on_next_track_info_changed()
+
+        backend.set_next_track.assert_not_called()
+        assert player._gapless_armed is False
+
+    async def test_the_direct_arm_path_is_guarded_too(self) -> None:
+        player, backend = _make_player(next_track_info=NEXT)
+        backend.supports_gapless = False
+
+        async with player._gapless_arm_lock:
+            await player._prepare_next_track_locked()
+
+        backend.set_next_track.assert_not_called()

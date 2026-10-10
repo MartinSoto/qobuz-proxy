@@ -20,7 +20,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
-from qobuz_proxy.backends.types import PlayResult
+from qobuz_proxy.backends.types import BackendTrackMetadata, PlayResult
 
 from ..proxy_server import AudioProxyServerProtocol
 from .audio_url import EntryKey, parse_entry_url
@@ -66,6 +66,18 @@ class SonosQueueBackend(SonosBackend):
     @property
     def supports_gapless(self) -> bool:
         """The device advances through its own queue; nothing is armed."""
+        return False
+
+    async def set_next_track(
+        self, metadata: BackendTrackMetadata, queue_item_id: int = 0
+    ) -> Optional[PlayResult]:
+        """Nothing is ever armed: the next entry is already in the device
+        queue, and arming would append a second copy of it."""
+        return None
+
+    async def _arm_next_track(
+        self, actual_url: str, didl: str, metadata: BackendTrackMetadata
+    ) -> bool:
         return False
 
     def create_proxy_server(

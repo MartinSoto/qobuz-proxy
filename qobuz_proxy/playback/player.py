@@ -2012,6 +2012,14 @@ class QobuzPlayer:
         if self._gapless_armed or not self._get_next_track_callback:
             return
 
+        # Not every caller went through _prepare_next_track_for_gapless's own
+        # check (a changed next pointer arrives via on_next_track_info_changed):
+        # a backend that does not arm tracks must never be asked to (one that
+        # holds the whole queue on the device would append a duplicate of the
+        # next entry to it).
+        if not self.backend.supports_gapless:
+            return
+
         if self._repeat_mode == RepeatMode.ONE:
             logger.debug("Gapless: repeat-one is on, not arming a next track")
             return

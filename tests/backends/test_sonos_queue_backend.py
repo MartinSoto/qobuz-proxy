@@ -202,6 +202,16 @@ class TestPlay:
     def test_gapless_arming_is_off(self) -> None:
         assert SonosQueueBackend("10.0.0.5").supports_gapless is False
 
+    async def test_nothing_is_ever_armed_so_no_second_copy_lands_in_the_queue(self) -> None:
+        backend, client, _ = await make(list(range(1, 11)))
+        await backend.play(meta(1))
+        await settled(backend)
+        before = keys_on(client)
+
+        assert await backend.set_next_track(meta(2), 2) is None
+
+        assert keys_on(client) == before  # the entry already there is not duplicated
+
 
 class TestQueueChanged:
     async def test_a_new_order_is_brought_to_the_device_around_the_playing_entry(self) -> None:
