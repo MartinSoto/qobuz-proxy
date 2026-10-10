@@ -344,6 +344,11 @@ class SonosAudioProxyServer:
             return False
         return url_tag != current_tag or url_major != current_major
 
+    async def gain_for(self, track_id: str) -> float:
+        """The playback gain (dB) to apply when `track_id` is transcoded, or 0
+        when gain normalization is off. Never raises (see QueueGainResolver)."""
+        return await self._gain_resolver.resolve(track_id) if self._gain_resolver else 0.0
+
     def _make_url(
         self,
         track_id: str,
