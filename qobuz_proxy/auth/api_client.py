@@ -17,6 +17,10 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# track/getList rejects a request naming more than this many ids with HTTP 400
+# (measured 2026-10-10: 50 works, 51 fails), so larger lookups go in chunks.
+TRACK_GETLIST_MAX_IDS = 50
+
 
 @dataclass
 class TrackAudioInfo:
@@ -429,32 +433,32 @@ class QobuzAPIClient:
             if not response:
                 return None
 
-            # Transform to flat format
-            metadata: dict[str, Any] = {
-                "title": response.get("title", ""),
-                "artist": "",
-                "album": "",
-                "album_art_url": "",
-                "duration_ms": int(response.get("duration", 0)) * 1000,
-            }
-
-            performer = response.get("performer")
-            if performer and isinstance(performer, dict):
-                metadata["artist"] = performer.get("name", "")
-
-            album = response.get("album")
-            if album and isinstance(album, dict):
-                metadata["album"] = album.get("title", "")
-                image = album.get("image")
-                if image and isinstance(image, dict):
-                    metadata["album_art_url"] = image.get("large") or image.get("small") or ""
-
-            return metadata
+            return self._flat_track_metadata(response)
 
         except Exception as e:
             logger.error(f"Failed to get track metadata: {e}")
 
         return None
+
+    async def _get_track_list_items(self, track_ids: list[str]) -> list[dict[str, Any]]:
+        """Fetch the raw track/getList items for any number of ids, in chunks
+        of TRACK_GETLIST_MAX_IDS. An id Qobuz does not recognize is simply
+        absent from the result; a chunk that fails is logged and skipped, so
+        the rest still come back (callers treat missing as "no data")."""
+        items: list[dict[str, Any]] = []
+        for start in range(0, len(track_ids), TRACK_GETLIST_MAX_IDS):
+            chunk = track_ids[start : start + TRACK_GETLIST_MAX_IDS]
+            try:
+                body = json.dumps({"tracks_id": [int(t) for t in chunk]})
+                response = await self._request_signed(
+                    "track", "getList", params={}, method="POST", body=body
+                )
+            except Exception as e:
+                logger.error(f"track/getList failed for {len(chunk)} id(s): {e}")
+                continue
+            if response:
+                items.extend(response.get("tracks", {}).get("items", []))
+        return items
 
     async def get_tracks_audio_info(self, track_ids: list[str]) -> dict[str, TrackAudioInfo]:
         """
@@ -469,45 +473,85 @@ class QobuzAPIClient:
         has to approximate one.
 
         Args:
-            track_ids: Qobuz track IDs to fetch. Empty input returns {}
-                without making a request.
+            track_ids: Qobuz track IDs to fetch, any number (sent in chunks
+                of TRACK_GETLIST_MAX_IDS). Empty input returns {} without
+                making a request.
 
         Returns:
             Mapping of track_id -> TrackAudioInfo for every id Qobuz
             actually returned data for. An id it doesn't recognize is
-            just absent, not an error; a request failure returns {}
-            rather than raising — the caller falls back to no adjustment.
+            just absent, not an error; a request failure drops only the
+            affected chunk — the caller falls back to no adjustment for
+            what is missing.
         """
         if not track_ids:
             return {}
-        try:
-            body = json.dumps({"tracks_id": [int(t) for t in track_ids]})
-            response = await self._request_signed(
-                "track", "getList", params={}, method="POST", body=body
+        result: dict[str, TrackAudioInfo] = {}
+        for item in await self._get_track_list_items(track_ids):
+            track_id = str(item.get("id", ""))
+            if not track_id:
+                continue
+            audio_info = item.get("audio_info") or {}
+            album = item.get("album") or {}
+            result[track_id] = TrackAudioInfo(
+                track_id=track_id,
+                gain_db=float(audio_info.get("replaygain_track_gain", 0.0)),
+                peak=float(audio_info.get("replaygain_track_peak", 1.0)),
+                album_id=str(album.get("id", "")),
+                duration_ms=int(item.get("duration", 0)) * 1000,
             )
-            if not response:
-                return {}
+        return result
 
-            items = response.get("tracks", {}).get("items", [])
-            result: dict[str, TrackAudioInfo] = {}
-            for item in items:
-                track_id = str(item.get("id", ""))
-                if not track_id:
-                    continue
-                audio_info = item.get("audio_info") or {}
-                album = item.get("album") or {}
-                result[track_id] = TrackAudioInfo(
-                    track_id=track_id,
-                    gain_db=float(audio_info.get("replaygain_track_gain", 0.0)),
-                    peak=float(audio_info.get("replaygain_track_peak", 1.0)),
-                    album_id=str(album.get("id", "")),
-                    duration_ms=int(item.get("duration", 0)) * 1000,
-                )
-            return result
+    async def get_tracks_metadata(self, track_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Batch-fetch display metadata for many tracks (track/getList).
 
-        except Exception as e:
-            logger.error(f"Failed to get tracks audio info: {e}")
+        Each value has the same flat shape get_track_metadata returns
+        (title, artist, album, album_art_url, duration_ms) plus the track's
+        best available format, ``max_sample_rate_hz`` and ``max_bit_depth``
+        (0 when Qobuz gives none) — everything a queue publisher needs for
+        DIDL-Lite and for choosing the container, in one call per 50 tracks.
+
+        Returns:
+            Mapping of track_id -> metadata for every id Qobuz returned; an
+            unknown id or a failed chunk is just absent.
+        """
+        if not track_ids:
             return {}
+        return {
+            str(item["id"]): self._flat_track_metadata(item)
+            for item in await self._get_track_list_items(track_ids)
+            if item.get("id") is not None
+        }
+
+    @staticmethod
+    def _flat_track_metadata(response: dict[str, Any]) -> dict[str, Any]:
+        """Flatten a Qobuz track object (track/get or an item of track/
+        getList) into the metadata dict the rest of the app uses."""
+        metadata: dict[str, Any] = {
+            "title": response.get("title", ""),
+            "artist": "",
+            "album": "",
+            "album_art_url": "",
+            "duration_ms": int(response.get("duration", 0)) * 1000,
+            # maximum_sampling_rate is in kHz (44.1, 96, 88.2 ...)
+            "max_sample_rate_hz": int(
+                round(float(response.get("maximum_sampling_rate") or 0) * 1000)
+            ),
+            "max_bit_depth": int(response.get("maximum_bit_depth") or 0),
+        }
+
+        performer = response.get("performer")
+        if performer and isinstance(performer, dict):
+            metadata["artist"] = performer.get("name", "")
+
+        album = response.get("album")
+        if album and isinstance(album, dict):
+            metadata["album"] = album.get("title", "")
+            image = album.get("image")
+            if image and isinstance(image, dict):
+                metadata["album_art_url"] = image.get("large") or image.get("small") or ""
+
+        return metadata
 
     async def _request_signed(
         self,
