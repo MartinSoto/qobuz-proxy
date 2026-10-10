@@ -16,14 +16,19 @@ snapshots) and QUEUE_TRACKS_ADDED/INSERTED/REMOVED/REORDERED/CLEARED
 command_handler.py's handlers for all of them).
 
 What's here beyond the plain Renderer bookkeeping (repeat mode, the queue
-version stamp echoed back in outbound state reports) is QueueMembership:
-just enough of that Controller-role queue traffic to answer "which tracks
-are in the queue right now", for backends/dlna/sonos/gain.py's
-approximated-album-gain grouping — deliberately not a full ordered
-track list (nothing needs one yet; see git history for the fuller
-"does Player need a Queue component at all?" reasoning this superseded).
-Track metadata caching (needs no track list at all — Player hands it the
-exact QueueTrack to cache onto) and the blob/actual_quality a backend
+version stamp echoed back in outbound state reports) is the queue as the
+Controller-role messages describe it: QueueMembership (which tracks are in the
+queue — the consumer is backends/dlna/sonos/gain.py's approximated-album-gain
+grouping) and QueueOrder, the ordered view built **only from full snapshots**
+(SRVR_CTRL_QUEUE_STATE / QUEUE_TRACKS_LOADED): the tracks in their original
+order plus, when shuffle is on, the server's shuffled order as indexes into
+that list. The incremental deltas (added/inserted/removed/reordered) keep
+membership current but deliberately do *not* patch the order: with shuffle on
+their effect on the play order is not derivable from the delta (see
+docs/queue-and-shuffle-wire-observations.md, O19), so the order is marked
+stale until the next snapshot, which the command handler asks for after every
+edit. Track metadata caching (needs no track list at all — Player hands it
+the exact QueueTrack to cache onto) and the blob/actual_quality a backend
 resolved for a track (see set_track_stream_info) round out what's left —
 streaming URL resolution itself lives entirely in the backend now (see
 backends.dlna.proxy_server.resolve_track), not here.
@@ -142,6 +147,38 @@ class QueueMembership:
     trustworthy: bool = False
 
 
+@dataclass(frozen=True)
+class QueueEntry:
+    """One item of the queue: the per-load ``queue_item_id`` (unique only
+    within one major version of one load) and the Qobuz track id."""
+
+    queue_item_id: int
+    track_id: str
+
+
+@dataclass
+class QueueOrder:
+    """The queue's order as the last full snapshot gave it.
+
+    ``entries`` is the original order; with ``shuffle_mode`` on,
+    ``shuffled_indexes`` is the server's play order as indexes into
+    ``entries`` (confirmed to match the server's next pointers, O16/O19).
+    ``fresh`` is False once a delta has arrived since the snapshot, i.e. the
+    order may no longer be what the server holds.
+    """
+
+    entries: list[QueueEntry] = field(default_factory=list)
+    shuffle_mode: bool = False
+    shuffled_indexes: list[int] = field(default_factory=list)
+    fresh: bool = False
+
+    def play_order(self) -> list[QueueEntry]:
+        """Entries in the order they will be played."""
+        if self.shuffle_mode and self.shuffled_indexes:
+            return [self.entries[i] for i in self.shuffled_indexes]
+        return list(self.entries)
+
+
 # Type alias for callbacks
 MetadataCallback = Callable[[str], Coroutine[Any, Any, Optional[dict[str, Any]]]]
 
@@ -166,6 +203,11 @@ class QobuzQueue:
 
         # See QueueMembership.
         self._membership: QueueMembership = QueueMembership()
+        # See QueueOrder.
+        self._order: QueueOrder = QueueOrder()
+        # The app's autoplay setting as last announced by the server (type
+        # 102); None until one has been seen.
+        self._autoplay_mode: Optional[bool] = None
 
         self._lock = asyncio.Lock()
 
@@ -256,42 +298,114 @@ class QobuzQueue:
                     "assuming a new session, discarding queue membership"
                 )
                 self._membership = QueueMembership()
+                self._order = QueueOrder()
             self._version = version
 
     # =========================================================================
     # Queue Membership (see QueueMembership)
     # =========================================================================
 
-    async def replace_queue_tracks(self, items: list[tuple[int, str]]) -> None:
-        """A full snapshot arrived (SrvrCtrlQueueTracksLoaded/QueueState) —
-        replace known membership outright and mark it trustworthy.
+    async def apply_snapshot(
+        self,
+        items: list[tuple[int, str]],
+        *,
+        shuffle_mode: bool = False,
+        shuffled_indexes: Optional[list[int]] = None,
+    ) -> None:
+        """A full snapshot arrived (SrvrCtrlQueueState/QueueTracksLoaded) —
+        replace membership and order outright and mark both trustworthy.
 
         Args:
-            items: (queue_item_id, track_id) pairs, in whatever order the
-                message carried them (order isn't kept — see
-                QueueMembership).
+            items: (queue_item_id, track_id) pairs in the order the message
+                carried them (the original, un-shuffled order).
+            shuffle_mode: The snapshot's shuffle flag.
+            shuffled_indexes: With shuffle on, the server's play order as
+                indexes into ``items``. Anything that is not a permutation
+                of ``range(len(items))`` is rejected with a warning and the
+                original order is used instead — a wrong order must never
+                be acted on.
         """
+        indexes = list(shuffled_indexes or [])
+        if shuffle_mode and indexes and sorted(indexes) != list(range(len(items))):
+            logger.warning(
+                f"Ignoring invalid shuffledTrackIndexes (not a permutation of "
+                f"{len(items)} tracks): {indexes[:20]}"
+            )
+            indexes = []
+        if shuffle_mode and not indexes and items:
+            logger.warning("Shuffle is on but the snapshot carries no usable shuffled order")
+        entries = [QueueEntry(queue_item_id, track_id) for queue_item_id, track_id in items]
         async with self._lock:
             self._membership = QueueMembership(by_item=dict(items), trustworthy=True)
+            self._order = QueueOrder(
+                entries=entries,
+                shuffle_mode=shuffle_mode and bool(indexes),
+                shuffled_indexes=indexes,
+                fresh=True,
+            )
+
+    async def replace_queue_tracks(self, items: list[tuple[int, str]]) -> None:
+        """A full snapshot arrived without shuffle information — see
+        apply_snapshot."""
+        await self.apply_snapshot(items)
 
     async def add_queue_tracks(self, items: list[tuple[int, str]]) -> None:
         """Tracks were added or inserted (SrvrCtrlQueueTracksAdded/
-        Inserted) — membership-wise these are identical: where they land
-        doesn't matter here, only that they're now present."""
+        Inserted). Membership gains them; the order goes stale (see
+        QueueOrder)."""
         async with self._lock:
             self._membership.by_item.update(items)
+            self._order.fresh = False
 
     async def remove_queue_tracks(self, queue_item_ids: list[int]) -> None:
         """Tracks were removed (SrvrCtrlQueueTracksRemoved)."""
         async with self._lock:
             for item_id in queue_item_ids:
                 self._membership.by_item.pop(item_id, None)
+            self._order.fresh = False
+
+    async def mark_order_stale(self) -> None:
+        """A delta that changes only the order (reorder, shuffle toggle)
+        arrived: membership is unaffected, the order is no longer known."""
+        async with self._lock:
+            self._order.fresh = False
 
     async def clear_queue_tracks(self) -> None:
         """The queue was emptied (SrvrCtrlQueueCleared) — a fully known
         (trustworthy) empty state, not "unknown"."""
         async with self._lock:
             self._membership = QueueMembership(trustworthy=True)
+            self._order = QueueOrder(fresh=True)
+
+    async def play_order(self) -> Optional[list[QueueEntry]]:
+        """The queue in play order, or None if the last snapshot has been
+        outdated by a delta (or none has arrived yet) — callers must wait
+        for the next snapshot rather than act on a stale order."""
+        async with self._lock:
+            if not self._order.fresh:
+                return None
+            return self._order.play_order()
+
+    async def shuffle_enabled(self) -> bool:
+        """Whether the last snapshot said shuffle is on (and carried a
+        usable shuffled order)."""
+        async with self._lock:
+            return self._order.shuffle_mode
+
+    # =========================================================================
+    # Autoplay setting (as announced by the server)
+    # =========================================================================
+
+    async def set_autoplay_mode(self, enabled: bool) -> None:
+        """The server announced the autoplay setting (SrvrCtrlAutoplayModeSet)."""
+        async with self._lock:
+            self._autoplay_mode = enabled
+        logger.info(f"Autoplay mode: {'on' if enabled else 'off'}")
+
+    async def autoplay_mode(self) -> Optional[bool]:
+        """Last announced autoplay setting, or None if never announced."""
+        async with self._lock:
+            return self._autoplay_mode
 
     async def current_track_ids(self) -> Optional[frozenset[str]]:
         """The current queue's track ids, or None if membership isn't
