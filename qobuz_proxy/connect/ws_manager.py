@@ -130,6 +130,9 @@ _QUEUE_POSITION_MESSAGE_TYPES = {
     105: "SRVR_CTRL_QUEUE_VERSION_CHANGED",
 }
 
+# SRVR_CTRL_SHUFFLE_MODE_SET — see WsManager._observe_shuffle_toggle (TEMP).
+_SHUFFLE_MODE_SET_MESSAGE_TYPE = 96
+
 # TEMP, investigative (2026-09-13) — a dedicated logger for the raw bytes
 # of every WS frame this proxy sends or receives, one line each, so a
 # capture from a real session can be diffed against a browser HAR of the
@@ -921,6 +924,8 @@ class WsManager:
                     handler(msg_type, msg)
                 except Exception as e:
                     logger.error(f"Handler error for type {msg_type}: {e}")
+            elif msg_type == _SHUFFLE_MODE_SET_MESSAGE_TYPE:
+                await self._observe_shuffle_toggle(msg)
             elif msg_type in _QUEUE_POSITION_MESSAGE_TYPES:
                 # See _QUEUE_POSITION_MESSAGE_TYPES — logged plainly (info,
                 # not warning: expected to arrive, not an error) so these
@@ -929,6 +934,20 @@ class WsManager:
                 logger.info(f"Observed queue message {type_name} (type {msg_type}): {msg}")
             else:
                 logger.warning(f"No handler for message type {msg_type}: {msg}")
+
+    async def _observe_shuffle_toggle(self, msg: Any) -> None:
+        """TEMP, investigative (2026-10-10) — log a SrvrCtrlShuffleModeSet
+        and immediately ask for a full queue snapshot, to see whether the
+        server's reply (a SRVR_CTRL_QUEUE_STATE) carries the shuffle state
+        and shuffledTrackIndexes after a toggle. See
+        docs/queue-and-shuffle-wire-observations.md, "Not yet observed".
+        Observation only: nothing acts on the reply, and nothing else
+        handles type 96. Remove once that question is answered."""
+        logger.info(f"Observed shuffle toggle (type {_SHUFFLE_MODE_SET_MESSAGE_TYPE}): {msg}")
+        try:
+            await self._send_ask_for_queue_state()
+        except Exception as e:
+            logger.warning(f"Could not ask for queue state after shuffle toggle: {e}")
 
     async def _flush_pending_messages(self) -> None:
         """Send any messages queued during disconnect."""

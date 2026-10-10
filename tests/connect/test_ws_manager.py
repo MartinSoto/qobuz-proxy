@@ -1037,3 +1037,49 @@ class TestStartStop:
         await ws_manager.stop()  # must not raise
 
         mock_ws.close.assert_awaited_once()
+
+
+class TestShuffleToggleDiagnostic:
+    """TEMP — see WsManager._observe_shuffle_toggle."""
+
+    @staticmethod
+    def _batch(msg_type: int) -> MagicMock:
+        msg = MagicMock()
+        msg.messageType = msg_type
+        batch = MagicMock()
+        batch.messages = [msg]
+        return batch
+
+    async def test_asks_for_queue_state_on_shuffle_mode_set(self, config: Config) -> None:
+        ws_manager = WsManager(config)
+        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
+            return_value=self._batch(96)
+        )
+        ws_manager._send_ask_for_queue_state = AsyncMock()  # type: ignore[method-assign]
+        decoded = MagicMock(payload=b"x")
+
+        await ws_manager._handle_payload(decoded)
+
+        ws_manager._send_ask_for_queue_state.assert_awaited_once()
+
+    async def test_other_unhandled_types_do_not_ask(self, config: Config) -> None:
+        ws_manager = WsManager(config)
+        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
+            return_value=self._batch(97)
+        )
+        ws_manager._send_ask_for_queue_state = AsyncMock()  # type: ignore[method-assign]
+
+        await ws_manager._handle_payload(MagicMock(payload=b"x"))
+
+        ws_manager._send_ask_for_queue_state.assert_not_awaited()
+
+    async def test_ask_failure_does_not_break_message_handling(self, config: Config) -> None:
+        ws_manager = WsManager(config)
+        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
+            return_value=self._batch(96)
+        )
+        ws_manager._send_ask_for_queue_state = AsyncMock(  # type: ignore[method-assign]
+            side_effect=OSError("socket gone")
+        )
+
+        await ws_manager._handle_payload(MagicMock(payload=b"x"))  # must not raise
