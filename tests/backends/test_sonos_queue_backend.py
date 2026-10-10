@@ -497,6 +497,28 @@ class TestAutoplayTail:
         assert keys_on(client) == K(10, 11)
 
 
+class TestCurrentContent:
+    async def test_the_entry_started_is_the_entry_the_device_holds(self) -> None:
+        """play() started `item=<track>`; the published entry is `item=<track>_<item>`
+        (seen live after a coordinator handoff: the retarget confirmation never
+        matched and timed out)."""
+        backend, client, _ = await make([1, 2])
+        await backend.play(meta(2))
+        await settled(backend)
+        held = client.device.urls[1]
+
+        assert backend._current_proxy_url != held  # the two spellings
+        assert backend._is_current_content(held)
+
+    async def test_another_entry_is_not(self) -> None:
+        backend, client, _ = await make([1, 2])
+        await backend.play(meta(2))
+        await settled(backend)
+
+        assert not backend._is_current_content(client.device.urls[0])
+        assert not backend._is_current_content(None)
+
+
 class TestOwnUrls:
     async def test_an_entry_naming_another_rooms_proxy_port_is_still_ours(self) -> None:
         backend, client, _ = await make([1, 2])

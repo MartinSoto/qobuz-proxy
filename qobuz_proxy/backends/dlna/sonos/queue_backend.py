@@ -101,6 +101,15 @@ class SonosQueueBackend(SonosBackend):
             and theirs.path.startswith("/audio/")
         )
 
+    def _is_current_content(self, uri: Optional[str]) -> bool:
+        """The entry the device holds is published as `item=<track>_<item>` while
+        play() started it as `item=<track>`: same entry, different spelling, so
+        compare what the URL says, not the string."""
+        if uri is None or self._current_key is None:
+            return uri == self._current_proxy_url
+        parsed = parse_entry_url(uri)
+        return parsed is not None and parsed.key == self._current_key
+
     @property
     def keeps_playing_on_shutdown(self) -> bool:
         """The device runs through its own queue; a restart of the proxy is

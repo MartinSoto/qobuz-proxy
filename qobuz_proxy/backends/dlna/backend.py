@@ -1046,6 +1046,13 @@ class DLNABackend(AudioBackend):
         moving to another entry of the queue it was given."""
         return None
 
+    def _is_current_content(self, uri: Optional[str]) -> bool:
+        """Whether the device's reported URI is the content we last started.
+        Exact match here; a backend whose device holds entries published under
+        another spelling of the URL than the one it started with compares by
+        identity instead (SonosQueueBackend)."""
+        return uri == self._current_proxy_url
+
     def _is_own_proxy_url(self, uri: str) -> bool:
         """Whether `uri` is served by this backend's own proxy — any track,
         not necessarily the one we currently think is playing. Each Speaker
@@ -1392,7 +1399,7 @@ class DLNABackend(AudioBackend):
                             f"[{self.name}] Polled while awaiting retarget confirmation: "
                             f"device reports {current_uri!r}, expecting {self._current_proxy_url!r}"
                         )
-                        if current_uri == self._current_proxy_url:
+                        if self._is_current_content(current_uri):
                             logger.info(
                                 f"[{self.name}] Retarget confirmed — device is now playing "
                                 "our content"
@@ -1459,7 +1466,7 @@ class DLNABackend(AudioBackend):
                             + (f", next={self._next_track_proxy_url!r}" if armed else "")
                         )
 
-                        if current_uri == self._current_proxy_url:
+                        if self._is_current_content(current_uri):
                             self._current_track_confirmed = True
                         await self._observe_polled_uri(current_uri)
 
