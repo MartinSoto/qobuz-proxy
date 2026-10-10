@@ -145,6 +145,14 @@ class Speaker:
         most one Speaker is ever active at a time."""
         return self._player is not None and self._player.is_active_renderer
 
+    @property
+    def stops_device_on_shutdown(self) -> bool:
+        """Whether shutting down should send the device a Stop: only to the
+        renderer actually being driven (never to one nobody selected), and not
+        to one meant to play on by itself (see keeps_playing_on_shutdown)."""
+        backend = self._backend
+        return self.is_active and not (backend is not None and backend.keeps_playing_on_shutdown)
+
     async def rename(self, new_name: str) -> bool:
         """
         Rename this speaker in place, without restarting playback.

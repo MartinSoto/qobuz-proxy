@@ -226,6 +226,13 @@ class AudioBackend(ABC):
         itself, so the default does nothing."""
         return None
 
+    @property
+    def keeps_playing_on_shutdown(self) -> bool:
+        """Whether the device is meant to play on when this proxy shuts down
+        (it plays a queue it holds itself and the next run carries on with
+        it). Default: no, an active device is stopped."""
+        return False
+
     async def playing_entry(self) -> Optional[AdoptedPlayback]:
         """The queue entry of ours the device is already playing or has paused,
         if it can tell (a backend that holds the queue on the device). Default:

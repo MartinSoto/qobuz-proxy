@@ -30,6 +30,7 @@ def _mock_speaker(name: str = "Manual", starts: bool = True) -> MagicMock:
     speaker.stop = AsyncMock()
     speaker.name = name
     speaker.is_active = False  # explicit default — a MagicMock attribute is truthy otherwise
+    speaker.stops_device_on_shutdown = False
     return speaker
 
 
@@ -136,6 +137,7 @@ class TestStopSpeakers:
         app = QobuzProxy(_make_config(sonos_auto_discover=False))
         speaker = _mock_speaker("Manual")
         speaker.is_active = True
+        speaker.stops_device_on_shutdown = True
         app._speakers.append(speaker)
 
         await app._stop_speakers()
@@ -146,6 +148,7 @@ class TestStopSpeakers:
         app = QobuzProxy(_make_config(sonos_auto_discover=False))
         speaker = _mock_speaker("Manual")
         speaker.is_active = False
+        speaker.stops_device_on_shutdown = False
         app._speakers.append(speaker)
 
         await app._stop_speakers()

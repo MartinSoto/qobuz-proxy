@@ -692,7 +692,7 @@ class QobuzProxy:
             # driven (Speaker.is_active) — shutting down (or logging out)
             # must not interrupt a renderer nobody has selected in the app.
             await asyncio.gather(
-                *[s.stop(send_device_stop=s.is_active) for s in self._speakers],
+                *[s.stop(send_device_stop=s.stops_device_on_shutdown) for s in self._speakers],
                 return_exceptions=True,
             )
             self._speakers = []

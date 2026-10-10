@@ -1137,3 +1137,30 @@ class TestSpeakerIsActive:
 
         speaker._player.is_active_renderer = False
         assert speaker.is_active is False
+
+
+class TestStopsDeviceOnShutdown:
+    def _speaker(self, active: bool, keeps_playing: bool):
+        speaker = Speaker(
+            config=_make_speaker_config(),
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
+        speaker._player = MagicMock(is_active_renderer=active)
+        speaker._backend = MagicMock(keeps_playing_on_shutdown=keeps_playing)
+        return speaker
+
+    def test_the_active_renderer_is_stopped(self):
+        assert self._speaker(active=True, keeps_playing=False).stops_device_on_shutdown
+
+    def test_a_renderer_nobody_selected_is_left_alone(self):
+        assert not self._speaker(active=False, keeps_playing=False).stops_device_on_shutdown
+
+    def test_a_device_playing_its_own_queue_is_left_playing(self):
+        assert not self._speaker(active=True, keeps_playing=True).stops_device_on_shutdown
+
+    def test_nothing_is_stopped_before_a_backend_exists(self):
+        speaker = self._speaker(active=True, keeps_playing=False)
+        speaker._backend = None
+        assert speaker.stops_device_on_shutdown

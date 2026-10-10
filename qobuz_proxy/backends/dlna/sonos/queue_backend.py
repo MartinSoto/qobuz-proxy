@@ -78,6 +78,12 @@ class SonosQueueBackend(SonosBackend):
         """The device advances through its own queue; nothing is armed."""
         return False
 
+    @property
+    def keeps_playing_on_shutdown(self) -> bool:
+        """The device runs through its own queue; a restart of the proxy is
+        no reason to silence it (the next run carries on, see playing_entry)."""
+        return True
+
     async def set_next_track(
         self, metadata: BackendTrackMetadata, queue_item_id: int = 0
     ) -> Optional[PlayResult]:

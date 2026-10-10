@@ -32,6 +32,7 @@ def _mock_speaker(name: str = "Kitchen", starts: bool = True) -> MagicMock:
     speaker.detach = AsyncMock()
     speaker.name = name
     speaker.is_active = False  # explicit default — a MagicMock attribute is truthy otherwise
+    speaker.stops_device_on_shutdown = False
     return speaker
 
 
@@ -626,6 +627,7 @@ class TestStop:
         controller = _make_controller()
         speaker = _mock_speaker("Kitchen")
         speaker.is_active = True
+        speaker.stops_device_on_shutdown = True
         controller._speakers_by_group_id["RINCON_A"] = speaker
 
         await controller.stop()
@@ -638,6 +640,7 @@ class TestStop:
         controller = _make_controller()
         speaker = _mock_speaker("Living Room")
         speaker.is_active = False
+        speaker.stops_device_on_shutdown = False
         controller._speakers_by_group_id["RINCON_A"] = speaker
 
         await controller.stop()
@@ -648,8 +651,10 @@ class TestStop:
         controller = _make_controller()
         active_speaker = _mock_speaker("Kitchen")
         active_speaker.is_active = True
+        active_speaker.stops_device_on_shutdown = True
         idle_speaker = _mock_speaker("Living Room")
         idle_speaker.is_active = False
+        idle_speaker.stops_device_on_shutdown = False
         controller._speakers_by_group_id["RINCON_A"] = active_speaker
         controller._speakers_by_group_id["RINCON_B"] = idle_speaker
 

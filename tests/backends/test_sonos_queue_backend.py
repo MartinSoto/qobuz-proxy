@@ -199,6 +199,9 @@ class TestPlay:
             "http://127.0.0.1:7120/audio/1?format=flac&i=1&s=x&v=5", "<d/>"
         )
 
+    def test_the_device_is_left_playing_on_shutdown(self) -> None:
+        assert SonosQueueBackend("10.0.0.5").keeps_playing_on_shutdown is True
+
     def test_gapless_arming_is_off(self) -> None:
         assert SonosQueueBackend("10.0.0.5").supports_gapless is False
 

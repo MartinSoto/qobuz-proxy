@@ -195,7 +195,7 @@ class SonosController:
 
         if self._speakers_by_group_id:
             await asyncio.gather(
-                *[s.stop(send_device_stop=s.is_active) for s in self.speakers],
+                *[s.stop(send_device_stop=s.stops_device_on_shutdown) for s in self.speakers],
                 return_exceptions=True,
             )
         self._speakers_by_group_id.clear()
