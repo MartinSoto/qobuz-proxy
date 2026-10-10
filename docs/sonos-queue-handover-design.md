@@ -636,3 +636,94 @@ version is stopped and the replay applied as before. Hardware check on Cocina
 (a first run "died" without a stop, a fresh one found item 1 at 63 s, ignored
 the replay of "item 0 paused" and followed the device on into item 2). Not
 covered: a device playing something else of ours from another session.
+
+## 11. Plan: following the device by events (2026-10-10, not started)
+
+### 11.1 Why
+
+The device is polled every 2 s (`DLNABackend._poll_state_loop`): a transport
+state read, a `GetPositionInfo` for the playing URI, a position read and a
+volume read per cycle, per active room. Consequences today:
+
+- a transition, a stop or a pause by someone else is noticed up to 2 s late;
+- a weak coordinator (a Sonos One, see the memory note on coordinator
+  overload) pays ~4 SOAP calls per 2 s for as long as it plays;
+- the cheap-to-add cases (takeover, a device-side Previous/Next) all wait for
+  the next tick.
+
+Phase 0 showed the coordinator pushes `AVTransport` `LastChange` events 0.1–
+0.5 s after a change, carrying `TransportState`, `CurrentTrack`,
+`NumberOfTracks`, `CurrentPlayMode`, `CurrentTrackURI`, `CurrentTrackDuration`
+and `CurrentTransportActions`, with the first event immediately on subscribing
+(9.2). A skipped entry gives no event; members send nothing per track (so the
+coordinator only, as for queue writes).
+
+What events will **not** replace: the position (`RelTime` is not evented), so
+the position keeps being read, just less often (the app interpolates from the
+timestamp we report, and the heartbeat is 5 s).
+
+### 11.2 Design
+
+1. **A general GENA client.** `SonosEventSubscriber` today holds one
+   subscription to one service (`ZoneGroupTopology`) with one `on_notify`
+   slot. Split it into: a client that subscribes/renews/unsubscribes any
+   service path, and a SID → handler table behind the one shared NOTIFY route
+   (registered before the web app starts, as today). The topology consumer
+   keeps its behavior and its tests.
+2. **`LastChange` parsing.** Pure function: NOTIFY body → the fields it
+   carries (deltas: an absent field means "unchanged"), `CurrentTrackURI`
+   handed to `parse_entry_url` like the poll does. Fixtures are real captures
+   from Cocina and Baño (grouped), taken first.
+3. **Events wake the existing loop; they do not rewrite it.** The decision
+   logic in `_poll_state_loop` (grace periods, stop confirmation, hijack,
+   `_observe_polled_uri`) is the product of many hardware lessons and stays as
+   it is. An event (a) caches the state and URI it carries with a timestamp and
+   (b) runs one loop cycle now. A cycle may take its state and URI from the
+   cache when the cache is younger than the previous cycle and the
+   subscription is healthy, and read the device otherwise.
+4. **Polling stays as the safety net**, slower while events are healthy
+   (10 s instead of 2 s, position included), back to 2 s the moment the
+   subscription is lost, missed a renewal or never produced its initial event.
+   No events mid-track is normal, so silence alone is not a health signal;
+   renewal and the initial event are.
+5. **Lifecycle** in `SonosQueueBackend` only (the plain `SonosBackend` and its
+   gapless path are untouched): subscribe to the coordinator's `AVTransport`
+   on connect and on retarget (resubscribe to the new coordinator, drop the
+   old SID), renew at ~80 % of the granted timeout, unsubscribe on disconnect.
+   Callback URL: the shared web app's NOTIFY route (host networking, which the
+   topology subscription already relies on), one path with the SID telling
+   rooms apart.
+6. **Volume** (a follow-up, not in the first cut): `GroupRenderingControl`
+   events would retire the volume read; to be verified on hardware first.
+
+### 11.3 Phases
+
+| | Work | Verified by |
+|---|---|---|
+| E0 | Capture real `LastChange` bodies: play, pause, next/previous from the Sonos app, queue end, repeat, group join/leave, a skipped entry, coordinator change | Cocina + Baño group; stored as test fixtures |
+| E1 | General GENA client + SID dispatch (topology unchanged); `LastChange` parser | unit tests, topology tests unchanged, fake NOTIFY |
+| E2 | Subscribe/renew/resubscribe in `SonosQueueBackend`; events wake the loop; polling unchanged (2 s) | hardware: transition latency poll vs event; renewal with a short timeout; retarget |
+| E3 | Cache + slower safety-net poll with automatic fallback | hardware: kill the subscription (block NOTIFY), expect the 2 s poll back; SOAP calls per minute before/after |
+| E4 | Volume events (optional) | hardware |
+
+E2 alone already gives the latency win with no behavior change in decisions;
+E3 is what lightens the coordinator and carries the real risk, so it ships
+separately and can be reverted on its own.
+
+### 11.4 Risks and open points
+
+- **NOTIFY must reach the container** (host networking is in use; a bridge
+  network would break it, and would break mDNS anyway).
+- **Subscription limits** on a Sonos device (the topology subscription plus one
+  per room; to be checked) and leaking SIDs on a crash (they expire by
+  themselves).
+- **Event ordering and coalescing**: one `LastChange` can carry several
+  changes, and a skipped entry produces none; the parser reports fields, the
+  loop decides, and the URI is always re-checked against `_current_key` as now.
+- **Coordinator handoff**: the subscription belongs to the old coordinator; the
+  retarget path must resubscribe, and the cache must be dropped with it.
+- **The first event after subscribing** repeats the current state; it must not
+  be taken for a transition.
+- **A flag or not**: proposed no new flag (it lives inside the handover
+  backend, which already is one) with the automatic fallback above; a kill
+  switch environment variable only if the first live run asks for it.
