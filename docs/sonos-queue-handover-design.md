@@ -580,3 +580,18 @@ Known gaps, in the order they matter:
 - The existing hijack check is unchanged (an own URL, any entry, is not a
   takeover); the redefinition in 5.5 is not needed so far.
 
+
+#### Live check after the duplicate-arming fix (2026-10-10)
+
+`b6f9fec` removes the old gapless arming in handover mode: the coordinator's
+device queue then held exactly the snapshot's entries (6 for a 6-track
+snapshot, no appended copies) with the transport on `x-rincon-queue:…#0`.
+Previous/Next from the Sonos side now work, which they could not with the
+one-or-two-entry queue.
+
+Open observation: the Sonos app does not list the queue while our entries
+play, whereas a source picked inside the Sonos app (Spotify, Idagio, Qobuz)
+shows its full queue. Unverified guess: the app decides from the item's
+service/source descriptor, which our plain `http-get` entries lack (all
+entries also show the device-filled `r:origID="1"`). Cosmetic for now since
+edits made in the Sonos app are out of scope.
