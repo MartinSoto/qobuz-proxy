@@ -813,3 +813,20 @@ the device went on into the next entry normally; different content, the entries
 were refused and it landed stopped on the first. Still open: an autoplay item
 the server forgot after a reload (its ids are regenerated) is not found by id;
 the proxy keeps reporting it.
+
+### 11.9 Events judged on their own (2026-10-10)
+
+With the miss fallback off (`DISTRUST_EVENTS_ON_MISS = False`, kept in the code)
+and the poll at 10 s while events are settled, a 10-minute side-by-side with the
+Sonos app on a grouped room (Sala and Cuarto): 22 events logged, no missed change
+apart from one false alarm at each rejoin (the first poll cycle compares the
+device with the backend's initial state 30 ms before the event for the same
+state arrives). Reactions in the Qobuz app: pause/resume and track changes
+about 1 s, seeks 0.7 to 1.5 s (the device's own TRANSITIONING time plus one
+cycle); the position jump is reported at once. One small inefficiency left: a
+seek is reported first with the old position (from the state change handler) and
+about 0.1 s later with the new one (from the jump handler).
+Lessons from the failure on the way (a quiet but dead subscription looks like a
+quiet healthy one): `healthy` means only that an event once arrived; a poll that
+finds a change no event announced is the only evidence of a dead one, which is
+why the miss is logged (and can be acted on again with the switch).
