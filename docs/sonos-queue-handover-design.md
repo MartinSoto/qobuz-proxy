@@ -491,3 +491,48 @@ plan: handing the stream `blob` to the player when the device requests an entry
 (Phase 4, it is the first thing needed there); "capabilities handed in once" is
 unnecessary since `publish_track` takes them as an argument.
 
+### Phase 3 — publisher (2026-10-10)
+Done, each as its own commit; 1331 tests passing. Nothing in playback uses it
+yet (Phase 4 wires it in behind the flag):
+- `30c6978` **client actions** on `SonosClient`: `add_uris_to_queue` (≤16),
+  `remove_queue_range`, `move_queue_range`, `set_play_mode`,
+  `seek_to_queue_position`, `browse_queue`; typed results carrying the device's
+  `UpdateID` and UPnP error code. Every one is sent once and a UPnP answer is
+  final (new `retry_upnp_errors` switch): a blind retry of a state-changing
+  action could apply it twice.
+- `427ae87` **planner** (`queue_plan.py`): the minimal remove/move/insert
+  operations that turn the device's queue into the desired one without touching
+  the playing entry (longest in-order stretch kept, rest moved next to their
+  predecessors, rebuild around the playing entry when cheaper). `apply_ops`
+  encodes the measured device semantics. Checked on 1500 random edit scenarios
+  each for "reaches the desired queue" and "never removes or moves the playing
+  entry".
+- `13b1c76` **executor** (`queue_sync.py`, `SonosQueueSync`): `load` publishes a
+  generation starting with the batch holding the entry to play and calls back so
+  playback starts while the rest goes out; `reconcile` applies the plan, reads
+  the queue back and repairs itself (refused step, mismatch, reply lost after
+  the change, someone else's edit, cancelled call). Tested against a fake
+  device written independently of the planner's reference model; three
+  deliberate breakages of the executor were each caught.
+- `26bcec7`, `d46bf19` **entry builder** (`entry_builder.py`): URL and DIDL per
+  entry from one batch-metadata call (cached), the publish-time container choice
+  and the shared DIDL builder (moved to `dlna/didl.py`); no per-track stream
+  request.
+- `9b4d9c2` **runner** (`queue_sync_runner.py`): one operation at a time per
+  speaker; newest reconcile replaces any pending one; a load cancels the running
+  operation and absorbs reconciles that arrive meanwhile; failures go to a
+  callback.
+
+Hardware validation, real Sonos One (Cocina, muted, 40-entry queue, playing item
+20 throughout): the load took 0.99 s with playback starting after the first
+batch; play-next insert 1 call / 0.10 s; drag 1 call / 0.04 s; removing three
+entries 2 calls / 0.06 s; two fresh shuffles (playing entry first and in the
+middle) 5 and 4 calls / 0.25 s; back to original order 6 calls / 0.32 s. After
+every step the device queue equalled the desired one and the playing entry had
+not restarted (its position kept advancing; only its track number moved).
+
+Findings during the work: removing a range that runs past the end is refused
+(UPnP 402, not clamped); `ReorderTracksInQueue` answers with no new `UpdateID`.
+Not yet done: the runtime wiring, play-mode (repeat) relay, following the device
+(item-change events) and reporting: Phases 4 and 5.
+

@@ -524,6 +524,48 @@ Two separate faults: (1) at the end of the queue the proxy keeps no track to
 resume (see O2, design implication 10); (2) when PLAY cannot be honored, the
 app must be told immediately (report stopped), not left hanging.
 
+### O23 — Autoplay lists follow user removes and reorders, never anything we send
+Across the captures every type 103 (autoplay suggestions) arrived 0.2–0.7 s
+after a **remove or reorder** made in the app, and never after an insert, an
+add, a shuffle toggle or any message of ours:
+
+| Capture | Time | Preceding message | List |
+|---|---|---|---|
+| 1 | 13:03:05 | reorder (v9.4) | v9.5, ids 14–63 |
+| 1 | 13:03:18 | remove (v9.6) | v9.7, ids 64–113 |
+| 1 | 13:03:24 | reorder (v9.8) | v9.9, ids 114–163 |
+| 2 | 13:24:31 | remove (v20.3) | v20.4, 42 tracks |
+| 2 | 13:24:36 | reorder (v20.5) | v20.6, 42 tracks |
+| 3 | 13:31:11–13:31:54 | add, insert, reorder ×5, remove ×2 | **none** (versions advance by exactly one per edit) |
+
+The earlier insert (13:02:30) and add (13:02:37) in capture 1 produced no list.
+Capture 3 is the exception and is not explained: it had the same kinds of edits
+(with shuffle on) but no new lists; it is also the capture in which the proxy
+asked for a queue snapshot after every edit, while captures 1 and 2 sent
+nothing but state reports. The snapshots themselves never carry autoplay data
+(`autoplayMode`/`autoplayTracks` absent in all of them). The proxy sends no
+autoplay message of any kind (no `CtrlSrvrSetAutoplayMode`/`AutoplayLoadTracks`
+anywhere in the code); a list created earlier in a session keeps being used at
+every queue end until autoplay is toggled on and off (O21). Reported by the
+user (2026-10-10, container build with the ask-after-edit): autoplay continuing
+past the last track "without autoplay enabled", consistent with edits made
+earlier in the same session. Whether asking for snapshots suppresses list
+generation, or whether capture 3 simply fell in a window where the server had
+no reason to regenerate, is open; the INFO lines `Autoplay suggestions loaded`
+and `Next track … is not in the queue` (commit `ddfea70` follow-up) now show
+when it happens.
+
+### O24 — Short plays and skipping seen during Phase 3 work were caused by hardware experiments
+The user saw a track play for a few seconds and jump to the next, repeatedly,
+once after tapping the playing track (2026-10-10 16:19 local). The container's
+log for that minute shows `Track ended naturally` 8–11 s after each start and
+`RemoveTrackFromQueue` failing with UPnP 800 repeatedly, exactly while queue
+experiments (clear/add/reorder) were being run on the same room for Phase 3
+(the room's queue was reshaped under the playing proxy, the transport stopped,
+the proxy read that as the track ending and advanced). Not a product bug; noted
+so it is not chased again. Re-tapping the playing track restarted it as intended
+(the `force_reload` change).
+
 ## Not yet observed
 
 - ~~A type 91 with `shuffleMode: true` and/or `shufflePivotQueueItemId`.~~
