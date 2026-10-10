@@ -552,7 +552,7 @@ past the last track "without autoplay enabled", consistent with edits made
 earlier in the same session. Whether asking for snapshots suppresses list
 generation, or whether capture 3 simply fell in a window where the server had
 no reason to regenerate, is open; the INFO lines `Autoplay suggestions loaded`
-and `Next track … is not in the queue` (commit `ddfea70` follow-up) now show
+and `Next track … is not in the queue` (commit `b1acd92`) now show
 when it happens.
 
 ### O24 — Short plays and skipping seen during Phase 3 work were caused by hardware experiments
