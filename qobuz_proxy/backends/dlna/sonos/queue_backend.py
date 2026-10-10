@@ -161,6 +161,12 @@ class SonosQueueBackend(SonosBackend):
     async def _on_transport_event(self, event: TransportEvent) -> None:
         """The device says something changed: look now rather than at the next
         tick. What it changed is read the usual way (see _poll_state_loop)."""
+        if event.transport_state == "TRANSITIONING":
+            # The device is between entries and says nothing yet: a cycle now
+            # would read the same, and its spacing would then hold back the
+            # cycle the PLAYING event right behind it wants (captured: 0.75 s
+            # later). If that never comes, the interval poll still does.
+            return
         self.wake_poll()
 
     async def disconnect(self, send_device_stop: bool = True) -> None:

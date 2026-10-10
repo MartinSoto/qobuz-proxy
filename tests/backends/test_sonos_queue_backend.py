@@ -602,6 +602,16 @@ class TestDeviceEvents:
 
         backend.wake_poll.assert_called_once()
 
+    async def test_a_transitioning_event_does_not_wake_it(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos.transport_events import TransportEvent
+
+        backend, _, _ = await make([1])
+        backend.wake_poll = MagicMock()  # type: ignore[method-assign]
+
+        await backend._on_transport_event(TransportEvent(transport_state="TRANSITIONING"))
+
+        backend.wake_poll.assert_not_called()
+
     async def test_something_that_is_not_a_source_is_ignored(self) -> None:
         backend, _, _ = await make([1])
 
