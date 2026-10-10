@@ -93,7 +93,9 @@ class TestQueueTracksLoadedPlaysSelectedTrack:
         msg = _queue_tracks_loaded_msg(tracks=[(0, 3001)], queue_position=0)
         await handler._handle_queue_tracks_loaded(msg)
 
-        assert player.current_position_ms == 0
+        # Interpolated from a wall-clock timestamp while playing: a millisecond of
+        # elapsed time between the load and this read is not a stale position.
+        assert player.current_position_ms < 500
 
     async def test_propagates_context_uuid_from_the_track(self) -> None:
         player, backend = _make_player()
