@@ -91,6 +91,7 @@ class SonosQueueBackend(SonosBackend):
         self._event_source: Optional[EventSource] = None
         self._events: Optional[TransportEventStream] = None
         self._volume_events: Optional[ServiceEventStream[GroupVolumeEvent]] = None
+        self._polling_slowly = False
 
     @property
     def supports_gapless(self) -> bool:
@@ -221,9 +222,18 @@ class SonosQueueBackend(SonosBackend):
 
     def _poll_interval(self) -> float:
         interval = super()._poll_interval()
-        if interval == STATE_POLL_INTERVAL_SECONDS and self._events_settled():
-            return SAFETY_NET_POLL_INTERVAL_SECONDS
-        return interval  # backed off, idle or unsure of the events: as before
+        slow = interval == STATE_POLL_INTERVAL_SECONDS and self._events_settled()
+        if slow != self._polling_slowly:
+            self._polling_slowly = slow
+            logger.info(
+                f"[{self.name}] device events "
+                + (
+                    f"are healthy: polling every {SAFETY_NET_POLL_INTERVAL_SECONDS:.0f}s"
+                    if slow
+                    else f"not settled: polling every {STATE_POLL_INTERVAL_SECONDS:.0f}s"
+                )
+            )
+        return SAFETY_NET_POLL_INTERVAL_SECONDS if slow else interval
 
     async def _on_transport_event(self, event: TransportEvent) -> None:
         """The device says something changed: look now rather than at the next
