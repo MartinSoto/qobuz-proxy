@@ -115,6 +115,12 @@ IDLE_POLL_INTERVAL_SECONDS = 30.0
 # independently — detection within a few seconds is plenty.
 _HIJACK_CHECK_INTERVAL_POLLS = 6
 
+# A device event wakes the poll loop early (see wake_poll), but never closer
+# to the previous cycle than this: the stop-confirmation logic counts cycles,
+# and a burst of events (TRANSITIONING then PLAYING within 0.3 s) must not
+# count as several independent observations.
+MIN_EVENT_CYCLE_GAP_SECONDS = 1.0
+
 # A STOPPED read while we think we're still PAUSED or PLAYING (a confirmed
 # external stop, or a natural end nothing else caught) is trusted only
 # once _device_confirms_stopped() has actually returned True this many
@@ -628,6 +634,33 @@ class DLNABackend(AudioBackend):
             self._client = None
 
         logger.info(f"Disconnected from DLNA device: {self.name}")
+
+    # Set by wake_poll(): something just happened on the device (an event), so
+    # the next cycle need not wait out its interval. Created on first use (the
+    # class-level defaults also keep backends built without __init__ working).
+    _poll_wake: Optional[asyncio.Event] = None
+    _last_cycle_at: float = 0.0
+
+    def wake_poll(self) -> None:
+        """Run the next poll cycle now (spaced from the last one, see
+        MIN_EVENT_CYCLE_GAP_SECONDS) instead of when its interval is up: the
+        device just told us something changed. Cheap and coalescing."""
+        if self._poll_wake is None:
+            self._poll_wake = asyncio.Event()
+        self._poll_wake.set()
+
+    async def _sleep_until_next_cycle(self) -> None:
+        interval = self._poll_interval()
+        if self._poll_wake is None:
+            self._poll_wake = asyncio.Event()
+        try:
+            await asyncio.wait_for(self._poll_wake.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            return
+        self._poll_wake.clear()
+        spare = MIN_EVENT_CYCLE_GAP_SECONDS - (time.monotonic() - self._last_cycle_at)
+        if spare > 0:
+            await asyncio.sleep(spare)
 
     def _start_polling(self) -> None:
         """Start (or resume) _poll_state_loop if it isn't already running —
@@ -1325,7 +1358,8 @@ class DLNABackend(AudioBackend):
         """
         while self._is_connected:
             try:
-                await asyncio.sleep(self._poll_interval())
+                await self._sleep_until_next_cycle()
+                self._last_cycle_at = time.monotonic()
 
                 if not self._is_connected:
                     break

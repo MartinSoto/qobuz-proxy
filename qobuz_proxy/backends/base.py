@@ -233,6 +233,11 @@ class AudioBackend(ABC):
         it). Default: no, an active device is stopped."""
         return False
 
+    async def attach_events(self, source: object) -> None:
+        """Let the backend receive device events through `source` (a
+        SonosEventSubscriber's EventSource). Default: events are not used."""
+        return None
+
     async def playing_entry(self) -> Optional[AdoptedPlayback]:
         """The queue entry of ours the device is already playing or has paused,
         if it can tell (a backend that holds the queue on the device). Default:

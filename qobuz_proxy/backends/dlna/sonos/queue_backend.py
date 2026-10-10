@@ -33,9 +33,12 @@ from .audio_url import EntryKey, parse_entry_url
 from .backend import SonosBackend
 from .client import SonosClient
 from .entry_builder import ProxyEntryBuilder
+from .events import EventSource
 from .proxy_server import SonosAudioProxyServer
 from .queue_sync import SonosQueueSync
 from .queue_sync_runner import QueueSyncRunner
+from .transport_events import TransportEvent
+from .transport_subscription import TransportEventStream
 
 if TYPE_CHECKING:
     from qobuz_proxy.playback.queue import QobuzQueue
@@ -73,6 +76,10 @@ class SonosQueueBackend(SonosBackend):
         # queue so the device runs on into them by itself.
         self._pointer: Optional[EntryKey] = None
         self._tail: list[EntryKey] = []
+        # Device events (AVTransport LastChange) wake the poll loop; see
+        # attach_events. None until given a source (or when there is none).
+        self._event_source: Optional[EventSource] = None
+        self._events: Optional[TransportEventStream] = None
 
     @property
     def supports_gapless(self) -> bool:
@@ -127,7 +134,37 @@ class SonosQueueBackend(SonosBackend):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Device events
+    # ------------------------------------------------------------------
+
+    async def attach_events(self, source: object) -> None:
+        if not isinstance(source, EventSource):
+            return
+        self._event_source = source
+        await self._start_events()
+
+    async def _start_events(self) -> None:
+        """(Re)subscribe to the AVTransport events of the device we are
+        driving now: the coordinator, the only one that reports the queue."""
+        source = self._event_source
+        if source is None or self._client is None:
+            return
+        if self._events is None:
+            self._events = TransportEventStream(source, self.name, self._on_transport_event)
+        await self._events.start(self._ip, self._port)
+
+    async def _stop_events(self) -> None:
+        if self._events is not None:
+            await self._events.stop()
+
+    async def _on_transport_event(self, event: TransportEvent) -> None:
+        """The device says something changed: look now rather than at the next
+        tick. What it changed is read the usual way (see _poll_state_loop)."""
+        self.wake_poll()
+
     async def disconnect(self, send_device_stop: bool = True) -> None:
+        await self._stop_events()
         await self._reset_queue_state()
         await super().disconnect(send_device_stop)
 
@@ -135,8 +172,9 @@ class SonosQueueBackend(SonosBackend):
         ok = await super().retarget(ip, port, description_url)
         if ok:
             # What the old device held says nothing about the new one: the next
-            # play publishes the queue again.
+            # play publishes the queue again, and its events are another's.
             await self._reset_queue_state()
+            await self._start_events()
         return ok
 
     async def _reset_queue_state(self) -> None:

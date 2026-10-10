@@ -9,7 +9,7 @@ run concurrently, one per physical audio device.
 import asyncio
 import functools
 import logging
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from aiohttp import web
 
@@ -43,6 +43,9 @@ from qobuz_proxy.playback.play_reporter import PlayReporter
 from qobuz_proxy.playback.state_reporter import PlaybackStateReport
 from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
 from qobuz_proxy.backends.dlna import AudioProxyServerProtocol, DLNABackend
+
+if TYPE_CHECKING:
+    from qobuz_proxy.backends.dlna.sonos.events import EventSource
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,7 @@ class Speaker:
         app_id: str,
         stream_resolver: QobuzStreamResolver,
         web_app: Optional[web.Application] = None,
+        event_source: Optional["EventSource"] = None,
     ) -> None:
         """
         Initialize Speaker.
@@ -97,6 +101,7 @@ class Speaker:
         self._app_id = app_id
         self._stream_resolver = stream_resolver
         self._web_app = web_app
+        self._event_source = event_source
 
         self._is_running: bool = False
         self._ws_connected_event: asyncio.Event = asyncio.Event()
@@ -536,6 +541,12 @@ class Speaker:
             # device at full speed for hours after the control channel has
             # already gone quiet.
             backend.set_idle_check(self._player.is_worth_keeping_ws_alive)
+        if self._event_source is not None:
+            # A failure here costs nothing but the speed-up: polling goes on.
+            try:
+                await backend.attach_events(self._event_source)
+            except Exception as e:
+                logger.warning(f"[{self.name}] could not use device events: {e}")
         self._components_ready.set()
 
     async def stop(self, send_device_stop: bool = True) -> None:

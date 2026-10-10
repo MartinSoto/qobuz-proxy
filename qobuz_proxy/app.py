@@ -31,7 +31,7 @@ from qobuz_proxy.config import (
     slugify_name,
 )
 from qobuz_proxy.backends.dlna.sonos import SonosController
-from qobuz_proxy.backends.dlna.sonos.events import SonosEventSubscriber
+from qobuz_proxy.backends.dlna.sonos.events import EventSource, SonosEventSubscriber
 from qobuz_proxy.playback.stream_resolver import QobuzStreamResolver
 from qobuz_proxy.speaker import Speaker
 from qobuz_proxy.webui.config_writer import save_config
@@ -90,6 +90,7 @@ class QobuzProxy:
         # this is created unconditionally in _start_web_server(), and
         # SonosController attaches/detaches as it starts/stops.
         self._sonos_event_subscriber: Optional[SonosEventSubscriber] = None
+        self._event_source: Optional[EventSource] = None
 
         # Speakers
         self._speakers: list[Speaker] = []
@@ -333,6 +334,7 @@ class QobuzProxy:
             api_client=self._api_client,
             app_id=self._app_id,
             stream_resolver=self._stream_resolver,
+            event_source=self._event_source,
         )
         started = await speaker.start()
         if not started:
@@ -416,6 +418,7 @@ class QobuzProxy:
             api_client=self._api_client,
             app_id=self._app_id,
             stream_resolver=self._stream_resolver,
+            event_source=self._event_source,
         )
         started = await new_speaker.start()
         if speaker_idx is not None:
@@ -497,6 +500,9 @@ class QobuzProxy:
         # runner below freezes the router.
         self._sonos_event_subscriber = SonosEventSubscriber()
         self._sonos_event_subscriber.register_route(self._web_app)
+        self._event_source = EventSource.create(
+            self._sonos_event_subscriber, self._config.server.http_port
+        )
 
         self._web_runner = web.AppRunner(self._web_app, access_log=None)
         await self._web_runner.setup()
@@ -564,6 +570,7 @@ class QobuzProxy:
                 api_client=self._api_client,
                 app_id=self._app_id,
                 stream_resolver=self._stream_resolver,
+                event_source=self._event_source,
             )
             for sc in configs
         ]
@@ -655,6 +662,7 @@ class QobuzProxy:
                     api_client=self._api_client,
                     app_id=self._app_id,
                     stream_resolver=self._stream_resolver,
+                    event_source=self._event_source,
                 )
                 try:
                     started = await speaker.start()

@@ -330,7 +330,26 @@ class SonosEventSubscriber:
         return web.Response(status=200)
 
 
+@dataclass(frozen=True)
+class EventSource:
+    """What a backend needs to receive device events: the shared subscriber
+    (one NOTIFY route for the whole process) and the URL devices reach it at."""
+
+    subscriber: SonosEventSubscriber
+    callback_url: str
+
+    @classmethod
+    def create(cls, subscriber: SonosEventSubscriber, http_port: int) -> Optional["EventSource"]:
+        """None when this host's address cannot be determined (events are then
+        simply not used, polling stays)."""
+        local_ip = get_local_ip()
+        if not local_ip or not http_port:
+            return None
+        return cls(subscriber, f"http://{local_ip}:{http_port}{subscriber.callback_path}")
+
+
 __all__ = [
+    "EventSource",
     "GenaSubscription",
     "SonosEventSubscriber",
     "get_local_ip",

@@ -567,3 +567,73 @@ class TestCarryingOn:
 
         assert backend._current_key == EntryKey("2", 2)
         assert keys_on(client) == K(1, 3, 2)
+
+
+class TestDeviceEvents:
+    """An AVTransport event wakes the poll loop; the subscription follows the
+    device the backend drives."""
+
+    def _source(self):  # type: ignore[no-untyped-def]
+        from qobuz_proxy.backends.dlna.sonos.events import EventSource, SonosEventSubscriber
+
+        subscriber = SonosEventSubscriber()
+        subscriber.subscribe_service = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        subscriber.unsubscribe_service = AsyncMock()  # type: ignore[method-assign]
+        return EventSource(subscriber, "http://cb/sonos-events"), subscriber
+
+    async def test_attaching_subscribes_to_the_device_we_drive(self) -> None:
+        backend, _, _ = await make([1])
+        source, subscriber = self._source()
+
+        await backend.attach_events(source)
+
+        args = subscriber.subscribe_service.await_args.args  # type: ignore[attr-defined]
+        assert args[0] == backend._ip and args[1] == backend._port
+        assert args[2].endswith("/AVTransport/Event") and args[3] == "http://cb/sonos-events"
+        await backend._stop_events()
+
+    async def test_an_event_wakes_the_poll_loop(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos.transport_events import TransportEvent
+
+        backend, _, _ = await make([1])
+        backend.wake_poll = MagicMock()  # type: ignore[method-assign]
+
+        await backend._on_transport_event(TransportEvent(transport_state="PLAYING"))
+
+        backend.wake_poll.assert_called_once()
+
+    async def test_something_that_is_not_a_source_is_ignored(self) -> None:
+        backend, _, _ = await make([1])
+
+        await backend.attach_events(object())
+
+        assert backend._events is None
+
+    async def test_disconnecting_stops_the_subscription(self) -> None:
+        backend, _, _ = await make([1])
+        source, _ = self._source()
+        await backend.attach_events(source)
+        stream = backend._events
+        assert stream is not None
+        stream.stop = AsyncMock()  # type: ignore[method-assign]
+
+        await backend.disconnect(send_device_stop=False)
+
+        stream.stop.assert_awaited()
+
+    async def test_a_retarget_moves_the_subscription(self) -> None:
+        backend, _, _ = await make([1])
+        source, subscriber = self._source()
+        await backend.attach_events(source)
+        backend._events.start = AsyncMock()  # type: ignore[union-attr, method-assign]
+        backend._client = backend._client or MagicMock()
+
+        from unittest.mock import patch
+
+        with patch.object(
+            type(backend).__mro__[2], "retarget", AsyncMock(return_value=True)
+        ):  # the plain retarget: only what follows it is under test
+            ok = await backend.retarget("10.0.0.9", 1400)
+
+        assert ok
+        backend._events.start.assert_awaited_once_with(backend._ip, backend._port)  # type: ignore[union-attr]

@@ -37,7 +37,7 @@ from qobuz_proxy.config import (
 
 from ..client import DLNAClient
 from .discovery_manager import DepartedMember, SonosDiscoveryManager, SonosRoom
-from .events import SonosEventSubscriber
+from .events import EventSource, SonosEventSubscriber
 
 if TYPE_CHECKING:
     # Deferred to runtime (see start()/_on_room_found()) — qobuz_proxy.speaker
@@ -123,6 +123,7 @@ class SonosController:
         self._app_id = app_id
         self._webui_http_port = webui_http_port
         self._event_subscriber = event_subscriber
+        self._event_source = EventSource.create(event_subscriber, webui_http_port)
         self._stream_resolver = stream_resolver
         # config.py's load_config() only applies the "gain implies
         # downsampling" normalization to config.speakers — empty in
@@ -253,6 +254,7 @@ class SonosController:
             api_client=self._api_client,
             app_id=self._app_id,
             stream_resolver=self._stream_resolver,
+            event_source=self._event_source,
         )
 
         # Register (tracking key) before the slow part (speaker.start(): DLNA
