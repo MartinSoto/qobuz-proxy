@@ -123,6 +123,7 @@ class PlaybackCommandHandler:
         self._request_queue_state = request_queue_state
         self._snapshot_debounce_s = snapshot_debounce_s
         self._snapshot_dirty = False
+        self._snapshot_reasons: list[str] = []
         self._snapshot_task: Optional["asyncio.Task[None]"] = None
 
         # Store next track info for auto-advance (from SET_STATE nextQueueItem)
@@ -370,7 +371,7 @@ class PlaybackCommandHandler:
         if loaded.shuffleMode:
             # Never seen on the wire (O9): a load does not carry the shuffled
             # order, so ask for it rather than guess.
-            self._request_snapshot_soon()
+            self._request_snapshot_soon("load with shuffle on")
 
         if not self.player.is_active_renderer:
             logger.debug("Not the active renderer, ignoring QUEUE_TRACKS_LOADED")
@@ -458,6 +459,12 @@ class PlaybackCommandHandler:
             shuffle_mode=state.shuffleMode,
             shuffled_indexes=list(state.shuffledTrackIndexes),
         )
+        shuffled = await self.queue.shuffle_enabled()
+        logger.info(
+            f"Queue snapshot applied: {len(state.tracks)} track(s), "
+            f"version {state.queueVersion.major}.{state.queueVersion.minor}, "
+            f"shuffle {'on' if shuffled else 'off'}"
+        )
 
     async def _handle_queue_tracks_added(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksAdded (type 93) — a genuine
@@ -469,7 +476,7 @@ class PlaybackCommandHandler:
         added = message.srvrCtrlQueueTracksAdded
         await self._note_version(added)
         await self.queue.add_queue_tracks([(t.queueItemId, str(t.trackId)) for t in added.tracks])
-        self._request_snapshot_soon()
+        self._request_snapshot_soon("tracks added")
 
     async def _handle_queue_tracks_inserted(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksInserted (type 92) — membership-wise
@@ -483,7 +490,7 @@ class PlaybackCommandHandler:
         await self.queue.add_queue_tracks(
             [(t.queueItemId, str(t.trackId)) for t in inserted.tracks]
         )
-        self._request_snapshot_soon()
+        self._request_snapshot_soon("tracks inserted")
 
     async def _handle_queue_tracks_removed(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksRemoved (type 94) — a delta carrying
@@ -493,7 +500,7 @@ class PlaybackCommandHandler:
         removed = message.srvrCtrlQueueTracksRemoved
         await self._note_version(removed)
         await self.queue.remove_queue_tracks(list(removed.queueItemIds))
-        self._request_snapshot_soon()
+        self._request_snapshot_soon("tracks removed")
 
     async def _handle_queue_tracks_reordered(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksReordered (type 95) — a pure
@@ -505,7 +512,7 @@ class PlaybackCommandHandler:
         reordered = message.srvrCtrlQueueTracksReordered
         await self._note_version(reordered)
         await self.queue.mark_order_stale()
-        self._request_snapshot_soon()
+        self._request_snapshot_soon("tracks reordered")
 
     async def _handle_queue_cleared(self, message: Any) -> None:
         """Handle SrvrCtrlQueueCleared (type 89)."""
@@ -527,7 +534,7 @@ class PlaybackCommandHandler:
         await self._note_version(toggled)
         logger.info(f"Shuffle toggled: {'on' if toggled.shuffleOn else 'off'}")
         await self.queue.mark_order_stale()
-        self._request_snapshot_soon()
+        self._request_snapshot_soon("shuffle toggled")
 
     async def _handle_loop_mode_set(self, message: Any) -> None:
         """Handle SrvrCtrlLoopModeSet (type 97): the repeat mode, announced
@@ -569,7 +576,7 @@ class PlaybackCommandHandler:
                 QueueVersion(major=payload.queueVersion.major, minor=payload.queueVersion.minor)
             )
 
-    def _request_snapshot_soon(self) -> None:
+    def _request_snapshot_soon(self, reason: str = "queue change") -> None:
         """Ask the server for a fresh queue snapshot once the current burst
         of edits has settled. Every call marks the request wanted again, so
         an edit arriving after the ask went out (and so not covered by its
@@ -577,6 +584,8 @@ class PlaybackCommandHandler:
         settling time share one request."""
         if self._request_queue_state is None:
             return
+        if reason not in self._snapshot_reasons:
+            self._snapshot_reasons.append(reason)
         self._snapshot_dirty = True
         if self._snapshot_task is None or self._snapshot_task.done():
             self._snapshot_task = asyncio.create_task(self._snapshot_request_loop())
@@ -586,6 +595,9 @@ class PlaybackCommandHandler:
         while self._snapshot_dirty:
             await asyncio.sleep(self._snapshot_debounce_s)
             self._snapshot_dirty = False  # everything seen so far is covered by this ask
+            reasons = ", ".join(self._snapshot_reasons)
+            self._snapshot_reasons = []
+            logger.info(f"Requesting a fresh queue snapshot after: {reasons}")
             try:
                 await self._request_queue_state()
             except Exception as e:

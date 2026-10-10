@@ -6,6 +6,7 @@ See docs/queue-and-shuffle-wire-observations.md (O7, O10, O16, O19, O21).
 """
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -111,6 +112,16 @@ class TestSnapshotMessage:
         assert order is not None
         assert [e.queue_item_id for e in order] == [5, 6, 7]
 
+    async def test_the_applied_snapshot_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        handler, _, _ = _handler()
+
+        with caplog.at_level(logging.INFO):
+            await handler._handle_queue_state(
+                _snapshot_msg([5, 6, 7], shuffle=True, indexes=[0, 2, 1], version=(21, 2))
+            )
+
+        assert "Queue snapshot applied: 3 track(s), version 21.2, shuffle on" in caplog.text
+
     async def test_a_snapshot_does_not_trigger_another_request(self) -> None:
         handler, _, request = _handler()
 
@@ -138,6 +149,20 @@ class TestEditsRequestASnapshot:
         await _settle()
 
         request.assert_awaited_once()
+
+    async def test_the_request_is_logged_with_what_triggered_it(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        handler, _, _ = _handler()
+
+        with caplog.at_level(logging.INFO):
+            for kind in ("reordered", "removed", "reordered"):
+                await handler.handle_message(_edit_msg(kind).messageType, _edit_msg(kind))
+            await _settle()
+
+        assert "Requesting a fresh queue snapshot after: tracks reordered, tracks removed" in (
+            caplog.text
+        )
 
     async def test_a_burst_of_edits_shares_one_request(self) -> None:
         handler, _, request = _handler()
