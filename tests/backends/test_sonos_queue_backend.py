@@ -876,6 +876,16 @@ class TestEventsThatMissedAChange:
 
         assert backend._distrust_events_until == 0.0
 
+    def test_a_change_our_own_play_just_made_is_not_a_miss(self) -> None:
+        import time as _time
+
+        backend = self._slow()
+        backend._playback_started_at = _time.monotonic() - 1
+
+        backend._poll_observed("state")
+
+        assert backend._distrust_events_until == 0.0
+
     def test_nothing_is_distrusted_while_polling_closely_anyway(self) -> None:
         backend = self._slow()
         backend._polling_slowly = False

@@ -264,6 +264,8 @@ class SonosQueueBackend(SonosBackend):
         now = time.monotonic()
         if now - self._last_event_at <= EVENT_ANNOUNCE_WINDOW_SECONDS:
             return
+        if now - self._playback_started_at <= EVENT_ANNOUNCE_WINDOW_SECONDS:
+            return  # the change our own play() just made, which the poll saw first
         if not DISTRUST_EVENTS_ON_MISS:
             logger.warning(
                 f"[{self.name}] the poll noticed a {kind} change no event announced "
