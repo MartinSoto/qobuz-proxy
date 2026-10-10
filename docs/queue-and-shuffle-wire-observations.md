@@ -497,13 +497,13 @@ on and immediately off again:
   possibilities are a server-side flag left on by an earlier session or client,
   or lists created after edits regardless of the setting. Either way, the end
   of the queue can run into autoplay even though the app shows autoplay off.
-- **Wire layout of `SrvrCtrlAutoplayModeSet` (type 102) differs from our
-  proto.** The raw frames are: field 1 queueVersion, field 2 actionUuid, field 3
+- **Wire layout of `SrvrCtrlAutoplayModeSet` (type 102) differed from our
+  proto (fixed in `0c09493`).** The raw frames are: field 1 queueVersion, field 2 actionUuid, field 3
   bool (set = on, absent = off), field 4 bool (`1` = loading, set in both
-  messages). Our `protos/qconnect_payload.proto` declares a single
-  `autoplayOn = 1`, so both messages decode as empty and are
-  indistinguishable. Needs fixing before anything relies on this message
-  (inferred from the raw bytes `…1801 2001` for on and `…2001` for off).
+  messages). The old `protos/qconnect_payload.proto` declared a single
+  `autoplayOn = 1`, so both messages decoded as empty and were
+  indistinguishable (layout inferred from the raw bytes `…1801 2001` for on
+  and `…2001` for off; field 4 is now `autoplayFlag`, meaning unknown).
 - Type 102 carries a queue version, and each of its changes (on, list load,
   off) bumped the minor: another case of a minor bump with the current track
   untouched.
