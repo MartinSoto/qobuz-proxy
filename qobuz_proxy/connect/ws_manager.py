@@ -9,7 +9,7 @@ import base64
 import logging
 import time
 import uuid
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Dict, Optional, TYPE_CHECKING
 
 import websockets
 from websockets import ClientConnection
@@ -18,6 +18,7 @@ from qobuz_proxy.auth.tokens import WSToken
 from qobuz_proxy.config import Config
 from qobuz_proxy.proto import common as common_pb2
 
+from .join_state import JoinSnapshot
 from .protocol import DecodedMessage, MessageType, ProtocolCodec
 from .types import ConnectTokens
 
@@ -198,6 +199,7 @@ class WsManager:
         config: Config,
         api_client: Optional["QobuzAPIClient"] = None,
         is_worth_keeping_alive: Optional[Callable[[], bool]] = None,
+        join_snapshot: Optional[Callable[[], Awaitable[Optional[JoinSnapshot]]]] = None,
     ):
         """
         Initialize WebSocket manager.
@@ -221,6 +223,7 @@ class WsManager:
         self.config = config
         self._api_client = api_client
         self._is_worth_keeping_alive = is_worth_keeping_alive
+        self._join_snapshot = join_snapshot
         self._device_uuid = self._uuid_to_bytes(config.device.uuid)
         self._codec = ProtocolCodec(self._device_uuid)
 
@@ -777,8 +780,25 @@ class WsManager:
         # (the mechanism behind the stale-restore bug that section
         # describes). Every other RendererState field is optional and
         # deliberately left unset here — only playingState is populated.
+        #
+        # Unless something of ours is playing (or paused) right now — a
+        # reconnect of the control channel under live playback — in which case
+        # saying "stopped" would be a lie the app acts on.
         initial_state = common_pb2.RendererState()
         initial_state.playingState = common_pb2.PLAYING_STATE_STOPPED
+        snapshot = await self._current_join_snapshot()
+        if snapshot is not None:
+            initial_state.playingState = snapshot.playing_state
+            initial_state.bufferState = common_pb2.BUFFER_STATE_OK
+            initial_state.currentPosition.timestamp = int(time.time() * 1000)
+            initial_state.currentPosition.value = snapshot.position_ms
+            initial_state.duration = snapshot.duration_ms
+            if snapshot.queue_index is not None:
+                initial_state.currentQueueIndex = snapshot.queue_index
+            logger.info(
+                f"Joining with playback in progress: state={snapshot.playing_state}, "
+                f"position={snapshot.position_ms}ms, queue index={snapshot.queue_index}"
+            )
 
         join_frame = self._codec.encode_join_session(
             device_uuid=self._device_uuid,
@@ -793,6 +813,15 @@ class WsManager:
             f"Sent JOIN_SESSION with max_quality={self._max_audio_quality}, "
             f"is_active={claims_active}"
         )
+
+    async def _current_join_snapshot(self) -> Optional[JoinSnapshot]:
+        if self._join_snapshot is None:
+            return None
+        try:
+            return await self._join_snapshot()
+        except Exception as e:
+            logger.warning(f"Could not read the playback state for the join: {e}")
+            return None
 
     async def _send_ctrl_join_session(self) -> None:
         """Join the Controller role too, alongside the existing Renderer

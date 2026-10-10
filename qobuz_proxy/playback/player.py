@@ -17,6 +17,8 @@ from qobuz_proxy.backends import (
     PlayResult,
     BufferStatus,
 )
+from qobuz_proxy.connect.join_state import JoinSnapshot
+
 from .queue import QobuzQueue, QueueTrack, RepeatMode
 from .metadata import MetadataService
 
@@ -1016,7 +1018,9 @@ class QobuzPlayer:
         # PAUSED position after a reconnect while we're still playing). Done
         # before any mutation so a replayed snapshot can't overwrite live
         # state (position or context) with its outdated values.
-        stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
+        stale = self._is_stale_pause_snapshot_locked(
+            track_id, position_ms, playing_state
+        ) or self._is_restore_of_live_playback_locked(track_id, playing_state)
 
         # Read from _intended_playing, not self._state — _load_track_locked
         # always drops self._state to STOPPED as a normal part of loading,
@@ -1151,6 +1155,53 @@ class QobuzPlayer:
             # already playing and the user just navigated to a different
             # track" actually means.
             await self._play_locked(position_ms or 0)
+
+    async def join_snapshot(self) -> Optional[JoinSnapshot]:
+        """What to tell the server when the control channel (re)joins: the
+        playback actually in progress, or None when nothing of ours is playing
+        or paused (the join then says stopped)."""
+        track = self._current_track
+        if (
+            track is None
+            or not self._backend_engaged
+            or self._state not in (PlaybackState.PLAYING, PlaybackState.PAUSED)
+        ):
+            return None
+        index: Optional[int] = None
+        order = await self.queue.play_order()
+        if order:
+            for i, entry in enumerate(order):
+                if entry.queue_item_id == track.queue_item_id and entry.track_id == track.track_id:
+                    index = i
+                    break
+        return JoinSnapshot(
+            playing_state=int(self._state),
+            position_ms=self.current_position_ms,
+            duration_ms=self._current_duration_ms,
+            queue_index=index,
+        )
+
+    def _is_restore_of_live_playback_locked(
+        self, track_id: Optional[str], playing_state: Optional[int]
+    ) -> bool:
+        """A SET_STATE naming the track already playing, right after we
+        (re)claimed active status, with a state of playing or stopped: the
+        server replaying what it remembers from before the control channel
+        dropped, not a command. Applying it would restart the track from the
+        remembered position, or stop it, while it plays on undisturbed."""
+        if playing_state not in (1, 2) or self._state != PlaybackState.PLAYING:
+            return False
+        cur = self._current_track
+        if cur is None or track_id is None or cur.track_id != track_id:
+            return False
+        if time.monotonic() - self._last_activated_at >= _RECONNECT_STALE_GRACE_SECONDS:
+            return False
+        logger.info(
+            "Ignoring SET_STATE (state %d) for the playing track right after rejoining: "
+            "a session-restore replay; keeping playback.",
+            playing_state,
+        )
+        return True
 
     def _is_stale_pause_snapshot_locked(
         self,

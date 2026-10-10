@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from qobuz_proxy.config import Config
+from qobuz_proxy.connect.join_state import JoinSnapshot
 from qobuz_proxy.connect.protocol import MessageType
 from qobuz_proxy.connect.types import ConnectTokens, JWTConnectToken
 from qobuz_proxy.connect import ws_manager as ws_manager_module
@@ -742,6 +743,39 @@ class TestSendJoinSession:
         assert not initial_state.HasField("duration")
         assert not initial_state.HasField("currentQueueIndex")
         assert not initial_state.HasField("nextQueueItemId")
+
+    async def test_join_reports_the_playback_in_progress(self, config: Config) -> None:
+        """A reconnect under live playback must not claim to be stopped."""
+        snapshot = JoinSnapshot(
+            playing_state=2, position_ms=61_000, duration_ms=292_000, queue_index=4
+        )
+        ws_manager = WsManager(config, join_snapshot=AsyncMock(return_value=snapshot))
+        ws_manager._session_uuid = b"0" * 16
+        ws_manager._ws = AsyncMock()
+
+        with patch.object(
+            ws_manager._codec, "encode_join_session", return_value=b"frame"
+        ) as mock_encode:
+            await ws_manager._send_join_session()
+
+        state = mock_encode.call_args.kwargs["initial_state"]
+        assert state.playingState == common_pb2.PLAYING_STATE_PLAYING
+        assert state.currentPosition.value == 61_000
+        assert state.duration == 292_000
+        assert state.currentQueueIndex == 4
+
+    async def test_join_falls_back_to_stopped_when_the_snapshot_fails(self, config: Config) -> None:
+        ws_manager = WsManager(config, join_snapshot=AsyncMock(side_effect=RuntimeError("boom")))
+        ws_manager._session_uuid = b"0" * 16
+        ws_manager._ws = AsyncMock()
+
+        with patch.object(
+            ws_manager._codec, "encode_join_session", return_value=b"frame"
+        ) as mock_encode:
+            await ws_manager._send_join_session()
+
+        state = mock_encode.call_args.kwargs["initial_state"]
+        assert state.playingState == common_pb2.PLAYING_STATE_STOPPED
 
     # A has_resumable_playback-gated variant of is_active was tried and
     # reverted 2026-09-13 — see docs/connect-activation-model-hypotheses.md,

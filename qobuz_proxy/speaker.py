@@ -628,6 +628,7 @@ class Speaker:
                     config=component_config,
                     api_client=self._api_client,
                     is_worth_keeping_alive=self._player.is_worth_keeping_ws_alive,
+                    join_snapshot=self._player.join_snapshot,
                 )
                 self._ws_manager.set_tokens(tokens)
                 self._ws_manager.set_max_audio_quality(self._effective_quality)
