@@ -606,6 +606,10 @@ class Speaker:
         assert self._queue is not None
         assert self._player is not None
 
+        # The session names the queue generation stream URLs are tagged with
+        # (see QobuzQueue.generation); known as soon as the tokens are.
+        self._queue.set_session(tokens.session_id)
+
         async with self._ws_setup_lock:
             try:
                 if self._ws_manager is not None:

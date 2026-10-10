@@ -27,7 +27,8 @@ reuse a transcode one already relied on, instead of each request opening
 its own independent upstream connection.
 
 Every proxy URL is fully self-describing —
-"/audio/{track_id}?format={flac,mp3,wav}&depth={16,24}&rate={hz}&item=..."
+"/audio/{track_id}?format={flac,mp3,wav}&depth={16,24}&rate={hz}&item=...
+&s={session tag}&v={major version}&i={queue item id}"
 — so there's no server-side registration table to consult when a request
 comes in: resolve_track() only ever has to build one of these strings,
 never register anything, and _handle_audio decodes `format`+`depth`+`rate`
@@ -36,7 +37,19 @@ straight back into either a plain CDN passthrough or a transcode request
 branch on). `item` is never read back — it exists purely so two different
 queue slots for the same track+quality get distinguishable URLs (see
 backend.py's gapless-transition detection, which keys off proxy-URL
-identity). Only a handful of (format, depth, rate) combinations are
+identity).
+
+`s`, `v` and `i` name the queue **generation** the entry belongs to (see
+QobuzQueue.generation): a tag of the Qobuz session, the queue's major
+version (bumped by every load; shuffle, edits and autoplay only move the
+minor one) and the item id, which is unique only within one load. A request
+whose `s`/`v` no longer match the current generation is answered 410 Gone:
+the Sonos device requests such an entry once and skips it, so an entry left
+in its queue by a previous load can no longer play (docs/sonos-queue-
+handover-design.md, 5.2, and the Phase 0 results in 9.2). Requests without
+`s`/`v` (URLs from before this scheme, or built before the session was
+known) and requests while the current generation is itself still unknown
+are served as before. Only a handful of (format, depth, rate) combinations are
 actually servable — see _PASSTHROUGH_QUALITIES — anything else is
 rejected outright rather than guessed at.
 
@@ -49,7 +62,7 @@ from __future__ import annotations
 
 import logging
 import socket
-from typing import Optional, TYPE_CHECKING
+from typing import Mapping, Optional, TYPE_CHECKING
 
 from aiohttp import web
 
@@ -134,6 +147,7 @@ class SonosAudioProxyServer:
             port: Port to listen on
         """
         self._resolver = resolver
+        self._queue = queue
         self._hires_downsampling = hires_downsampling
         self._host = host
         self._port = port
@@ -230,6 +244,7 @@ class SonosAudioProxyServer:
         *,
         proxy_key: Optional[str] = None,
         forced_format_id: Optional[int] = None,
+        queue_item_id: Optional[int] = None,
     ) -> Optional[ResolvedTrack]:
         """Decide passthrough vs. on-the-fly downsampling vs. CD-tier
         fallback, and build the resulting self-describing URL via
@@ -265,7 +280,7 @@ class SonosAudioProxyServer:
         force_transcode = self._gain_resolver is not None and stream.format_id != QOBUZ_QUALITY_MP3
 
         if self._fits_device(stream, capabilities) and not force_transcode:
-            return self._resolved_track(track_id, stream, proxy_key)
+            return self._resolved_track(track_id, stream, proxy_key, queue_item_id=queue_item_id)
 
         if (
             (self._hires_downsampling or force_transcode)
@@ -289,12 +304,44 @@ class SonosAudioProxyServer:
                 proxy_key,
                 transcode_to_sample_rate=target_rate,
                 gain_db=gain_db,
+                queue_item_id=queue_item_id,
             )
 
         cd_stream = await self._resolver.resolve(track_id, QOBUZ_QUALITY_CD)
         if cd_stream is None:
             return None
-        return self._resolved_track(track_id, cd_stream, proxy_key)
+        return self._resolved_track(track_id, cd_stream, proxy_key, queue_item_id=queue_item_id)
+
+    def _generation_query(self, queue_item_id: Optional[int]) -> str:
+        """The `&s=..&v=..&i=..` tail naming the queue generation an entry
+        belongs to, or "" for whatever is not yet known (no queue, or the
+        Qobuz session not seen yet)."""
+        parts = ""
+        if self._queue is not None:
+            tag, major = self._queue.generation
+            if tag:
+                parts += f"&s={tag}&v={major}"
+        if queue_item_id is not None:
+            parts += f"&i={queue_item_id}"
+        return parts
+
+    def _is_stale_generation(self, query: "Mapping[str, str]") -> bool:
+        """Whether a request names a queue generation that is no longer the
+        current one. Only a request carrying both `s` and `v` can be stale,
+        and only while the current generation is known: not knowing it (a
+        fresh start, before the first snapshot) cannot make anything stale."""
+        url_tag = query.get("s")
+        url_major_text = query.get("v")
+        if url_tag is None or url_major_text is None or self._queue is None:
+            return False
+        try:
+            url_major = int(url_major_text)
+        except ValueError:
+            return False
+        current_tag, current_major = self._queue.generation
+        if not current_tag or current_major == 0 or url_major == 0:
+            return False
+        return url_tag != current_tag or url_major != current_major
 
     def _resolved_track(
         self,
@@ -303,6 +350,7 @@ class SonosAudioProxyServer:
         proxy_key: Optional[str],
         transcode_to_sample_rate: Optional[int] = None,
         gain_db: float = 0.0,
+        queue_item_id: Optional[int] = None,
     ) -> ResolvedTrack:
         """Build the self-describing URL (see module docstring) and
         ResolvedTrack for one stream — a plain passthrough of `stream` as
@@ -336,6 +384,7 @@ class SonosAudioProxyServer:
         item = proxy_key or track_id
         proxy_url = (
             f"{self.base_url}/audio/{track_id}?format={fmt}&depth={depth}&rate={rate}&item={item}"
+            f"{self._generation_query(queue_item_id)}"
         )
         if transcode_to_sample_rate is not None and gain_db:
             # Self-describing, like every other part of this URL (see
@@ -368,6 +417,13 @@ class SonosAudioProxyServer:
         ignored: see module docstring for what it's actually for."""
         track_id = request.match_info["track_id"]
         query = request.query
+        if self._is_stale_generation(query):
+            current = self._queue.generation if self._queue is not None else ("", 0)
+            logger.info(
+                f"Refusing {request.method} for track {track_id}: queue entry from "
+                f"s={query.get('s')} v={query.get('v')}, current is s={current[0]} v={current[1]}"
+            )
+            return web.Response(status=410, text="Gone: this entry belongs to an earlier queue")
         try:
             fmt = query["format"]
             depth = int(query["depth"])

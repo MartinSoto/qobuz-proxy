@@ -1694,6 +1694,7 @@ class QobuzPlayer:
                 album=meta.get("album", "") if meta else "",
                 duration_ms=track.duration_ms,
                 artwork_url=meta.get("artwork_url", "") if meta else "",
+                queue_item_id=track.queue_item_id,
             )
 
             # Start playback on backend — resolves the actual streaming
@@ -2036,6 +2037,7 @@ class QobuzPlayer:
                 album=meta.get("album", "") if meta else "",
                 duration_ms=meta.get("duration_ms", 0) if meta else 0,
                 artwork_url=meta.get("artwork_url", "") if meta else "",
+                queue_item_id=queue_item_id,
             )
 
             # Resolves the URL/format itself — see backend.set_next_track.

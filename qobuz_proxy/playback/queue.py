@@ -35,12 +35,25 @@ backends.dlna.proxy_server.resolve_track), not here.
 """
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def session_tag(session_id: str) -> str:
+    """A short, stable tag for a Qobuz session id, safe to put in URLs.
+
+    Not secret and not meant to be: it only has to tell one session from
+    another so a stream URL from a previous session is recognized as stale.
+    Empty for an unknown session.
+    """
+    if not session_id:
+        return ""
+    return hashlib.sha256(session_id.encode()).hexdigest()[:8]
 
 
 class RepeatMode(Enum):
@@ -208,6 +221,9 @@ class QobuzQueue:
         # The app's autoplay setting as last announced by the server (type
         # 102); None until one has been seen.
         self._autoplay_mode: Optional[bool] = None
+        # session_tag() of the Qobuz session this queue belongs to; "" until
+        # known. Together with the major version it names a queue generation.
+        self._session_tag: str = ""
 
         self._lock = asyncio.Lock()
 
@@ -272,6 +288,21 @@ class QobuzQueue:
         """Get current queue state snapshot."""
         async with self._lock:
             return QueueState(version=self._version, repeat_mode=self._repeat_mode)
+
+    def set_session(self, session_id: str) -> None:
+        """Record which Qobuz session this queue belongs to (known once the
+        WebSocket tokens arrive)."""
+        self._session_tag = session_tag(session_id)
+
+    @property
+    def generation(self) -> tuple[str, int]:
+        """(session tag, major version): what a stream URL must match to
+        count as belonging to the current queue. A new load bumps the major
+        version, a new session changes the tag; minor bumps (shuffle, edits,
+        autoplay) change neither, so entries survive them. Read without the
+        lock on purpose: two plain attribute reads, called from request
+        handlers that must not wait on queue updates."""
+        return self._session_tag, self._version.major
 
     async def get_version(self) -> QueueVersion:
         """Get current queue version."""

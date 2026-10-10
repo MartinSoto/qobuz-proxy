@@ -62,6 +62,18 @@ class TestSonosGaplessQueue:
         client.add_uri_to_queue.assert_awaited_once()
         assert backend._next_track_queue_nr == 7
 
+    async def test_set_next_track_gives_the_proxy_the_queue_item_id(self):
+        """The proxy puts it in the stream URL (queue generation, see
+        SonosAudioProxyServer)."""
+        backend, client = _make_backend()
+        meta = _make_metadata(track_id="222")
+
+        await backend.set_next_track(meta, 9)
+
+        kwargs = backend._proxy_server.resolve_track.await_args.kwargs
+        assert kwargs["queue_item_id"] == 9
+        assert kwargs["proxy_key"] == "222_9"
+
     async def test_set_next_track_skips_duplicate_url(self):
         backend, client = _make_backend()
         meta = _make_metadata(track_id="222")

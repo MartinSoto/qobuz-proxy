@@ -121,6 +121,7 @@ class AudioProxyServerProtocol(Protocol):
         *,
         proxy_key: Optional[str] = None,
         forced_format_id: Optional[int] = None,
+        queue_item_id: Optional[int] = None,
     ) -> Optional[ResolvedTrack]: ...
 
 
@@ -260,6 +261,7 @@ class AudioProxyServer:
         *,
         proxy_key: Optional[str] = None,
         forced_format_id: Optional[int] = None,
+        queue_item_id: Optional[int] = None,
     ) -> Optional[ResolvedTrack]:
         """
         Decide what to actually serve for this track, and register it.
@@ -287,6 +289,9 @@ class AudioProxyServer:
                 of the capability-derived ceiling (a manual/app-driven
                 quality override) — the fits/fallback decision still
                 applies on top of it.
+            queue_item_id: The track's queue item id; unused here (this
+                server keeps a registration table instead of putting it in
+                the URL, see SonosAudioProxyServer).
 
         Returns:
             ResolvedTrack, or None if Qobuz has nothing for this track at all.

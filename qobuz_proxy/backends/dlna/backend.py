@@ -728,6 +728,7 @@ class DLNABackend(AudioBackend):
             metadata.track_id,
             self._capabilities,
             forced_format_id=self._quality_override,
+            queue_item_id=metadata.queue_item_id,
         )
         if resolved is None:
             raise RuntimeError(f"Failed to resolve streaming URL for track {metadata.track_id}")
@@ -1132,6 +1133,7 @@ class DLNABackend(AudioBackend):
             self._capabilities,
             proxy_key=proxy_key,
             forced_format_id=self._quality_override,
+            queue_item_id=queue_item_id,
         )
         if resolved is None:
             return None

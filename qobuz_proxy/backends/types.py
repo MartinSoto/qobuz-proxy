@@ -51,6 +51,10 @@ class BackendTrackMetadata:
     artwork_url: str = ""
     sample_rate: int = 0  # Hz, e.g. 44100, 96000, 192000
     bit_depth: int = 0  # e.g. 16, 24
+    # The track's queue item id within the current queue load (unique only
+    # within one major queue version). A backend that publishes stream URLs
+    # puts it in them, so an entry can be matched to a queue item later.
+    queue_item_id: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
