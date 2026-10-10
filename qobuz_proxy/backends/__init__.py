@@ -24,6 +24,7 @@ from .types import (
     BackendTrackMetadata,
     BufferStatus,
     PlaybackState,
+    AdoptedPlayback,
     PlayResult,
 )
 from .dlna import (
@@ -47,6 +48,7 @@ __all__ = [
     "BackendTrackMetadata",
     "BufferStatus",
     "PlaybackState",
+    "AdoptedPlayback",
     "PlayResult",
     # Base class
     "AudioBackend",

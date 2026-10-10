@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
 from .types import (
+    AdoptedPlayback,
     BackendInfo,
     BackendTrackMetadata,
     BufferStatus,
@@ -223,6 +224,17 @@ class AudioBackend(ABC):
         lets the device run through the queue on its own relays it to the
         device (SonosQueueBackend); every other backend sequences the queue
         itself, so the default does nothing."""
+        return None
+
+    async def playing_entry(self) -> Optional[AdoptedPlayback]:
+        """The queue entry of ours the device is already playing or has paused,
+        if it can tell (a backend that holds the queue on the device). Default:
+        None."""
+        return None
+
+    async def adopt(self, playing: AdoptedPlayback, duration_ms: int) -> None:
+        """Carry on from `playing` instead of starting anew: take it as the
+        current entry and learn what the device queue holds. Default: nothing."""
         return None
 
     async def next_pointer_changed(self, info: Optional[dict]) -> None:

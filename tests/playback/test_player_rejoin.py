@@ -103,3 +103,113 @@ class TestRestoreAfterRejoin:
         )
 
         player._load_track_locked.assert_awaited()
+
+
+class TestCarryingOnUnderAPlayingDevice:
+    """The proxy restarted while the device kept playing one of its entries: the
+    app rejoining must not silence it, and the state the server replays (what
+    it remembers from before) must not be applied over what the device does."""
+
+    def _fresh_player(self, playing):  # type: ignore[no-untyped-def]
+        player, backend = _make_player()
+        player.queue.generation = ("tag", 64)
+        backend.playing_entry = AsyncMock(return_value=playing)
+        backend.adopt = AsyncMock()
+        backend.stop = AsyncMock()
+        backend.play = AsyncMock()
+        player._send_state_update = AsyncMock()  # type: ignore[method-assign]
+        return player, backend
+
+    @staticmethod
+    def _playing(**kw):  # type: ignore[no-untyped-def]
+        from qobuz_proxy.backends import AdoptedPlayback
+
+        fields = dict(
+            track_id="333",
+            queue_item_id=3,
+            session="tag",
+            major=64,
+            position_ms=90_000,
+            paused=False,
+            url="http://x/audio/333",
+        )
+        fields.update(kw)
+        return AdoptedPlayback(**fields)  # type: ignore[arg-type]
+
+    async def test_claiming_does_not_stop_a_device_playing_our_entry(self) -> None:
+        player, backend = self._fresh_player(self._playing())
+
+        await player.claim_device()
+
+        backend.stop.assert_not_called()
+
+    async def test_claiming_still_stops_a_device_playing_something_else(self) -> None:
+        player, backend = self._fresh_player(None)
+
+        await player.claim_device()
+
+        backend.stop.assert_awaited_once()
+
+    async def test_another_sessions_entry_is_not_carried_on_with(self) -> None:
+        player, backend = self._fresh_player(self._playing(session="other"))
+
+        await player.claim_device()
+
+        backend.stop.assert_awaited_once()
+
+    async def test_the_replayed_state_is_answered_with_what_the_device_does(self) -> None:
+        player, backend = self._fresh_player(self._playing())
+        await player.claim_device()
+
+        # The server remembers item 2 paused at 154s; the device is on item 3.
+        await player.apply_remote_state(
+            track_id="222", queue_item_id=2, position_ms=154_749, playing_state=3
+        )
+
+        assert player._current_track is not None
+        assert (player._current_track.track_id, player._current_track.queue_item_id) == ("333", 3)
+        assert player._state == PlaybackState.PLAYING
+        assert 90_000 <= player.current_position_ms < 91_000
+        backend.adopt.assert_awaited_once()
+        backend.play.assert_not_called()
+        backend.stop.assert_not_called()
+        player._send_state_update.assert_awaited()
+
+    async def test_a_paused_device_is_adopted_paused(self) -> None:
+        player, _ = self._fresh_player(self._playing(paused=True))
+        await player.claim_device()
+
+        await player.apply_remote_state(
+            track_id="222", queue_item_id=2, position_ms=0, playing_state=2
+        )
+
+        assert player._state == PlaybackState.PAUSED
+
+    async def test_an_older_queue_on_the_device_is_stopped_and_the_state_applied(self) -> None:
+        player, backend = self._fresh_player(self._playing(major=60))
+        player._load_track_locked = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        await player.claim_device()
+
+        await player.apply_remote_state(
+            track_id="222", queue_item_id=2, position_ms=0, playing_state=2
+        )
+
+        backend.stop.assert_awaited_once()
+        backend.adopt.assert_not_called()
+        player._load_track_locked.assert_awaited()
+
+    async def test_only_the_first_replay_is_answered_that_way(self) -> None:
+        player, backend = self._fresh_player(self._playing())
+        await player.claim_device()
+        await player.apply_remote_state(
+            track_id="222", queue_item_id=2, position_ms=0, playing_state=3
+        )
+        backend.adopt.reset_mock()
+        player._load_track_locked = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        await player.apply_remote_state(
+            track_id="444", queue_item_id=4, position_ms=0, playing_state=2
+        )
+
+        backend.adopt.assert_not_called()
+        player._load_track_locked.assert_awaited()

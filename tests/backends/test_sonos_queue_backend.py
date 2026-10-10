@@ -9,7 +9,7 @@ from qobuz_proxy.backends.dlna.capabilities import DLNACapabilities, QOBUZ_QUALI
 from qobuz_proxy.backends.dlna.sonos.audio_url import EntryKey, parse_entry_url
 from qobuz_proxy.backends.dlna.sonos.client import SonosClient
 from qobuz_proxy.backends.dlna.sonos.queue_backend import SonosQueueBackend
-from qobuz_proxy.backends.types import BackendTrackMetadata, PlayResult
+from qobuz_proxy.backends.types import BackendTrackMetadata, PlaybackState, PlayResult
 from qobuz_proxy.playback.queue import QobuzQueue, QueueVersion
 from qobuz_proxy.playback.stream_resolver import ResolvedStream
 
@@ -491,3 +491,53 @@ class TestAutoplayTail:
         await settled(backend)
 
         assert keys_on(client) == K(10, 11)
+
+
+class TestCarryingOn:
+    """A proxy that restarted under a device still playing its entries."""
+
+    async def _playing_on_device(self):  # type: ignore[no-untyped-def]
+        backend, client, queue = await make([1, 2, 3])
+        await backend.play(meta(2))
+        await settled(backend)
+        url = client.device.urls[1]  # the entry the device is on
+        backend.get_state = AsyncMock(return_value=PlaybackState.PLAYING)  # type: ignore[method-assign]
+        backend._get_current_transport_uri = AsyncMock(return_value=url)  # type: ignore[method-assign]
+        backend.get_position = AsyncMock(return_value=61_000)  # type: ignore[method-assign]
+        return backend, client, queue
+
+    async def test_the_entry_playing_is_found(self) -> None:
+        backend, _, queue = await self._playing_on_device()
+
+        found = await backend.playing_entry()
+
+        assert found is not None
+        assert (found.track_id, found.queue_item_id) == ("2", 2)
+        assert (found.session, found.major) == queue.generation
+        assert found.position_ms == 61_000 and found.paused is False
+
+    async def test_nothing_is_found_while_the_device_is_stopped(self) -> None:
+        backend, _, _ = await self._playing_on_device()
+        backend.get_state = AsyncMock(return_value=PlaybackState.STOPPED)  # type: ignore[method-assign]
+
+        assert await backend.playing_entry() is None
+
+    async def test_something_foreign_is_not_found(self) -> None:
+        backend, _, _ = await self._playing_on_device()
+        backend._get_current_transport_uri = AsyncMock(return_value="http://elsewhere/x.mp3")  # type: ignore[method-assign]
+
+        assert await backend.playing_entry() is None
+
+    async def test_adopting_learns_the_device_queue_so_edits_can_follow(self) -> None:
+        backend, client, queue = await self._playing_on_device()
+        found = await backend.playing_entry()
+        await backend._reset_queue_state()  # the restart: nothing known any more
+        assert found is not None
+
+        await backend.adopt(found, 200_000)
+        await queue.apply_snapshot([(1, "1"), (3, "3"), (2, "2")])
+        await backend.queue_changed()
+        await settled(backend)
+
+        assert backend._current_key == EntryKey("2", 2)
+        assert keys_on(client) == K(1, 3, 2)

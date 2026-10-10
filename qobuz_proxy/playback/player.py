@@ -11,6 +11,7 @@ import time
 from typing import Awaitable, Callable, Dict, Optional, TypeVar, TYPE_CHECKING
 
 from qobuz_proxy.backends import (
+    AdoptedPlayback,
     AudioBackend,
     BackendTrackMetadata,
     PlaybackState,
@@ -62,6 +63,10 @@ _STALE_SNAPSHOT_THRESHOLD_MS = 5000
 # the same underlying reason — a signal can be transiently wrong right
 # after a transition even once it's normally trustworthy.
 _RECONNECT_STALE_GRACE_SECONDS = 5.0
+
+# How long after claiming the device the first replayed state may still be
+# answered by carrying on with what the device is already playing.
+_ADOPTION_WINDOW_SECONDS = 30.0
 
 # How long playback can sit PAUSED or STOPPED before it's no longer worth
 # proactively keeping the control WebSocket alive for (see
@@ -218,6 +223,8 @@ class QobuzPlayer:
         # deliberately "long ago" relative to any real time.monotonic()
         # reading, never mistaken for "just now".
         self._last_activated_at: float = 0.0
+        # What the device was found playing when we claimed it (see claim_device).
+        self._adoptable: Optional[AdoptedPlayback] = None
 
         # When the state last left PLAYING (PAUSED or STOPPED), or None while
         # actually PLAYING — see is_worth_keeping_ws_alive().
@@ -723,10 +730,74 @@ class QobuzPlayer:
         if self._current_track is not None and self._state != PlaybackState.STOPPED:
             logger.debug("claim_device: already have active content of our own, not stopping it")
             return
+        # A proxy that (re)started while the device kept playing one of its own
+        # entries: that is not something to silence but to carry on with. The
+        # state the server replays right after this (what it remembers from
+        # before) is then not applied, see _adopt_playing_device.
+        self._adoptable = await self._find_adoptable()
+        if self._adoptable is not None:
+            logger.info(
+                f"claim_device: the device is already playing our entry "
+                f"{self._adoptable.track_id} (item {self._adoptable.queue_item_id}), not stopping it"
+            )
+            return
         try:
             await self.backend.stop()
         except Exception as e:
             logger.warning(f"Failed to stop device on activation: {e}")
+
+    async def _find_adoptable(self) -> Optional[AdoptedPlayback]:
+        """What the device plays of ours, if it belongs to the current session
+        (the queue's version is not known yet when this runs)."""
+        try:
+            playing = await self.backend.playing_entry()
+        except Exception as e:
+            logger.warning(f"Could not look at what the device is playing: {e}")
+            return None
+        if playing is None:
+            return None
+        if playing.session != self.queue.generation[0]:
+            return None  # another session's entry: not ours to carry on with
+        return playing
+
+    async def _adopt_playing_device(self) -> bool:
+        """Take over what the device is playing as the current track, instead
+        of applying the replayed state that follows a rejoin. True if adopted."""
+        playing, self._adoptable = self._adoptable, None
+        if playing is None or time.monotonic() - self._last_activated_at > _ADOPTION_WINDOW_SECONDS:
+            return False
+        if playing.major != self.queue.generation[1]:
+            # An older queue than the one the server holds: not a match.
+            logger.info("The device plays an entry of another queue: stopping it")
+            try:
+                await self.backend.stop()
+            except Exception as e:
+                logger.warning(f"Failed to stop the device: {e}")
+            return False
+        meta = await self._get_track_metadata(playing.track_id)
+        track = QueueTrack(
+            queue_item_id=playing.queue_item_id,
+            track_id=playing.track_id,
+            context_uuid=None,
+            metadata=meta or {},
+            duration_ms=meta.get("duration_ms", 0) if meta else 0,
+        )
+        self._current_track = track
+        self._current_duration_ms = track.duration_ms
+        self._position_value_ms = playing.position_ms
+        self._position_timestamp_ms = int(time.time() * 1000)
+        self._state = PlaybackState.PAUSED if playing.paused else PlaybackState.PLAYING
+        self._backend_engaged = True
+        self._intended_playing = not playing.paused
+        await self.backend.adopt(playing, track.duration_ms)
+        logger.info(
+            f"Carrying on with track {playing.track_id} (queue item {playing.queue_item_id}) "
+            f"found on the device at {playing.position_ms}ms"
+        )
+        await self._send_state_update()
+        if not playing.paused:
+            await self._report_playing(playing.position_ms)
+        return True
 
     async def deactivate_renderer(self) -> None:
         """Handle SET_ACTIVE(false) — debounced, not an immediate stop.
@@ -1018,6 +1089,9 @@ class QobuzPlayer:
         # PAUSED position after a reconnect while we're still playing). Done
         # before any mutation so a replayed snapshot can't overwrite live
         # state (position or context) with its outdated values.
+        if self._adoptable is not None and await self._adopt_playing_device():
+            return  # what the server replays is older than what the device does
+
         stale = self._is_stale_pause_snapshot_locked(
             track_id, position_ms, playing_state
         ) or self._is_restore_of_live_playback_locked(track_id, playing_state)

@@ -20,7 +20,12 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
-from qobuz_proxy.backends.types import BackendTrackMetadata, PlayResult
+from qobuz_proxy.backends.types import (
+    AdoptedPlayback,
+    BackendTrackMetadata,
+    PlaybackState,
+    PlayResult,
+)
 
 from ..proxy_server import AudioProxyServerProtocol
 from .audio_url import EntryKey, parse_entry_url
@@ -266,6 +271,50 @@ class SonosQueueBackend(SonosBackend):
             logger.warning(f"[{self.name}] starting the queue took over {START_TIMEOUT_SECONDS}s")
             self._published_generation = None
             return False
+
+    # ------------------------------------------------------------------
+    # Carrying on under a device that is already playing
+    # ------------------------------------------------------------------
+
+    async def playing_entry(self) -> Optional[AdoptedPlayback]:
+        """The queue entry of ours the device is playing or has paused right
+        now: what a proxy that just (re)started finds when the app rejoins."""
+        if not isinstance(self._client, SonosClient):
+            return None
+        state = await self.get_state()
+        if state not in (PlaybackState.PLAYING, PlaybackState.PAUSED):
+            return None
+        uri = await self._get_current_transport_uri()
+        parsed = parse_entry_url(uri) if uri and self._is_own_proxy_url(uri) else None
+        if uri is None or parsed is None or parsed.session is None or parsed.major is None:
+            return None
+        return AdoptedPlayback(
+            track_id=parsed.key.track_id,
+            queue_item_id=parsed.key.queue_item_id,
+            session=parsed.session,
+            major=parsed.major,
+            position_ms=await self.get_position(),
+            paused=state == PlaybackState.PAUSED,
+            url=uri,
+        )
+
+    async def adopt(self, playing: AdoptedPlayback, duration_ms: int) -> None:
+        self._current_key = EntryKey(playing.track_id, playing.queue_item_id)
+        self._current_proxy_url = playing.url
+        self._current_track_confirmed = True
+        self._position_ms = playing.position_ms
+        self._duration_ms = duration_ms
+        self._playback_started_at = time.monotonic()
+        self._state = PlaybackState.PAUSED if playing.paused else PlaybackState.PLAYING
+        runner = self._ensure_sync()
+        if runner is not None and self._sync is not None and self._queue is not None:
+            # The device holds the queue the previous run published: learn it.
+            if await self._sync.resync():
+                self._published_generation = self._queue.generation
+        logger.info(
+            f"[{self.name}] carrying on with {self._current_key} "
+            f"({'paused' if playing.paused else 'playing'} at {playing.position_ms}ms)"
+        )
 
     # ------------------------------------------------------------------
     # Following the Qobuz queue and the device

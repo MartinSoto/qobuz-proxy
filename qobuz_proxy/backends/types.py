@@ -68,6 +68,21 @@ class BackendTrackMetadata:
         }
 
 
+@dataclass(frozen=True)
+class AdoptedPlayback:
+    """A queue entry of ours the device is already playing (or has paused),
+    found when the proxy starts up under it: the url's generation (`session`,
+    `major`) says which Qobuz queue it belongs to."""
+
+    track_id: str
+    queue_item_id: int
+    session: str
+    major: int
+    position_ms: int
+    paused: bool
+    url: str
+
+
 @dataclass
 class PlayResult:
     """What a backend hands back after starting playback of a track — the
