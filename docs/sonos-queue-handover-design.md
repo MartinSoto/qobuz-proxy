@@ -119,28 +119,41 @@ the later phases pass on hardware; both paths coexist until then.
 ### 5.2 URLs and the proxy server
 The Sonos URL becomes
 
-`/audio/{track_id}?s={session8}&v={major}&i={queue_item_id}` (+ existing gain
-and rate parameters where they still apply)
+`/audio/{track_id}?s={session8}&v={major}&i={queue_item_id}&fmt={flac|wav|mp3}`
+(+ the existing gain and rate parameters where they still apply)
 
 - `s` is a short digest of the Qobuz session uuid, `v` the major version, `i`
   the item id. Item id alone is not enough (O15), the pair `v`/`i` is unique
   within a session, and `s` guards against a restart reusing small numbers.
 - The proxy keeps one **current generation** (fed by `QobuzQueue`). A request
-  whose `s`/`v` differ gets **410 Gone** *(what Sonos does with a refusing
-  entry is a Phase 0 question: skip, stop, retry)*. A minor bump changes
-  nothing: entries stay valid (O8).
-- Format, depth and rate are **not** part of the URL any more. They are decided
-  when the device requests the stream, from the track's actual stream and the
-  device capabilities (which the proxy gets from the backend once). This removes
-  the per-track `getFileUrl` at publish time (a 200-track playlist would
-  otherwise be 200 API calls, and a `HEAD` probe per entry would be a CDN read
-  each, see 5.6).
-- DIDL-Lite per entry still needs title/artist/album/art/duration: fetched in
-  batches in the background with a concurrency cap; rate/depth attributes in
-  `res` can be omitted until known: on the Sonos One the seek offset comes from
-  the WAV header, not the DIDL (Phase 0, 9.2). The repo's DIDL builder still
-  documents that a renderer trusting wrong values garbles seeks, so this is
-  verified for Sonos only, not for other renderers.
+  whose `s`/`v` differ gets **410 Gone**; Sonos requests such an entry once and
+  skips it (9.2). A minor bump changes nothing: entries stay valid (O8).
+- **The container (`fmt`) is chosen at publish time, from track metadata, not
+  from a per-track stream request.** Phase 0 showed that the DIDL's MIME type
+  is binding: a wildcard is rejected (UPnP 804) and declaring `audio/wav` for
+  a FLAC stream made Sonos run through the queue instead of playing it (9.2).
+  So the rule, applied when the entry is published:
+  `flac` (passthrough) only when the track's `maximum_sampling_rate` and
+  `maximum_bit_depth` fit the device (≤ 48 kHz, ≤ 24 bit on Sonos); `mp3` only
+  when the device or the track cannot do FLAC; otherwise `wav` (transcode,
+  downsampling to the device rate). The proxy then serves **exactly the
+  published container** for that URL, whatever tier Qobuz returns at request
+  time (a `wav` entry can transcode any source; a `flac` entry only ever
+  qualifies when every tier fits). This keeps the existing fits/fallback logic
+  but moves its input from `getFileUrl` to metadata.
+- The per-track stream request (`getFileUrl`, signed CDN URL, blob) therefore
+  still happens, but **when the device asks for the stream**, not for every
+  queued entry. `HEAD` probes are not a concern on Sonos (9.2).
+- **Metadata comes in batches.** `track/getList` (already used for album gain,
+  `get_tracks_audio_info`) returned 15 of 15 tracks in one call with title,
+  performer, album title and cover art, duration, `maximum_sampling_rate`,
+  `maximum_bit_depth` and `hires_streamable` — everything DIDL-Lite and the
+  container rule need. The maximum ids per call is unknown (Phase 1 checks it).
+- DIDL `res` attributes `sampleFrequency`/`bitsPerSample` can be omitted: on the
+  Sonos One the seek offset comes from the WAV header, not the DIDL (9.2). The
+  repo's DIDL builder still documents that a renderer trusting wrong values
+  garbles seeks, so this is verified for Sonos only. `protocolInfo`'s MIME type
+  must be correct (above), and `duration` should be set.
 - Reporting needs the stream `blob`; the proxy records what it resolved when it
   served the request and hands it to the Player on item change, falling back to
   a cached resolve.
@@ -242,7 +255,12 @@ path keeps all of it.
   is the only defense, so its latency and failure handling matter.
 - **Retarget and coordinator handover** replay the whole queue onto a new
   device (the existing retarget path was written around the current one-track-plus-next model).
-- **Metadata volume** for large playlists (see 5.2 on batching).
+- **Metadata volume** for large playlists: one `track/getList` call returned
+  15 tracks; the per-call maximum is not yet known (Phase 1).
+- **Publish-time container prediction** can disagree with what the stream
+  turns out to be only in the safe direction (a `wav` entry can transcode
+  anything; a `flac` entry is published only when every tier fits), but a
+  mistaken `maximum_sampling_rate` in Qobuz's data would break one entry.
 
 ### 6.2 Decisions (2026-10-10)
 1. **Whole queue, chunk by chunk.** The whole queue is published, in chunks and
@@ -369,6 +387,11 @@ Audio was a 3 %-amplitude 220 Hz WAV at volume 8.
 | `REPEAT_ALL` | Wraps 3 → 1 seamlessly. |
 | `REPEAT_ONE` | Stays on the entry. |
 | Do DIDL `sampleFrequency`/`bitsPerSample` affect a seek into a transcoded WAV? | **No.** Real proxy path (96 kHz FLAC downsampled to 48 kHz/24-bit WAV, 82 MB, 285 s), muted, one queue entry, `Seek REL_TIME` to 60 s and 120 s under four DIDL variants — correct 48000/24, attributes omitted, wrong 96000/24, wrong 44100/16. **All four gave identical Range requests** (`bytes=17268736-` and `bytes=34553856-`), which is the WAV-header-derived offset (about 4 KB aligned, not frame aligned: the proxy aligns it to a frame itself). Reported position afterwards was 1:02 and 2:02. Only a plain `GET` first, then the ranged `GET`; no `HEAD`. |
+| Declared MIME vs. actual stream (DIDL `protocolInfo`) | **Binding.** `http-get:*:*:*` is **rejected at enqueue (UPnP 804)**. Declaring `audio/wav` for FLAC entries (while the proxy served `audio/flac`) made Sonos run through the queue in about a second instead of playing; with the correct per-entry MIME the same queue played normally. |
+| Gapless across mixed entries (real tracks, muted, 0.2 s polling) | FLAC passthrough → 96 kHz-source WAV transcode → FLAC passthrough: both transitions went `PLAYING` → `PLAYING` with the track number changing and **no `TRANSITIONING`/`STOPPED` state in between**. An audible gap cannot be judged muted. |
+| When does Sonos fetch the next entry? | Observed with a seek to 25 s before the end: the next entry's first `GET` came **~18 s before** the end (FLAC → WAV) and **~4–5 s before** it (WAV → FLAC). The lead varies; do not rely on a fixed one. |
+| Grouped room (Cocina coordinating Baño) | Queue **writes sent to the member fail (UPnP 800)**; `Browse Q:0` on a member returns an empty queue of its own; a member's `GetPositionInfo` shows `x-rincon:<coordinator>`. Eventing on the **coordinator** carries every transition (6 events for a 3-entry run); the **member** sent a single event (`x-rincon:` source) and nothing per track. So: always target the coordinator, subscribe there only. |
+| Queue size, again | **5008 entries accepted** in 8.7 s on the grouped coordinator, no refusal (the loop stopped there). |
 | AVTransport eventing (GENA `LastChange`) | Subscription works. Events arrive within ~0.1–0.5 s of a change and carry `TransportState`, `CurrentTrack`, `NumberOfTracks`, `CurrentPlayMode`, `CurrentTrackURI`, `CurrentTransportActions`, `CurrentTrackDuration`. A skipped entry produces no event (track 2 → 4). The initial subscription event arrives immediately. |
 
 ### 9.3 Consequences for the design
@@ -382,17 +405,20 @@ Audio was a 3 %-amplitude 220 Hz WAV at volume 8.
   mirror must be re-derived from `Browse` or from the `CurrentTrackURI` events.
 - Item-change tracking can use eventing instead of the 2 s poll, which also
   helps the weak coordinator. Polling stays as fallback.
-- Lazy resolution may publish entries without `sampleFrequency`/
-  `bitsPerSample` in the DIDL; Sonos ignores them for seeks (9.2).
+- DIDL `sampleFrequency`/`bitsPerSample` may be omitted (Sonos ignores them for
+  seeks, 9.2), but the **MIME type must be right at publish time**, so the
+  container is decided then, from `track/getList` metadata (5.2).
+- Publishing and eventing go to the **coordinator** only; a member rejects
+  queue writes and sends no per-track events.
 - A refused or stale entry costs one skipped track, not a stopped player.
 - End-of-queue landing is native on the device; the proxy must report it
   (and not gate PLAY on its own `_current_track`, O22).
 
-### 9.4 Still open for Phase 0
-- Gapless across mixed passthrough/WAV entries, with real tracks.
-- Eventing and `CurrentTrackURI` on a **grouped** room (the four-room group),
-  and what happens to the queue on a coordinator change.
-- When exactly Sonos prefetches the next entry (the spike only saw one extra
-  `GET` at the end of each short track).
-- `SHUFFLE`-mode behavior is not needed (the design never uses it).
-- A queue larger than 1200 entries, and anything above that limit.
+### 9.4 Still open
+- What happens to the queue and to eventing when the **coordinator changes**
+  (group reshuffle, Baño taking over): not tested, since it would change the
+  household's groups.
+- An **audible** gap check across mixed entries (the spike ran muted).
+- How many ids `track/getList` accepts per call (Phase 1).
+- A queue beyond 5008 entries (no limit found; likely irrelevant).
+- Behavior with a real, long playlist end to end (Phases 3–5).
