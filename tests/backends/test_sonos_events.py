@@ -259,3 +259,153 @@ def _make_subscription(sid: str):
     return GenaSubscription(
         sid=sid, ip="127.0.0.1", port=1400, timeout_seconds=1800, subscribed_at=0.0
     )
+
+
+AVT_PATH = "/MediaRenderer/AVTransport/Event"
+
+
+class _FakeServiceDevice(_FakeGenaDevice):
+    """A fake device that also has an AVTransport event path."""
+
+    def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(*args, **kwargs)
+        self.refuse_renewal = False
+
+    async def handle_subscribe(self, request: web.Request) -> web.Response:
+        if "CALLBACK" not in request.headers and self.refuse_renewal:
+            return web.Response(status=412)
+        return await super().handle_subscribe(request)
+
+    async def start(self) -> tuple[web.AppRunner, int]:
+        app = web.Application()
+        for path in (ZONE_GROUP_TOPOLOGY_EVENT_PATH, AVT_PATH):
+            app.router.add_route("SUBSCRIBE", path, self.handle_subscribe)
+            app.router.add_route("UNSUBSCRIBE", path, self.handle_unsubscribe)
+        port = _free_port()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", port).start()
+        return runner, port
+
+
+class TestServiceSubscriptions:
+    """AVTransport (and any other service) over the one shared NOTIFY route."""
+
+    async def test_subscribes_to_the_services_path_and_keeps_it(self) -> None:
+        device = _FakeServiceDevice()
+        runner, port = await device.start()
+        try:
+            subscriber = SonosEventSubscriber()
+
+            sub = await subscriber.subscribe_service(
+                "127.0.0.1", port, AVT_PATH, "http://cb/sonos-events", AsyncMock()
+            )
+
+            assert sub is not None and sub.path == AVT_PATH
+            assert device.subscribe_headers[0]["CALLBACK"] == "<http://cb/sonos-events>"
+            assert subscriber.subscription is None  # the topology slot is not touched
+        finally:
+            await runner.cleanup()
+
+    async def test_a_service_sid_is_dispatched_to_its_own_handler(self) -> None:
+        subscriber = SonosEventSubscriber()
+        handler, topology = AsyncMock(), AsyncMock()
+        subscriber.on_notify = topology
+        subscriber._handlers["uuid:avt-1"] = handler
+        app = web.Application()
+        subscriber.register_route(app)
+
+        async with TestClient(TestServer(app)) as client:
+            response = await client.request(
+                "NOTIFY", "/sonos-events", headers={"SID": "uuid:avt-1"}, data="<xml/>"
+            )
+
+        assert response.status == 200
+        handler.assert_awaited_once_with("<xml/>")
+        topology.assert_not_called()
+
+    async def test_a_handler_that_fails_is_still_acknowledged(self) -> None:
+        subscriber = SonosEventSubscriber()
+        subscriber._handlers["uuid:avt-1"] = AsyncMock(side_effect=RuntimeError("boom"))
+        app = web.Application()
+        subscriber.register_route(app)
+
+        async with TestClient(TestServer(app)) as client:
+            response = await client.request(
+                "NOTIFY", "/sonos-events", headers={"SID": "uuid:avt-1"}, data="<xml/>"
+            )
+
+        assert response.status == 200  # the device must not retry or drop us for it
+
+    async def test_an_unknown_sid_is_still_refused(self) -> None:
+        subscriber = SonosEventSubscriber()
+        subscriber._handlers["uuid:avt-1"] = AsyncMock()
+        app = web.Application()
+        subscriber.register_route(app)
+
+        async with TestClient(TestServer(app)) as client:
+            response = await client.request(
+                "NOTIFY", "/sonos-events", headers={"SID": "uuid:other"}, data="<xml/>"
+            )
+
+        assert response.status == 412
+
+    async def test_renewal_keeps_the_handler_even_if_the_sid_changes(self) -> None:
+        device = _FakeServiceDevice()
+        runner, port = await device.start()
+        try:
+            subscriber = SonosEventSubscriber()
+            handler = AsyncMock()
+            sub = await subscriber.subscribe_service(
+                "127.0.0.1", port, AVT_PATH, "http://cb/sonos-events", handler
+            )
+            assert sub is not None
+
+            renewed = await subscriber.renew_service(sub)
+
+            assert renewed is not None and renewed.path == AVT_PATH
+            assert subscriber._handlers == {renewed.sid: handler}
+        finally:
+            await runner.cleanup()
+
+    async def test_a_refused_renewal_drops_the_handler(self) -> None:
+        device = _FakeServiceDevice()
+        runner, port = await device.start()
+        try:
+            subscriber = SonosEventSubscriber()
+            sub = await subscriber.subscribe_service(
+                "127.0.0.1", port, AVT_PATH, "http://cb/sonos-events", AsyncMock()
+            )
+            assert sub is not None
+            device.refuse_renewal = True
+
+            assert await subscriber.renew_service(sub) is None
+            assert subscriber._handlers == {}
+        finally:
+            await runner.cleanup()
+
+    async def test_unsubscribing_tells_the_device_and_drops_the_handler(self) -> None:
+        device = _FakeServiceDevice()
+        runner, port = await device.start()
+        try:
+            subscriber = SonosEventSubscriber()
+            sub = await subscriber.subscribe_service(
+                "127.0.0.1", port, AVT_PATH, "http://cb/sonos-events", AsyncMock()
+            )
+            assert sub is not None
+
+            await subscriber.unsubscribe_service(sub)
+
+            assert device.unsubscribe_headers[0]["SID"] == sub.sid
+            assert subscriber._handlers == {}
+        finally:
+            await runner.cleanup()
+
+    async def test_an_unreachable_device_gives_none(self) -> None:
+        subscriber = SonosEventSubscriber()
+
+        sub = await subscriber.subscribe_service(
+            "127.0.0.1", _free_port(), AVT_PATH, "http://cb/sonos-events", AsyncMock()
+        )
+
+        assert sub is None and subscriber._handlers == {}

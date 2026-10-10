@@ -103,6 +103,7 @@ class GenaSubscription:
     port: int
     timeout_seconds: int
     subscribed_at: float  # time.monotonic()
+    path: str = ZONE_GROUP_TOPOLOGY_EVENT_PATH  # the service's event path on the device
 
     @property
     def expires_at(self) -> float:
@@ -145,6 +146,9 @@ class SonosEventSubscriber:
         self.on_notify: Optional[NotifyCallback] = None
         self.callback_path = callback_path
         self.subscription: Optional[GenaSubscription] = None
+        # Other services' subscriptions (see subscribe_service) share this one
+        # NOTIFY route; the SID says which handler a NOTIFY is for.
+        self._handlers: dict[str, NotifyCallback] = {}
 
     def register_route(self, app: web.Application) -> None:
         """Register the NOTIFY handler on a running aiohttp Application."""
@@ -178,9 +182,14 @@ class SonosEventSubscriber:
         return None
 
     async def _subscribe_to(
-        self, session: aiohttp.ClientSession, ip: str, port: int, callback_url: str
+        self,
+        session: aiohttp.ClientSession,
+        ip: str,
+        port: int,
+        callback_url: str,
+        path: str = ZONE_GROUP_TOPOLOGY_EVENT_PATH,
     ) -> Optional[GenaSubscription]:
-        url = f"http://{ip}:{port}{ZONE_GROUP_TOPOLOGY_EVENT_PATH}"
+        url = f"http://{ip}:{port}{path}"
         headers = {
             "CALLBACK": f"<{callback_url}>",
             "NT": "upnp:event",
@@ -204,6 +213,7 @@ class SonosEventSubscriber:
                     port=port,
                     timeout_seconds=timeout_s,
                     subscribed_at=time.monotonic(),
+                    path=path,
                 )
         except Exception as e:
             logger.debug(f"SUBSCRIBE to {ip} failed: {e}")
@@ -213,45 +223,51 @@ class SonosEventSubscriber:
         """Renew the current subscription. Returns False (and clears the
         subscription) if renewal failed — the caller should treat that the
         same as never having subscribed, and try a fresh subscribe."""
-        sub = self.subscription
-        if sub is None:
-            return False
+        renewed = await self._renew(self.subscription)
+        self.subscription = renewed
+        return renewed is not None
 
-        url = f"http://{sub.ip}:{sub.port}{ZONE_GROUP_TOPOLOGY_EVENT_PATH}"
+    async def _renew(self, sub: Optional[GenaSubscription]) -> Optional[GenaSubscription]:
+        """SUBSCRIBE again with the SID; the renewed subscription, or None."""
+        if sub is None:
+            return None
+
+        url = f"http://{sub.ip}:{sub.port}{sub.path}"
         headers = {"SID": sub.sid, "TIMEOUT": f"Second-{REQUESTED_TIMEOUT_SECONDS}"}
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.request("SUBSCRIBE", url, headers=headers) as response:
                     if response.status != 200:
-                        logger.debug(f"Renewal for {sub.ip} returned {response.status}")
-                        self.subscription = None
-                        return False
+                        logger.debug(f"Renewal for {sub.ip}{sub.path} returned {response.status}")
+                        return None
                     timeout_s = _parse_timeout_header(
                         response.headers.get("TIMEOUT", f"Second-{DEFAULT_TIMEOUT_SECONDS}")
                     )
-                    self.subscription = GenaSubscription(
+                    logger.debug(f"Renewed event subscription on {sub.ip}{sub.path}")
+                    return GenaSubscription(
                         sid=response.headers.get("SID", sub.sid),
                         ip=sub.ip,
                         port=sub.port,
                         timeout_seconds=timeout_s,
                         subscribed_at=time.monotonic(),
+                        path=sub.path,
                     )
-                    logger.debug(f"Renewed Sonos topology event subscription on {sub.ip}")
-                    return True
         except Exception as e:
-            logger.debug(f"Renewal for {sub.ip} failed: {e}")
-            self.subscription = None
-            return False
+            logger.debug(f"Renewal for {sub.ip}{sub.path} failed: {e}")
+            return None
 
     async def unsubscribe(self) -> None:
         """Best-effort UNSUBSCRIBE. Always clears local subscription state."""
         sub = self.subscription
         self.subscription = None
+        await self._unsubscribe(sub)
+
+    async def _unsubscribe(self, sub: Optional[GenaSubscription]) -> None:
         if sub is None:
             return
 
-        url = f"http://{sub.ip}:{sub.port}{ZONE_GROUP_TOPOLOGY_EVENT_PATH}"
+        url = f"http://{sub.ip}:{sub.port}{sub.path}"
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -259,9 +275,46 @@ class SonosEventSubscriber:
         except Exception as e:
             logger.debug(f"UNSUBSCRIBE to {sub.ip} failed (harmless — it will just expire): {e}")
 
+    # ------------------------------------------------------------------
+    # Other services (AVTransport of one room, ...) over the same NOTIFY route
+    # ------------------------------------------------------------------
+
+    async def subscribe_service(
+        self, ip: str, port: int, path: str, callback_url: str, handler: NotifyCallback
+    ) -> Optional[GenaSubscription]:
+        """Subscribe to one service of one device; `handler` gets every NOTIFY
+        for the new subscription. None if the device refused or was unreachable."""
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            sub = await self._subscribe_to(session, ip, port, callback_url, path)
+        if sub is not None:
+            self._handlers[sub.sid] = handler
+        return sub
+
+    async def renew_service(self, sub: GenaSubscription) -> Optional[GenaSubscription]:
+        """Renew a service subscription; None (and the handler dropped) if the
+        device no longer knows it — the caller subscribes afresh."""
+        renewed = await self._renew(sub)
+        handler = self._handlers.pop(sub.sid, None)
+        if renewed is not None and handler is not None:
+            self._handlers[renewed.sid] = handler
+        return renewed
+
+    async def unsubscribe_service(self, sub: GenaSubscription) -> None:
+        self._handlers.pop(sub.sid, None)
+        await self._unsubscribe(sub)
+
     async def _handle_notify_request(self, request: web.Request) -> web.Response:
         """aiohttp handler for incoming NOTIFY requests."""
         sid = request.headers.get("SID", "")
+        handler = self._handlers.get(sid)
+        if handler is not None:
+            body = await request.text()
+            try:
+                await handler(body)
+            except Exception as e:
+                logger.warning(f"Error handling event NOTIFY for {sid}: {e}")
+            return web.Response(status=200)
         if self.on_notify is None or self.subscription is None or sid != self.subscription.sid:
             # No current subscriber (feature not in use, or between
             # start/stop), or a foreign/stale subscription (e.g. from a
