@@ -294,6 +294,12 @@ class QobuzPlayer:
         self._gapless_armed: bool = False
         self._transition_generation: int = 0
         self._gapless_arm_lock: asyncio.Lock = asyncio.Lock()
+        # The repeat mode as last announced (see set_loop_mode). Kept here as
+        # well as on the queue because the gapless path consults it on every
+        # arm attempt: with repeat-one on, nothing must be armed, or the
+        # device would advance past the current track instead of stopping
+        # for _handle_track_ended to restart it.
+        self._repeat_mode: RepeatMode = RepeatMode.OFF
         # Whether _prepare_next_track_locked has already warned about having
         # no next-track info to arm with, since the last time info was
         # actually available — see its own docstring. Cleared as soon as
@@ -1582,7 +1588,26 @@ class QobuzPlayer:
             3: RepeatMode.ALL,  # REPEAT_ALL
         }
         repeat_mode = mode_map.get(mode, RepeatMode.OFF)
+        previous = self._repeat_mode
+        self._repeat_mode = repeat_mode
         await self.queue.set_repeat_mode(repeat_mode)
+        if (repeat_mode == RepeatMode.ONE) != (previous == RepeatMode.ONE):
+            await self._rearm_gapless_for_repeat_change()
+
+    async def _rearm_gapless_for_repeat_change(self) -> None:
+        """Repeat-one was switched on or off. On: whatever is armed as the
+        next track must go, so the device stops at the end of this one and
+        _handle_track_ended restarts it (O11: a pre-armed next track
+        otherwise just plays). Off: arm the server's next track again."""
+        if not self.backend.supports_gapless:
+            return
+        async with self._gapless_arm_lock:
+            self._transition_generation += 1
+            self._gapless_armed = False
+            self._pending_next_track = None
+            await self.backend.clear_next_track()
+            if self._state == PlaybackState.PLAYING:
+                await self._prepare_next_track_locked()
 
     async def set_shuffle_mode(self, enabled: bool) -> None:
         """
@@ -1970,6 +1995,10 @@ class QobuzPlayer:
         """Arm the next track. Caller must hold `_gapless_arm_lock`."""
         # Re-check after waiting on the lock — a concurrent arm may have won
         if self._gapless_armed or not self._get_next_track_callback:
+            return
+
+        if self._repeat_mode == RepeatMode.ONE:
+            logger.debug("Gapless: repeat-one is on, not arming a next track")
             return
 
         next_track_info = self._get_next_track_callback()

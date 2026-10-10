@@ -1,0 +1,103 @@
+"""Repeat-one and the gapless path: while repeat-one is on nothing may be
+armed as the next track (the device would otherwise play it instead of
+stopping so the current track can be restarted), and switching it on or off
+must clear or restore the arming. See docs/queue-and-shuffle-wire-observations.md,
+O11, and Player._rearm_gapless_for_repeat_change.
+"""
+
+from unittest.mock import AsyncMock
+
+from qobuz_proxy.backends import PlaybackState
+
+from tests.playback.test_player import _make_player as _make_gapless_player
+
+NEXT = {"trackId": "222", "queueItemId": 9}
+REPEAT_OFF, REPEAT_ONE, REPEAT_ALL = 1, 2, 3  # protocol LoopMode values
+
+
+def _make_player(next_track_info=None):  # type: ignore[no-untyped-def]
+    player, backend = _make_gapless_player(next_track_info=next_track_info)
+    player.queue.set_repeat_mode = AsyncMock()  # the shared helper's queue is a plain mock
+    return player, backend
+
+
+class TestRepeatOneAndGapless:
+    async def test_nothing_is_armed_while_repeat_one_is_on(self) -> None:
+        player, backend = _make_player(next_track_info=NEXT)
+        player._state = PlaybackState.PLAYING
+        await player.set_loop_mode(REPEAT_ONE)
+        backend.set_next_track.reset_mock()
+
+        await player._prepare_next_track_for_gapless()
+
+        backend.set_next_track.assert_not_called()
+        assert player._gapless_armed is False
+
+    async def test_switching_repeat_one_on_clears_the_armed_next_track(self) -> None:
+        player, backend = _make_player(next_track_info=NEXT)
+        player._state = PlaybackState.PLAYING
+        await player._prepare_next_track_for_gapless()
+        assert player._gapless_armed is True
+        backend.clear_next_track.reset_mock()
+        backend.set_next_track.reset_mock()
+
+        await player.set_loop_mode(REPEAT_ONE)
+
+        backend.clear_next_track.assert_awaited_once()
+        backend.set_next_track.assert_not_called()
+        assert player._gapless_armed is False
+
+    async def test_switching_repeat_one_off_arms_the_next_track_again(self) -> None:
+        player, backend = _make_player(next_track_info=NEXT)
+        player._state = PlaybackState.PLAYING
+        await player.set_loop_mode(REPEAT_ONE)
+        backend.set_next_track.reset_mock()
+
+        await player.set_loop_mode(REPEAT_OFF)
+
+        backend.set_next_track.assert_awaited_once()
+        assert player._gapless_armed is True
+
+    async def test_not_playing_it_only_clears_on_the_way_out(self) -> None:
+        player, backend = _make_player(next_track_info=NEXT)
+        player._state = PlaybackState.PAUSED
+        await player.set_loop_mode(REPEAT_ONE)
+        backend.set_next_track.reset_mock()
+
+        await player.set_loop_mode(REPEAT_OFF)
+
+        backend.set_next_track.assert_not_called()  # re-armed when playback resumes
+
+    async def test_repeat_all_and_off_do_not_touch_the_arming(self) -> None:
+        """The server wraps its own next pointer for repeat-all (O17)."""
+        player, backend = _make_player(next_track_info=NEXT)
+        player._state = PlaybackState.PLAYING
+        await player._prepare_next_track_for_gapless()
+        backend.clear_next_track.reset_mock()
+
+        await player.set_loop_mode(REPEAT_ALL)
+        await player.set_loop_mode(REPEAT_OFF)
+
+        backend.clear_next_track.assert_not_called()
+        assert player._gapless_armed is True
+
+    async def test_repeating_the_same_announcement_is_idempotent(self) -> None:
+        """Type 97 arrives twice per change."""
+        player, backend = _make_player(next_track_info=NEXT)
+        player._state = PlaybackState.PLAYING
+        await player._prepare_next_track_for_gapless()
+        backend.clear_next_track.reset_mock()
+
+        await player.set_loop_mode(REPEAT_ONE)
+        await player.set_loop_mode(REPEAT_ONE)
+
+        backend.clear_next_track.assert_awaited_once()
+
+    async def test_a_backend_without_gapless_is_left_alone(self) -> None:
+        player, backend = _make_player(next_track_info=NEXT)
+        backend.supports_gapless = False
+        backend.clear_next_track = AsyncMock()
+
+        await player.set_loop_mode(REPEAT_ONE)
+
+        backend.clear_next_track.assert_not_called()
