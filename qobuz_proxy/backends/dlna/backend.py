@@ -242,6 +242,13 @@ class DLNABackend(AudioBackend):
 
     _client_class: type[DLNAClient] = DLNAClient
 
+    # Whether _poll_state_loop reads the device's current URI on every cycle
+    # while playing, instead of only when a next track is armed or a hijack
+    # check is due. A backend that follows the device through a queue it
+    # handed over whole (SonosQueueBackend) needs every cycle; see
+    # _observe_polled_uri.
+    _poll_uri_every_cycle: bool = False
+
     def __init__(
         self,
         ip: str,
@@ -999,6 +1006,13 @@ class DLNABackend(AudioBackend):
 
         return current_uri in (self._current_proxy_url, self._next_track_proxy_url)
 
+    async def _observe_polled_uri(self, current_uri: Optional[str]) -> None:
+        """Called with the URI the device reported on a cycle that read it
+        (see _poll_uri_every_cycle), before gapless/hijack evaluation.
+        Default: nothing. SonosQueueBackend uses it to notice the device
+        moving to another entry of the queue it was given."""
+        return None
+
     def _is_own_proxy_url(self, uri: str) -> bool:
         """Whether `uri` is served by this backend's own proxy — any track,
         not necessarily the one we currently think is playing. Each Speaker
@@ -1401,7 +1415,7 @@ class DLNABackend(AudioBackend):
                     hijack_check_due = self._hijack_check_countdown <= 0
                     if hijack_check_due:
                         self._hijack_check_countdown = _HIJACK_CHECK_INTERVAL_POLLS
-                    armed = bool(self._next_track_proxy_url)
+                    armed = bool(self._next_track_proxy_url) or self._poll_uri_every_cycle
 
                     if armed or (hijack_check_due and not in_grace_period):
                         current_uri = await self._get_current_transport_uri()
@@ -1413,6 +1427,7 @@ class DLNABackend(AudioBackend):
 
                         if current_uri == self._current_proxy_url:
                             self._current_track_confirmed = True
+                        await self._observe_polled_uri(current_uri)
 
                         # Gated on the device actually having confirmed the
                         # *current* track at least once (not just a fixed
