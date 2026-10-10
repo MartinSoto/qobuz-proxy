@@ -841,3 +841,14 @@ The likely difference is that the app's own entries carry a service or library
 identity ours lack. Experimenting with variants of the entry description on a
 spare room was offered and not taken up: cosmetic, since Previous/Next from the
 Sonos side work and editing the queue there is out of scope.
+
+Follow-up the same day, measured on a room with a native Spotify queue (Cocina):
+the app has a queue button; on our queues it says "empty". A native entry is
+`<res protocolInfo="sonos.com-spotify:*:audio/x-spotify:*">x-sonos-spotify:...?sid=9&flags=8232&sn=14`
+with a `/getaa` cover and id `Q:0/N`. Six differently described test entries of
+ours (as published, no cover, mp3 protocol, radio scheme, `Q:0/N` ids, bare res)
+appended to that queue and, last, an exact copy of a native entry, were all held by
+the device (`Browse Q:0` listed 20 entries) and none appeared in the app, which
+kept showing the original 12. So the app does not read the device's queue
+contents (it keeps its own view of service queues), and no description of an
+entry makes a UPnP-added one listed. Closed for good.
