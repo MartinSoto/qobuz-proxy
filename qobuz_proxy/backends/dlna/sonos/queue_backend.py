@@ -30,6 +30,7 @@ from qobuz_proxy.backends.types import (
 
 from ..proxy_server import AudioProxyServerProtocol
 from .audio_url import EntryKey, parse_entry_url
+from ..backend import PLAYBACK_START_GRACE_PERIOD_SECONDS, STATE_POLL_INTERVAL_SECONDS
 from .backend import SonosBackend
 from .client import SonosClient
 from .entry_builder import ProxyEntryBuilder
@@ -37,8 +38,13 @@ from .events import EventSource
 from .proxy_server import SonosAudioProxyServer
 from .queue_sync import SonosQueueSync
 from .queue_sync_runner import QueueSyncRunner
-from .transport_events import TransportEvent
-from .transport_subscription import TransportEventStream
+from .transport_events import (
+    GROUP_RENDERING_EVENT_PATH,
+    GroupVolumeEvent,
+    TransportEvent,
+    parse_group_volume_event,
+)
+from .transport_subscription import ServiceEventStream, TransportEventStream
 
 if TYPE_CHECKING:
     from qobuz_proxy.playback.queue import QobuzQueue
@@ -51,6 +57,10 @@ _PLAY_MODES = {"off": "NORMAL", "one": "REPEAT_ONE", "all": "REPEAT_ALL"}
 
 # How long starting playback may take, publishing the first batch included.
 START_TIMEOUT_SECONDS = 30.0
+
+# While the device's events are healthy (and nothing is in flux) the poll loop
+# only has to be a safety net: events wake it the moment something changes.
+SAFETY_NET_POLL_INTERVAL_SECONDS = 10.0
 
 
 class SonosQueueBackend(SonosBackend):
@@ -80,6 +90,7 @@ class SonosQueueBackend(SonosBackend):
         # attach_events. None until given a source (or when there is none).
         self._event_source: Optional[EventSource] = None
         self._events: Optional[TransportEventStream] = None
+        self._volume_events: Optional[ServiceEventStream[GroupVolumeEvent]] = None
 
     @property
     def supports_gapless(self) -> bool:
@@ -170,11 +181,49 @@ class SonosQueueBackend(SonosBackend):
             return
         if self._events is None:
             self._events = TransportEventStream(source, self.name, self._on_transport_event)
+        if self._volume_events is None:
+            self._volume_events = ServiceEventStream(
+                source,
+                self.name,
+                GROUP_RENDERING_EVENT_PATH,
+                parse_group_volume_event,
+                self._on_volume_event,
+            )
         await self._events.start(self._ip, self._port)
+        await self._volume_events.start(self._ip, self._port)
 
     async def _stop_events(self) -> None:
-        if self._events is not None:
-            await self._events.stop()
+        for stream in (self._events, self._volume_events):
+            if stream is not None:
+                await stream.stop()
+
+    async def _on_volume_event(self, event: GroupVolumeEvent) -> None:
+        """The group volume or mute changed (from the Sonos app, a button): the
+        cycle's volume read picks it up now instead of at the next tick."""
+        self.wake_poll()
+
+    def _events_settled(self) -> bool:
+        """Whether the device's events can be relied on to say when something
+        changes, and nothing is mid-change (a stop or seek awaiting its
+        confirmation, a handoff, the first seconds of a play) that the loop must
+        keep watching closely."""
+        events, volume = self._events, self._volume_events
+        if events is None or volume is None or not (events.healthy and volume.healthy):
+            return False
+        return (
+            self._unconfirmed_stop_polls == 0
+            and self._unconfirmed_stop_since == 0.0
+            and not self._awaiting_retarget_confirmation
+            and not self._awaiting_seek_confirmation
+            and not self._external_takeover_notified
+            and time.monotonic() - self._playback_started_at > PLAYBACK_START_GRACE_PERIOD_SECONDS
+        )
+
+    def _poll_interval(self) -> float:
+        interval = super()._poll_interval()
+        if interval == STATE_POLL_INTERVAL_SECONDS and self._events_settled():
+            return SAFETY_NET_POLL_INTERVAL_SECONDS
+        return interval  # backed off, idle or unsure of the events: as before
 
     async def _on_transport_event(self, event: TransportEvent) -> None:
         """The device says something changed: look now rather than at the next

@@ -10,10 +10,16 @@ to arrive (the first event after subscribing is the proof the path works).
 import asyncio
 import logging
 import time
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Generic, Optional, TypeVar
 
 from .events import EventSource, GenaSubscription
-from .transport_events import AVTRANSPORT_EVENT_PATH, TransportEvent, parse_transport_event
+from .transport_events import (
+    AVTRANSPORT_EVENT_PATH,
+    TransportEvent,
+    parse_transport_event,
+)
+
+T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +33,22 @@ RETRY_SECONDS = 30.0
 EventCallback = Callable[[TransportEvent], Awaitable[None]]
 
 
-class TransportEventStream:
-    def __init__(self, source: EventSource, name: str, on_event: EventCallback) -> None:
+class ServiceEventStream(Generic[T]):
+    """One device service's events: `parse` turns a NOTIFY body into what
+    `on_event` receives (None: not an event of this service, ignored)."""
+
+    def __init__(
+        self,
+        source: EventSource,
+        name: str,
+        path: str,
+        parse: Callable[[str], Optional[T]],
+        on_event: Callable[[T], Awaitable[None]],
+    ) -> None:
         self._source = source
         self._name = name
+        self._path = path
+        self._parse = parse
         self._on_event = on_event
         self._target: Optional[tuple[str, int]] = None
         self._sub: Optional[GenaSubscription] = None
@@ -80,19 +98,19 @@ class TransportEventStream:
         ip, port = self._target
         self._last_event_at = None
         self._sub = await self._source.subscriber.subscribe_service(
-            ip, port, AVTRANSPORT_EVENT_PATH, self._source.callback_url, self._handle_notify
+            ip, port, self._path, self._source.callback_url, self._handle_notify
         )
         if self._sub is None:
-            logger.info(f"[{self._name}] could not subscribe to transport events on {ip}")
+            logger.info(f"[{self._name}] could not subscribe to {self._path} events on {ip}")
             return False
         logger.info(
-            f"[{self._name}] subscribed to transport events on {ip} "
+            f"[{self._name}] subscribed to {self._path.rsplit('/', 2)[-2]} events on {ip} "
             f"(timeout {self._sub.timeout_seconds}s)"
         )
         return True
 
     async def _handle_notify(self, body: str) -> None:
-        event = parse_transport_event(body)
+        event = self._parse(body)
         if event is None:
             return
         self._last_event_at = time.monotonic()
@@ -117,11 +135,18 @@ class TransportEventStream:
                 self._sub = renewed
                 continue
             # The device no longer knows the subscription: start afresh.
-            logger.info(f"[{self._name}] transport event subscription lapsed; resubscribing")
+            logger.info(f"[{self._name}] {self._path} event subscription lapsed; resubscribing")
             self._sub = None
             self._last_event_at = None
             if not await self._subscribe():
                 continue
 
 
-__all__ = ["EventCallback", "TransportEventStream"]
+class TransportEventStream(ServiceEventStream[TransportEvent]):
+    """A room's AVTransport events."""
+
+    def __init__(self, source: EventSource, name: str, on_event: EventCallback) -> None:
+        super().__init__(source, name, AVTRANSPORT_EVENT_PATH, parse_transport_event, on_event)
+
+
+__all__ = ["EventCallback", "ServiceEventStream", "TransportEventStream"]

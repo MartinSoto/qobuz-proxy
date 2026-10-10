@@ -632,9 +632,15 @@ class TestDeviceEvents:
 
         await backend.attach_events(source)
 
-        args = subscriber.subscribe_service.await_args.args  # type: ignore[attr-defined]
-        assert args[0] == backend._ip and args[1] == backend._port
-        assert args[2].endswith("/AVTransport/Event") and args[3] == "http://cb/sonos-events"
+        calls = subscriber.subscribe_service.await_args_list  # type: ignore[attr-defined]
+        paths = sorted(c.args[2] for c in calls)
+        assert paths == [
+            "/MediaRenderer/AVTransport/Event",
+            "/MediaRenderer/GroupRenderingControl/Event",
+        ]
+        for call in calls:
+            assert call.args[0] == backend._ip and call.args[1] == backend._port
+            assert call.args[3] == "http://cb/sonos-events"
         await backend._stop_events()
 
     async def test_an_event_wakes_the_poll_loop(self) -> None:
@@ -692,3 +698,76 @@ class TestDeviceEvents:
 
         assert ok
         backend._events.start.assert_awaited_once_with(backend._ip, backend._port)  # type: ignore[union-attr]
+
+
+class TestSafetyNetPolling:
+    """While the events can be relied on and nothing is in flux, the poll loop
+    is a slow safety net; otherwise it polls as before."""
+
+    def _healthy_backend(self):  # type: ignore[no-untyped-def]
+        import time as _time
+
+        backend = SonosQueueBackend("10.0.0.5")
+        backend._events = MagicMock(healthy=True)
+        backend._volume_events = MagicMock(healthy=True)
+        backend._playback_started_at = _time.monotonic() - 60
+        backend._client = None
+        return backend
+
+    def test_healthy_events_slow_the_poll_to_a_safety_net(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos.queue_backend import SAFETY_NET_POLL_INTERVAL_SECONDS
+
+        assert self._healthy_backend()._poll_interval() == SAFETY_NET_POLL_INTERVAL_SECONDS
+
+    def test_without_events_it_polls_as_before(self) -> None:
+        from qobuz_proxy.backends.dlna.backend import STATE_POLL_INTERVAL_SECONDS
+
+        backend = SonosQueueBackend("10.0.0.5")
+
+        assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS
+
+    def test_either_stream_unhealthy_brings_the_fast_poll_back(self) -> None:
+        from qobuz_proxy.backends.dlna.backend import STATE_POLL_INTERVAL_SECONDS
+
+        for which in ("_events", "_volume_events"):
+            backend = self._healthy_backend()
+            getattr(backend, which).healthy = False
+            assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS, which
+
+    def test_anything_in_flux_keeps_the_fast_poll(self) -> None:
+        import time as _time
+
+        from qobuz_proxy.backends.dlna.backend import STATE_POLL_INTERVAL_SECONDS
+
+        in_flux = {
+            "a stop awaiting confirmation": {"_unconfirmed_stop_polls": 1},
+            "an unconfirmed stop": {"_unconfirmed_stop_since": _time.monotonic()},
+            "a retarget awaiting confirmation": {"_awaiting_retarget_confirmation": True},
+            "a seek awaiting confirmation": {"_awaiting_seek_confirmation": True},
+            "an unresolved takeover": {"_external_takeover_notified": True},
+            "the first seconds of a play": {"_playback_started_at": _time.monotonic()},
+        }
+        for what, attrs in in_flux.items():
+            backend = self._healthy_backend()
+            for name, value in attrs.items():
+                setattr(backend, name, value)
+            assert backend._poll_interval() == STATE_POLL_INTERVAL_SECONDS, what
+
+    def test_a_backed_off_poll_stays_backed_off(self) -> None:
+        backend = self._healthy_backend()
+        backend._poll_backoff_active = True
+        backend._client = MagicMock(consecutive_failures=50)
+
+        from qobuz_proxy.backends.dlna.backend import STATE_POLL_INTERVAL_SECONDS
+
+        assert backend._poll_interval() > STATE_POLL_INTERVAL_SECONDS
+
+    async def test_a_volume_event_wakes_the_loop(self) -> None:
+        from qobuz_proxy.backends.dlna.sonos.transport_events import GroupVolumeEvent
+
+        backend, _, _ = await make([1])
+        backend.wake_poll = MagicMock()  # type: ignore[method-assign]
+
+        await backend._on_volume_event(GroupVolumeEvent(volume=20))
+
+        backend.wake_poll.assert_called_once()

@@ -4,7 +4,10 @@
 from pathlib import Path
 
 from qobuz_proxy.backends.dlna.sonos.audio_url import parse_entry_url
-from qobuz_proxy.backends.dlna.sonos.transport_events import parse_transport_event
+from qobuz_proxy.backends.dlna.sonos.transport_events import (
+    parse_group_volume_event,
+    parse_transport_event,
+)
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "sonos_events"
 
@@ -102,3 +105,15 @@ class TestPartialEvents:
         assert e.transport_state == "PAUSED_PLAYBACK"
         assert e.current_track is None and e.current_track_uri is None
         assert e.play_mode is None and e.current_track_duration_ms is None
+
+
+class TestGroupVolumeEvents:
+    def test_the_volume_and_mute_of_the_group(self) -> None:
+        e = parse_group_volume_event((FIXTURES / "grc_group_volume.xml").read_text())
+
+        assert e is not None
+        assert e.volume == 5 and e.muted is True
+
+    def test_other_events_are_not_volume_events(self) -> None:
+        assert parse_group_volume_event((FIXTURES / "avt_playing.xml").read_text()) is None
+        assert parse_group_volume_event("not xml") is None

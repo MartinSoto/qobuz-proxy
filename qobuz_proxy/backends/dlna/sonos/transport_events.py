@@ -17,6 +17,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 AVTRANSPORT_EVENT_PATH = "/MediaRenderer/AVTransport/Event"
+GROUP_RENDERING_EVENT_PATH = "/MediaRenderer/GroupRenderingControl/Event"
 
 
 @dataclass(frozen=True)
@@ -97,4 +98,34 @@ def parse_transport_event(body: str) -> Optional[TransportEvent]:
     return parsed if parsed != TransportEvent() else None
 
 
-__all__ = ["AVTRANSPORT_EVENT_PATH", "TransportEvent", "parse_transport_event"]
+@dataclass(frozen=True)
+class GroupVolumeEvent:
+    """What a GroupRenderingControl event says (None: not mentioned)."""
+
+    volume: Optional[int] = None
+    muted: Optional[bool] = None
+
+
+def parse_group_volume_event(body: str) -> Optional[GroupVolumeEvent]:
+    """Read a GroupRenderingControl NOTIFY body (plain properties, no LastChange);
+    None if it carries neither the volume nor the mute."""
+    try:
+        outer = ET.fromstring(body)
+    except ET.ParseError:
+        return None
+    values = {_local(e.tag): (e.text or "") for e in outer.iter() if len(e) == 0}
+    volume = _int(values.get("GroupVolume"))
+    mute = _int(values.get("GroupMute"))
+    if volume is None and mute is None:
+        return None
+    return GroupVolumeEvent(volume=volume, muted=None if mute is None else bool(mute))
+
+
+__all__ = [
+    "AVTRANSPORT_EVENT_PATH",
+    "GROUP_RENDERING_EVENT_PATH",
+    "GroupVolumeEvent",
+    "TransportEvent",
+    "parse_group_volume_event",
+    "parse_transport_event",
+]
