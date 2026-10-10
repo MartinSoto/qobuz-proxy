@@ -662,3 +662,46 @@ class TestStop:
 
         active_speaker.stop.assert_awaited_once_with(send_device_stop=True)
         idle_speaker.stop.assert_awaited_once_with(send_device_stop=False)
+
+
+class TestProxyPortsSurviveARestart:
+    """A room keeps the audio port its queue's entries were published under, so a
+    restart (other order, fewer rooms) does not leave the device with entries no
+    one serves."""
+
+    ROOMS = {
+        "A": SonosRoom(
+            uuid="RINCON_A", name="Kitchen", ip="10.0.1.30", port=1400, is_stereo_pair=False
+        ),
+        "B": SonosRoom(
+            uuid="RINCON_B", name="Den", ip="10.0.1.31", port=1400, is_stereo_pair=False
+        ),
+        "C": SonosRoom(
+            uuid="RINCON_C", name="Bath", ip="10.0.1.32", port=1400, is_stereo_pair=False
+        ),
+    }
+
+    async def _ports_after_finding(self, order: str) -> dict[str, int]:
+        controller = _make_controller()
+        ports: dict[str, int] = {}
+        for key in order:
+            speaker = _mock_speaker(self.ROOMS[key].name)
+            with patch("qobuz_proxy.speaker.Speaker", return_value=speaker) as MockSpeaker:
+                await controller._on_room_found(self.ROOMS[key])
+            ports[key] = MockSpeaker.call_args.kwargs["config"].proxy_port
+            speaker._config = MockSpeaker.call_args.kwargs["config"]
+        return ports
+
+    async def test_the_same_room_gets_the_same_port_in_another_order(self) -> None:
+        first = await self._ports_after_finding("ABC")
+        second = await self._ports_after_finding("CAB")
+
+        assert second == first
+        assert len(set(first.values())) == 3
+
+    async def test_a_room_running_alone_keeps_its_port(self) -> None:
+        first = await self._ports_after_finding("ABC")
+
+        alone = await self._ports_after_finding("C")
+
+        assert alone["C"] == first["C"]

@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from qobuz_proxy.config import (
@@ -38,6 +40,8 @@ from qobuz_proxy.config import (
 from ..client import DLNAClient
 from .discovery_manager import DepartedMember, SonosDiscoveryManager, SonosRoom
 from .events import EventSource, SonosEventSubscriber
+from .port_registry import FILE_NAME as PORT_REGISTRY_FILE
+from .port_registry import PortRegistry
 
 if TYPE_CHECKING:
     # Deferred to runtime (see start()/_on_room_found()) — qobuz_proxy.speaker
@@ -49,6 +53,12 @@ if TYPE_CHECKING:
     from qobuz_proxy.speaker import Speaker
 
 logger = logging.getLogger(__name__)
+
+
+def _data_dir() -> Path:
+    """Where the proxy keeps its state (the same place as the credentials)."""
+    return Path(os.environ.get("QOBUZPROXY_DATA_DIR", Path.home() / ".qobuz-proxy"))
+
 
 # A departed member keeps pulling audio from our proxy over its own HTTP
 # connection — Sonos's group-leave doesn't reliably tear that down on its
@@ -122,6 +132,7 @@ class SonosController:
         self._api_client = api_client
         self._app_id = app_id
         self._webui_http_port = webui_http_port
+        self._ports = PortRegistry(_data_dir() / PORT_REGISTRY_FILE)
         self._event_subscriber = event_subscriber
         self._event_source = EventSource.create(event_subscriber, webui_http_port)
         self._stream_resolver = stream_resolver
@@ -243,6 +254,10 @@ class SonosController:
             auto_managed=True,
         )
         all_configs = [s._config for s in self.speakers] + [sc]
+        # The device keeps the port its queue's entries were published under.
+        sc.proxy_port = self._ports.port_for(
+            room.uuid, (c.proxy_port for c in all_configs if c is not sc)
+        )
         _assign_ports(all_configs, webui_port=self._webui_http_port)
 
         # Deferred import — see the module docstring's note by the
