@@ -1259,6 +1259,8 @@ class QobuzPlayer:
         # from SET_STATE (_load_track_locked) before this is ever reached.
         if not self._current_track:
             logger.warning("No track to play - nothing loaded")
+            # The app flips its play button optimistically: correct it now.
+            await self._send_state_update()
             return False
 
         # A cold pause (see above) already has the resume position recorded
@@ -1906,9 +1908,35 @@ class QobuzPlayer:
         self._intended_playing = False
         await self.backend.stop()
         self._state = PlaybackState.STOPPED
-        self._current_track = None
         self._position_value_ms = 0
+        self._position_timestamp_ms = int(time.time() * 1000)
+        # The end of the queue leaves the player on its first item, stopped,
+        # the way players do (O2/O22): that is what the app shows, and what a
+        # bare PLAY afterwards starts again.
+        await self._land_on_first_entry(ended_track)
         await self._send_state_update()
+
+    async def _land_on_first_entry(self, ended_track: Optional[QueueTrack]) -> None:
+        """Make the first item of the play order the current track (stopped,
+        position 0). With no queue to land on, nothing stays loaded."""
+        order = await self.queue.play_order()
+        if not order:
+            self._current_track = None
+            return
+        first = order[0]
+        meta = await self._get_track_metadata(first.track_id)
+        self._current_track = QueueTrack(
+            queue_item_id=first.queue_item_id,
+            track_id=first.track_id,
+            context_uuid=ended_track.context_uuid if ended_track else None,
+            metadata=meta or {},
+            duration_ms=meta.get("duration_ms", 0) if meta else 0,
+        )
+        self._current_duration_ms = self._current_track.duration_ms
+        logger.info(
+            f"Landed on the first queue item: track {first.track_id} "
+            f"(queue item {first.queue_item_id})"
+        )
 
     async def _restart_current_track_locked(self) -> None:
         """Restart the current track from the beginning (repeat-one).
