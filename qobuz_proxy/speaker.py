@@ -46,6 +46,9 @@ from qobuz_proxy.backends.dlna import AudioProxyServerProtocol, DLNABackend
 
 logger = logging.getLogger(__name__)
 
+# How long an app connection waits for the speaker's queue and player to exist.
+_COMPONENTS_READY_TIMEOUT_SECONDS = 60.0
+
 # Observed live, not documented anywhere in the protocol: the server uses
 # this specific error code for "the session_uuid you're using is no good
 # any more" ("session data is missing" / "sessionUuid mismatch" are the
@@ -98,6 +101,9 @@ class Speaker:
         self._is_running: bool = False
         self._ws_connected_event: asyncio.Event = asyncio.Event()
         self._ws_setup_lock: asyncio.Lock = asyncio.Lock()
+        # Set once the queue and player exist: discovery is started alongside
+        # the backend connection (see start()), so the app can connect first.
+        self._components_ready: asyncio.Event = asyncio.Event()
 
         # Effective quality (may differ from config when AUTO_QUALITY is resolved)
         self._effective_quality: int = config.max_quality
@@ -522,6 +528,7 @@ class Speaker:
             # device at full speed for hours after the control channel has
             # already gone quiet.
             backend.set_idle_check(self._player.is_worth_keeping_ws_alive)
+        self._components_ready.set()
 
     async def stop(self, send_device_stop: bool = True) -> None:
         """
@@ -604,6 +611,20 @@ class Speaker:
 
     async def _setup_websocket(self, tokens: ConnectTokens) -> None:
         """Set up (or refresh) the WebSocket connection after receiving tokens."""
+        if self._queue is None or self._player is None:
+            # The app connected while the backend was still being set up (the
+            # discovery endpoint is up before it): wait for it instead of
+            # failing the join the app is spinning on.
+            try:
+                await asyncio.wait_for(
+                    self._components_ready.wait(), _COMPONENTS_READY_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"[{self.name}] The app connected but the speaker did not come up in "
+                    f"{_COMPONENTS_READY_TIMEOUT_SECONDS:.0f}s; not joining"
+                )
+                return
         assert self._queue is not None
         assert self._player is not None
 

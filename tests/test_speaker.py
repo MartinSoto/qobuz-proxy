@@ -1,5 +1,6 @@
 """Tests for the Speaker class."""
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -596,6 +597,45 @@ class TestSpeakerWebSocket:
             await speaker._setup_websocket(refreshed)
 
         assert speaker._queue.set_session.call_args_list[-1].args == (refreshed.session_id,)
+
+    async def test_an_app_connecting_before_the_speaker_is_up_waits_for_it(self):
+        """Discovery is up before the backend is connected, so the app can
+        connect first: the join must wait for the queue and player instead of
+        failing (the app spins on a join that never happens)."""
+        speaker = Speaker(
+            config=_make_speaker_config(),
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
+        tokens = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(jwt="jwt", exp=9999999999, endpoint="wss://test.qobuz.com/ws"),
+        )
+
+        with (
+            patch("qobuz_proxy.speaker.WsManager") as mock_ws_cls,
+            patch("qobuz_proxy.speaker.StateReporter") as mock_sr_cls,
+        ):
+            mock_ws = mock_ws_cls.return_value
+            mock_ws.start = AsyncMock()
+            mock_ws.send_volume_changed = AsyncMock()
+            mock_sr_cls.return_value.start = AsyncMock()
+
+            joining = asyncio.create_task(speaker._setup_websocket(tokens))
+            await asyncio.sleep(0.05)
+            assert not joining.done()  # still waiting for the speaker
+
+            speaker._queue = MagicMock()
+            player = MagicMock()
+            player.start = AsyncMock()
+            player.get_volume = AsyncMock(return_value=50)
+            speaker._player = player
+            speaker._components_ready.set()
+            await asyncio.wait_for(joining, 2)
+
+        mock_ws.start.assert_awaited()
+        speaker._queue.set_session.assert_called_once_with(tokens.session_id)
 
     async def test_setup_websocket_refreshes_existing_manager(self):
         """If ws_manager already exists, _setup_websocket should only refresh tokens."""
