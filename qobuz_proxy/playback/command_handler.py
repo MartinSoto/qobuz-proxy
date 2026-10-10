@@ -4,6 +4,7 @@ Playback command handler for WebSocket integration.
 Processes playback commands from the Qobuz app via WsManager.
 """
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
@@ -17,6 +18,13 @@ logger = logging.getLogger(__name__)
 
 # Quality change callback type
 QualityChangeCallback = Callable[[int], Awaitable[None]]
+
+# Asks the server for a full queue snapshot (WsManager.request_queue_state).
+RequestQueueState = Callable[[], Awaitable[Any]]
+
+# How long to let a burst of queue edits settle before asking for the snapshot
+# that reflects all of them (edits can arrive 1-2 s apart, never faster).
+SNAPSHOT_REQUEST_DEBOUNCE_SECONDS = 0.15
 
 # QConnect message types for Server -> Renderer commands
 MSG_TYPE_SET_STATE = 41  # SrvrRndrSetState: play/pause/stop, position, queue item
@@ -46,11 +54,20 @@ MSG_TYPE_QUEUE_TRACKS_LOADED = 91  # SrvrCtrlQueueLoadTracks
 # added track, not the whole queue — see queue.py's QueueMembership,
 # which these all feed.
 MSG_TYPE_QUEUE_CLEARED = 89  # SrvrCtrlQueueCleared
-MSG_TYPE_QUEUE_STATE = 90  # SrvrCtrlQueueState — full snapshot, purely descriptive
+MSG_TYPE_QUEUE_STATE = 90  # SrvrCtrlQueueState — full snapshot (also the reply to AskForQueueState)
 MSG_TYPE_QUEUE_TRACKS_INSERTED = 92  # SrvrCtrlQueueTracksInserted
 MSG_TYPE_QUEUE_TRACKS_ADDED = 93  # SrvrCtrlQueueTracksAdded
 MSG_TYPE_QUEUE_TRACKS_REMOVED = 94  # SrvrCtrlQueueTracksRemoved
-MSG_TYPE_QUEUE_TRACKS_REORDERED = 95  # SrvrCtrlQueueTracksReordered — membership no-op
+MSG_TYPE_QUEUE_TRACKS_REORDERED = 95  # SrvrCtrlQueueTracksReordered
+
+# Session-level settings announced to Controllers (docs/queue-and-shuffle-wire-
+# observations.md): shuffle (a minor-version bump, no queue resend, O7), repeat
+# (no version bump, and never a renderer-targeted message after connect, O10),
+# autoplay on/off and the autoplay suggestion list (O12, O21).
+MSG_TYPE_SHUFFLE_MODE_SET = 96  # SrvrCtrlShuffleModeSet
+MSG_TYPE_LOOP_MODE_SET = 97  # SrvrCtrlLoopModeSet
+MSG_TYPE_AUTOPLAY_MODE_SET = 102  # SrvrCtrlAutoplayModeSet
+MSG_TYPE_AUTOPLAY_TRACKS_LOADED = 103  # SrvrCtrlAutoplayTracksLoaded
 
 # The server signals "no current/next track" with an all-bits-set
 # QueueTrackRef rather than omitting the field — HasField() is still True,
@@ -82,6 +99,8 @@ class PlaybackCommandHandler:
         player: "QobuzPlayer",
         queue: Optional["QobuzQueue"] = None,
         on_quality_change: Optional[QualityChangeCallback] = None,
+        request_queue_state: Optional[RequestQueueState] = None,
+        snapshot_debounce_s: float = SNAPSHOT_REQUEST_DEBOUNCE_SECONDS,
     ):
         """
         Initialize command handler.
@@ -90,10 +109,21 @@ class PlaybackCommandHandler:
             player: QobuzPlayer instance
             queue: Optional QobuzQueue (defaults to player.queue)
             on_quality_change: Optional callback for quality change events
+            request_queue_state: Asks the server for a full queue snapshot.
+                Called (debounced) after every queue edit and shuffle toggle,
+                because those messages do not say what the play order is now
+                (O19). None disables it (queue order then goes stale on
+                the first edit and stays so until a snapshot happens to
+                arrive).
+            snapshot_debounce_s: Settling time before such a request is sent.
         """
         self.player = player
         self.queue = queue or player.queue
         self._on_quality_change = on_quality_change
+        self._request_queue_state = request_queue_state
+        self._snapshot_debounce_s = snapshot_debounce_s
+        self._snapshot_dirty = False
+        self._snapshot_task: Optional["asyncio.Task[None]"] = None
 
         # Store next track info for auto-advance (from SET_STATE nextQueueItem)
         self._next_track_info: Optional[dict] = None
@@ -117,6 +147,10 @@ class PlaybackCommandHandler:
             MSG_TYPE_QUEUE_TRACKS_ADDED,
             MSG_TYPE_QUEUE_TRACKS_REMOVED,
             MSG_TYPE_QUEUE_TRACKS_REORDERED,
+            MSG_TYPE_SHUFFLE_MODE_SET,
+            MSG_TYPE_LOOP_MODE_SET,
+            MSG_TYPE_AUTOPLAY_MODE_SET,
+            MSG_TYPE_AUTOPLAY_TRACKS_LOADED,
         ]
 
     async def handle_message(self, msg_type: int, message: Any) -> None:
@@ -151,6 +185,14 @@ class PlaybackCommandHandler:
                 await self._handle_queue_tracks_reordered(message)
             elif msg_type == MSG_TYPE_QUEUE_CLEARED:
                 await self._handle_queue_cleared(message)
+            elif msg_type == MSG_TYPE_SHUFFLE_MODE_SET:
+                await self._handle_shuffle_mode_set(message)
+            elif msg_type == MSG_TYPE_LOOP_MODE_SET:
+                await self._handle_loop_mode_set(message)
+            elif msg_type == MSG_TYPE_AUTOPLAY_MODE_SET:
+                await self._handle_autoplay_mode_set(message)
+            elif msg_type == MSG_TYPE_AUTOPLAY_TRACKS_LOADED:
+                await self._handle_autoplay_tracks_loaded(message)
             else:
                 logger.warning(f"Unhandled playback message type: {msg_type}")
         except Exception as e:
@@ -321,9 +363,14 @@ class PlaybackCommandHandler:
 
         # Full snapshot — feed queue membership regardless of activation
         # state, same reasoning as the version bookkeeping just above.
-        await self.queue.replace_queue_tracks(
-            [(t.queueItemId, str(t.trackId)) for t in loaded.tracks]
+        await self.queue.apply_snapshot(
+            [(t.queueItemId, str(t.trackId)) for t in loaded.tracks],
+            shuffle_mode=loaded.shuffleMode,
         )
+        if loaded.shuffleMode:
+            # Never seen on the wire (O9): a load does not carry the shuffled
+            # order, so ask for it rather than guess.
+            self._request_snapshot_soon()
 
         if not self.player.is_active_renderer:
             logger.debug("Not the active renderer, ignoring QUEUE_TRACKS_LOADED")
@@ -396,49 +443,47 @@ class PlaybackCommandHandler:
         self._on_next_track_changed = callback
 
     async def _handle_queue_state(self, message: Any) -> None:
-        """Handle SrvrCtrlQueueState (type 90) — a full, unprompted queue
-        snapshot (observed live after another client (re)joins the
-        session). Never seen carrying a queuePosition or driving playback
-        the way QUEUE_TRACKS_LOADED does, so this only feeds queue
-        membership/version bookkeeping."""
+        """Handle SrvrCtrlQueueState (type 90) — a full snapshot: the queue
+        in its original order, the shuffle flag and, with shuffle on, the
+        server's play order as `shuffledTrackIndexes` (O16). It is the reply
+        to our own AskForQueueState and is also volunteered when another
+        client (re)joins. Never drives playback the way QUEUE_TRACKS_LOADED
+        does, so this only feeds the queue model."""
         if not message.HasField("srvrCtrlQueueState"):
             return
         state = message.srvrCtrlQueueState
-        if state.HasField("queueVersion"):
-            await self.queue.set_version(
-                QueueVersion(major=state.queueVersion.major, minor=state.queueVersion.minor)
-            )
-        await self.queue.replace_queue_tracks(
-            [(t.queueItemId, str(t.trackId)) for t in state.tracks]
+        await self._note_version(state)
+        await self.queue.apply_snapshot(
+            [(t.queueItemId, str(t.trackId)) for t in state.tracks],
+            shuffle_mode=state.shuffleMode,
+            shuffled_indexes=list(state.shuffledTrackIndexes),
         )
 
     async def _handle_queue_tracks_added(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksAdded (type 93) — a genuine
         incremental delta (confirmed live 2026-09-15): only the newly
-        added track(s) are carried, not the whole queue."""
+        added track(s) are carried, not the whole queue. They are appended
+        to membership; the order goes stale and a snapshot is requested."""
         if not message.HasField("srvrCtrlQueueTracksAdded"):
             return
         added = message.srvrCtrlQueueTracksAdded
-        if added.HasField("queueVersion"):
-            await self.queue.set_version(
-                QueueVersion(major=added.queueVersion.major, minor=added.queueVersion.minor)
-            )
+        await self._note_version(added)
         await self.queue.add_queue_tracks([(t.queueItemId, str(t.trackId)) for t in added.tracks])
+        self._request_snapshot_soon()
 
     async def _handle_queue_tracks_inserted(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksInserted (type 92) — membership-wise
-        identical to Added: where the track lands (insertAfter) isn't
-        tracked, only that it's now present (see QueueMembership)."""
+        identical to Added. Where the track ends up in the play order is not
+        derivable (with shuffle on a "play next" re-arranges the upcoming
+        tracks, O19), so the snapshot that follows is the only source."""
         if not message.HasField("srvrCtrlQueueTracksInserted"):
             return
         inserted = message.srvrCtrlQueueTracksInserted
-        if inserted.HasField("queueVersion"):
-            await self.queue.set_version(
-                QueueVersion(major=inserted.queueVersion.major, minor=inserted.queueVersion.minor)
-            )
+        await self._note_version(inserted)
         await self.queue.add_queue_tracks(
             [(t.queueItemId, str(t.trackId)) for t in inserted.tracks]
         )
+        self._request_snapshot_soon()
 
     async def _handle_queue_tracks_removed(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksRemoved (type 94) — a delta carrying
@@ -446,35 +491,105 @@ class PlaybackCommandHandler:
         if not message.HasField("srvrCtrlQueueTracksRemoved"):
             return
         removed = message.srvrCtrlQueueTracksRemoved
-        if removed.HasField("queueVersion"):
-            await self.queue.set_version(
-                QueueVersion(major=removed.queueVersion.major, minor=removed.queueVersion.minor)
-            )
+        await self._note_version(removed)
         await self.queue.remove_queue_tracks(list(removed.queueItemIds))
+        self._request_snapshot_soon()
 
     async def _handle_queue_tracks_reordered(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksReordered (type 95) — a pure
-        ordering change (queueItemIds + insertAfter anchor); membership is
-        unaffected, so only version bookkeeping is worth doing here (see
-        QueueMembership for why order isn't tracked at all)."""
+        ordering change (queueItemIds + insertAfter anchor, where the anchor
+        refers to the *shuffled* sequence while shuffle is on, O19);
+        membership is unaffected, the order goes stale."""
         if not message.HasField("srvrCtrlQueueTracksReordered"):
             return
         reordered = message.srvrCtrlQueueTracksReordered
-        if reordered.HasField("queueVersion"):
-            await self.queue.set_version(
-                QueueVersion(major=reordered.queueVersion.major, minor=reordered.queueVersion.minor)
-            )
+        await self._note_version(reordered)
+        await self.queue.mark_order_stale()
+        self._request_snapshot_soon()
 
     async def _handle_queue_cleared(self, message: Any) -> None:
         """Handle SrvrCtrlQueueCleared (type 89)."""
         if not message.HasField("srvrCtrlQueueCleared"):
             return
         cleared = message.srvrCtrlQueueCleared
-        if cleared.HasField("queueVersion"):
-            await self.queue.set_version(
-                QueueVersion(major=cleared.queueVersion.major, minor=cleared.queueVersion.minor)
-            )
+        await self._note_version(cleared)
         await self.queue.clear_queue_tracks()
+
+    async def _handle_shuffle_mode_set(self, message: Any) -> None:
+        """Handle SrvrCtrlShuffleModeSet (type 96): shuffle was toggled in
+        the app. It carries only the new flag, a seed and the pivot item —
+        never the order (O7) — and bumps the minor version without
+        interrupting playback. The play order lives in the snapshot, so mark
+        ours stale and ask for it."""
+        if not message.HasField("srvrCtrlShuffleModeSet"):
+            return
+        toggled = message.srvrCtrlShuffleModeSet
+        await self._note_version(toggled)
+        logger.info(f"Shuffle toggled: {'on' if toggled.shuffleOn else 'off'}")
+        await self.queue.mark_order_stale()
+        self._request_snapshot_soon()
+
+    async def _handle_loop_mode_set(self, message: Any) -> None:
+        """Handle SrvrCtrlLoopModeSet (type 97): the repeat mode, announced
+        to Controllers on every change and on connect. It is the only way
+        this session ever learns of a change after connect (the
+        renderer-targeted type 45 does not follow, O10), and it arrives
+        twice per change (one per role of the dual join) — applying it is
+        idempotent. No version bump accompanies it."""
+        if not message.HasField("srvrCtrlLoopModeSet"):
+            return
+        mode = message.srvrCtrlLoopModeSet.mode
+        logger.info(f"Loop mode announced: {mode}")
+        await self.player.set_loop_mode(mode)
+
+    async def _handle_autoplay_mode_set(self, message: Any) -> None:
+        """Handle SrvrCtrlAutoplayModeSet (type 102): the autoplay setting
+        changed (on = field present, off = absent, O21)."""
+        if not message.HasField("srvrCtrlAutoplayModeSet"):
+            return
+        mode = message.srvrCtrlAutoplayModeSet
+        await self._note_version(mode)
+        await self.queue.set_autoplay_mode(mode.autoplayOn)
+
+    async def _handle_autoplay_tracks_loaded(self, message: Any) -> None:
+        """Handle SrvrCtrlAutoplayTracksLoaded (type 103): a fresh list of
+        suggestions (sent after queue edits, O12). Only the version
+        bookkeeping matters — what plays after the last queue item is
+        whatever the server's next pointer names, not this list."""
+        if not message.HasField("srvrCtrlAutoplayTracksLoaded"):
+            return
+        loaded = message.srvrCtrlAutoplayTracksLoaded
+        await self._note_version(loaded)
+        logger.debug(f"Autoplay suggestions loaded: {len(loaded.tracks)} track(s)")
+
+    async def _note_version(self, payload: Any) -> None:
+        """Record the queue version a message carries, if it has one."""
+        if payload.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=payload.queueVersion.major, minor=payload.queueVersion.minor)
+            )
+
+    def _request_snapshot_soon(self) -> None:
+        """Ask the server for a fresh queue snapshot once the current burst
+        of edits has settled. Every call marks the request wanted again, so
+        an edit arriving after the ask went out (and so not covered by its
+        reply) always triggers another round; edits arriving during the
+        settling time share one request."""
+        if self._request_queue_state is None:
+            return
+        self._snapshot_dirty = True
+        if self._snapshot_task is None or self._snapshot_task.done():
+            self._snapshot_task = asyncio.create_task(self._snapshot_request_loop())
+
+    async def _snapshot_request_loop(self) -> None:
+        assert self._request_queue_state is not None
+        while self._snapshot_dirty:
+            await asyncio.sleep(self._snapshot_debounce_s)
+            self._snapshot_dirty = False  # everything seen so far is covered by this ask
+            try:
+                await self._request_queue_state()
+            except Exception as e:
+                logger.warning(f"Queue snapshot request failed: {e}")
 
     async def _handle_set_active(self, message: Any) -> None:
         """

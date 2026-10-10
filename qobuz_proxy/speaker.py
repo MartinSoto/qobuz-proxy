@@ -631,6 +631,9 @@ class Speaker:
                 self._playback_handler = PlaybackCommandHandler(
                     self._player,
                     on_quality_change=self._on_quality_change,
+                    # Queue edits and shuffle toggles do not say what the new
+                    # play order is; the snapshot this asks for does.
+                    request_queue_state=self._ws_manager.request_queue_state,
                 )
                 self._volume_handler = VolumeCommandHandler(self._player)
 

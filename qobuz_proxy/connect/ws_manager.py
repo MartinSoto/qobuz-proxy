@@ -130,17 +130,6 @@ _QUEUE_POSITION_MESSAGE_TYPES = {
     105: "SRVR_CTRL_QUEUE_VERSION_CHANGED",
 }
 
-# SRVR_CTRL_SHUFFLE_MODE_SET — logged rather than "no handler" (TEMP, see
-# _ASK_AFTER_MESSAGE_TYPES).
-_SHUFFLE_MODE_SET_MESSAGE_TYPE = 96
-
-# TEMP, investigative (2026-10-10) — message types after which this proxy
-# immediately asks for a full queue snapshot, purely to log the reply (see
-# WsManager._ask_for_queue_state_after): a shuffle toggle (96) and every
-# in-place queue edit (92 inserted, 93 added, 94 removed, 95 reordered).
-# Answers how the shuffled order (shuffledTrackIndexes) reacts to edits.
-_ASK_AFTER_MESSAGE_TYPES = frozenset({92, 93, 94, 95, _SHUFFLE_MODE_SET_MESSAGE_TYPE})
-
 # TEMP, investigative (2026-09-13) — a dedicated logger for the raw bytes
 # of every WS frame this proxy sends or receives, one line each, so a
 # capture from a real session can be diffed against a browser HAR of the
@@ -849,6 +838,30 @@ class WsManager:
         await self._raw_send(ask_frame)
         logger.info("Sent CTRL_SRVR_ASK_FOR_QUEUE_STATE")
 
+    async def request_queue_state(self) -> bool:
+        """Ask the server for a full queue snapshot right now.
+
+        The reply arrives as a SRVR_CTRL_QUEUE_STATE (routed to the playback
+        command handler like any other message), followed by the current
+        loop mode. Used by PlaybackCommandHandler after every queue edit and
+        shuffle toggle: those deltas do not say what the new play order is
+        (docs/queue-and-shuffle-wire-observations.md, O19), the snapshot
+        does, and it answered within ~50 ms every time it was asked.
+
+        Returns:
+            True if the request went out, False if there is no live
+            connection (nothing is queued for later: a reconnect asks for
+            the state itself) or the send failed.
+        """
+        if not self._ws or not self._is_connected:
+            return False
+        try:
+            await self._send_ask_for_queue_state()
+        except Exception as e:
+            logger.warning(f"Could not ask for queue state: {e}")
+            return False
+        return True
+
     async def _receive_loop(self) -> None:
         """Receive and dispatch messages."""
         while self._should_run and self._ws:
@@ -932,8 +945,6 @@ class WsManager:
                     handler(msg_type, msg)
                 except Exception as e:
                     logger.error(f"Handler error for type {msg_type}: {e}")
-            elif msg_type == _SHUFFLE_MODE_SET_MESSAGE_TYPE:
-                logger.info(f"Observed shuffle toggle (type {msg_type}): {msg}")
             elif msg_type in _QUEUE_POSITION_MESSAGE_TYPES:
                 # See _QUEUE_POSITION_MESSAGE_TYPES — logged plainly (info,
                 # not warning: expected to arrive, not an error) so these
@@ -942,24 +953,6 @@ class WsManager:
                 logger.info(f"Observed queue message {type_name} (type {msg_type}): {msg}")
             else:
                 logger.warning(f"No handler for message type {msg_type}: {msg}")
-
-            if msg_type in _ASK_AFTER_MESSAGE_TYPES:
-                await self._ask_for_queue_state_after(msg_type)
-
-    async def _ask_for_queue_state_after(self, msg_type: int) -> None:
-        """TEMP, investigative (2026-10-10) — ask for a full queue snapshot
-        right after a shuffle toggle or an in-place queue edit (see
-        _ASK_AFTER_MESSAGE_TYPES), to see whether the server's reply (a
-        SRVR_CTRL_QUEUE_STATE) carries shuffleMode and shuffledTrackIndexes
-        and how they react to the edit. See
-        docs/queue-and-shuffle-wire-observations.md, "Not yet observed".
-        Observation only: nothing acts on the reply beyond what the existing
-        type 90 handler already does. Remove once that question is
-        answered."""
-        try:
-            await self._send_ask_for_queue_state()
-        except Exception as e:
-            logger.warning(f"Could not ask for queue state after message type {msg_type}: {e}")
 
     async def _flush_pending_messages(self) -> None:
         """Send any messages queued during disconnect."""

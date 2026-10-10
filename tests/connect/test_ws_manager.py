@@ -1039,91 +1039,41 @@ class TestStartStop:
         mock_ws.close.assert_awaited_once()
 
 
-class TestShuffleToggleDiagnostic:
-    """TEMP — see WsManager._ask_for_queue_state_after."""
-
-    @staticmethod
-    def _batch(msg_type: int) -> MagicMock:
-        msg = MagicMock()
-        msg.messageType = msg_type
-        batch = MagicMock()
-        batch.messages = [msg]
-        return batch
-
-    async def test_asks_for_queue_state_on_shuffle_mode_set(self, config: Config) -> None:
+class TestRequestQueueState:
+    async def test_sends_the_ask_when_connected(self, config: Config) -> None:
         ws_manager = WsManager(config)
-        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
-            return_value=self._batch(96)
-        )
+        ws_manager._ws = AsyncMock()
+        ws_manager._is_connected = True
         ws_manager._send_ask_for_queue_state = AsyncMock()  # type: ignore[method-assign]
-        decoded = MagicMock(payload=b"x")
 
-        await ws_manager._handle_payload(decoded)
+        assert await ws_manager.request_queue_state() is True
 
         ws_manager._send_ask_for_queue_state.assert_awaited_once()
 
-    async def test_other_unhandled_types_do_not_ask(self, config: Config) -> None:
+    async def test_does_nothing_without_a_live_connection(self, config: Config) -> None:
         ws_manager = WsManager(config)
-        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
-            return_value=self._batch(97)
-        )
         ws_manager._send_ask_for_queue_state = AsyncMock()  # type: ignore[method-assign]
 
-        await ws_manager._handle_payload(MagicMock(payload=b"x"))
+        assert await ws_manager.request_queue_state() is False
 
         ws_manager._send_ask_for_queue_state.assert_not_awaited()
 
-    async def test_ask_failure_does_not_break_message_handling(self, config: Config) -> None:
+    async def test_a_send_failure_is_reported_not_raised(self, config: Config) -> None:
         ws_manager = WsManager(config)
-        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
-            return_value=self._batch(96)
-        )
+        ws_manager._ws = AsyncMock()
+        ws_manager._is_connected = True
         ws_manager._send_ask_for_queue_state = AsyncMock(  # type: ignore[method-assign]
             side_effect=OSError("socket gone")
         )
 
-        await ws_manager._handle_payload(MagicMock(payload=b"x"))  # must not raise
+        assert await ws_manager.request_queue_state() is False
 
-    @pytest.mark.parametrize("msg_type", [92, 93, 94, 95])
-    async def test_asks_for_queue_state_after_each_queue_edit(
-        self, config: Config, msg_type: int
-    ) -> None:
+    async def test_the_real_ask_frame_goes_out_on_the_socket(self, config: Config) -> None:
         ws_manager = WsManager(config)
-        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
-            return_value=self._batch(msg_type)
-        )
-        ws_manager._send_ask_for_queue_state = AsyncMock()  # type: ignore[method-assign]
+        ws = AsyncMock()
+        ws_manager._ws = ws
+        ws_manager._is_connected = True
 
-        await ws_manager._handle_payload(MagicMock(payload=b"x"))
+        assert await ws_manager.request_queue_state() is True
 
-        ws_manager._send_ask_for_queue_state.assert_awaited_once()
-
-    async def test_asks_even_when_a_handler_is_registered_for_the_type(
-        self, config: Config
-    ) -> None:
-        """92-95 have real handlers (command_handler.py); the ask must happen
-        in addition to them, not instead."""
-        ws_manager = WsManager(config)
-        handler = MagicMock()
-        ws_manager._handlers[94] = handler
-        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
-            return_value=self._batch(94)
-        )
-        ws_manager._send_ask_for_queue_state = AsyncMock()  # type: ignore[method-assign]
-
-        await ws_manager._handle_payload(MagicMock(payload=b"x"))
-
-        handler.assert_called_once()
-        ws_manager._send_ask_for_queue_state.assert_awaited_once()
-
-    async def test_does_not_ask_after_the_snapshot_itself(self, config: Config) -> None:
-        """A type 90 reply must not trigger another ask (no feedback loop)."""
-        ws_manager = WsManager(config)
-        ws_manager._codec.decode_qconnect_batch = MagicMock(  # type: ignore[method-assign]
-            return_value=self._batch(90)
-        )
-        ws_manager._send_ask_for_queue_state = AsyncMock()  # type: ignore[method-assign]
-
-        await ws_manager._handle_payload(MagicMock(payload=b"x"))
-
-        ws_manager._send_ask_for_queue_state.assert_not_awaited()
+        assert ws.send.await_count == 1

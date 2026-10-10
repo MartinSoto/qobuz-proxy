@@ -89,6 +89,9 @@ def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:
     # AsyncMock is enough; nothing here asserts on queue state itself.
     queue.set_version = AsyncMock()
     queue.replace_queue_tracks = AsyncMock()
+    queue.apply_snapshot = AsyncMock()
+    queue.mark_order_stale = AsyncMock()
+    queue.set_autoplay_mode = AsyncMock()
     queue.add_queue_tracks = AsyncMock()
     queue.remove_queue_tracks = AsyncMock()
     queue.clear_queue_tracks = AsyncMock()
