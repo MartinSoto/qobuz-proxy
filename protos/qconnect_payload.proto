@@ -287,11 +287,15 @@ message SrvrCtrlQueueErrorMessage       { // reuse of PlaybackError shape, renam
   optional bytes        actionUuid   = 2;
   optional Error        error    = 3;
 }
+// Field 4 was declared "currentQueueItemId" but is not an item id: it is a large
+// value that differs on every toggle (O7), so it is most likely the shuffle seed.
+// shufflePivot is the queueItemId of the current item. Both are present only
+// when shuffle is turned on.
 message SrvrCtrlShuffleModeSet          {
   optional QueueVersion queueVersion = 1;
   optional bytes        actionUuid   = 2;
   optional bool        shuffleOn    = 3;
-  optional fixed32     currentQueueItemId  = 4;
+  optional fixed32     shuffleSeed  = 4;
   optional uint32        shufflePivot = 5;
   optional bool        autoplayMode = 6;
   optional bool        autoplayLoading = 7;
@@ -301,7 +305,17 @@ message SrvrCtrlLoopModeSet             { optional LoopMode mode           = 1; 
 message SrvrCtrlMaxAudioQualityChanged  { optional int32    maxAudioQuality = 1; }
 message SrvrCtrlFileAudioQualityChanged { optional int32    fileAudioQuality = 1; }
 message SrvrCtrlDeviceAudioQualityChanged { optional int32  deviceAudioQuality = 1; }
-message SrvrCtrlAutoplayModeSet         { optional bool     autoplayOn     = 1; }
+// Wire layout confirmed from raw frames (docs/queue-and-shuffle-wire-observations.md,
+// O21): field 3 is present (true) when autoplay is switched on and absent when it
+// is switched off; field 4 was true in both messages observed and its meaning is
+// unknown (possibly "loading"). The earlier single "autoplayOn = 1" declaration
+// decoded both messages as empty.
+message SrvrCtrlAutoplayModeSet {
+  optional QueueVersion queueVersion = 1;
+  optional bytes        actionUuid   = 2;
+  optional bool         autoplayOn   = 3;
+  optional bool         autoplayFlag = 4;
+}
 message SrvrCtrlAutoplayTracksLoaded    {
   optional QueueVersion          queueVersion          = 1;
   optional bytes                 actionUuid            = 2; // 16b
