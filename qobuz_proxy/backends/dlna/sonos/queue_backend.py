@@ -291,7 +291,7 @@ class SonosQueueBackend(SonosBackend):
         """The device says something changed: look now rather than at the next
         tick. What it changed is read the usual way (see _poll_state_loop)."""
         self._last_event_at = time.monotonic()
-        logger.info(
+        logger.debug(
             f"[{self.name}] event: {event.transport_state} track {event.current_track}"
             + (f" of {event.number_of_tracks}" if event.number_of_tracks else "")
         )

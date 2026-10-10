@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import TYPE_CHECKING, Iterable, Optional
 
 if TYPE_CHECKING:
@@ -33,6 +34,9 @@ if TYPE_CHECKING:
     from qobuz_proxy.playback.queue import QobuzQueue
 
 logger = logging.getLogger(__name__)
+
+# Gain lines closer together than this belong to one burst (a queue publish).
+_INFO_BURST_SECONDS = 10.0
 
 
 class QueueGainResolver:
@@ -47,6 +51,9 @@ class QueueGainResolver:
         # tracks for that to matter — see MetadataCache for the pattern
         # this deliberately doesn't need to copy.
         self._cache: dict[str, "TrackAudioInfo"] = {}
+        # A whole queue is resolved in one burst: only the first line of a burst
+        # is worth the info level, the rest is debug.
+        self._last_info_at: float = 0.0
 
     async def resolve(self, track_id: str) -> float:
         """The effective gain, in dB, to apply when transcoding
@@ -61,23 +68,31 @@ class QueueGainResolver:
     async def _resolve(self, track_id: str) -> float:
         own = await self._get_one(track_id)
         if own is None:
-            logger.info(f"No gain data for track {track_id} — using 0 dB")
+            self._log(f"No gain data for track {track_id} — using 0 dB")
             return 0.0
 
         group_ids = await self._album_group(track_id)
         if group_ids is None:
             result = self._clamp(own.gain_db, own.peak)
-            logger.info(f"Track gain for {track_id}: {result:.2f} dB")
+            self._log(f"Track gain for {track_id}: {result:.2f} dB")
             return result
 
         infos = await self._get_many(group_ids)
         group_gain = self._weighted_average_gain(infos.values())
         result = self._clamp(group_gain, own.peak)
-        logger.info(
+        self._log(
             f"Approximated album gain for track {track_id}: {result:.2f} dB "
             f"(unclamped {group_gain:.2f} dB, from {len(infos)} tracks sharing one album)"
         )
         return result
+
+    def _log(self, message: str) -> None:
+        now = time.monotonic()
+        if now - self._last_info_at > _INFO_BURST_SECONDS:
+            logger.info(message + " (the rest of this queue at debug level)")
+        else:
+            logger.debug(message)
+        self._last_info_at = now
 
     async def _album_group(self, track_id: str) -> Optional[frozenset[str]]:
         """The set of track ids to average over, if ``track_id`` is
