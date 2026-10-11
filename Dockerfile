@@ -6,6 +6,7 @@ FROM python:3.11-slim
 # Labels
 LABEL org.opencontainers.image.title="qobuz-proxy"
 LABEL org.opencontainers.image.description="Headless Qobuz music player with DLNA support"
+LABEL org.opencontainers.image.source="https://github.com/MartinSoto/qobuz-proxy"
 
 # Install system dependencies
 # - curl: for health check
