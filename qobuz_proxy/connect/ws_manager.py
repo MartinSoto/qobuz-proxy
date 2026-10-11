@@ -141,6 +141,14 @@ _QUEUE_POSITION_MESSAGE_TYPES = {
 _ACKNOWLEDGED_MESSAGE_TYPES = {
     82: "SRVR_CTRL_RENDERER_STATE_UPDATED",
     83: "SRVR_CTRL_ADD_RENDERER",
+    # The rest of the renderer list's upkeep (seen all day: 85 on every room
+    # change, 84 on a rename) and what the server announces when the active
+    # renderer or its quality settings change.
+    84: "SRVR_CTRL_UPDATE_RENDERER",
+    85: "SRVR_CTRL_REMOVE_RENDERER",
+    86: "SRVR_CTRL_ACTIVE_RENDERER_CHANGED",
+    98: "SRVR_CTRL_VOLUME_MUTED",
+    99: "SRVR_CTRL_MAX_AUDIO_QUALITY_CHANGED",
     100: "SRVR_CTRL_FILE_AUDIO_QUALITY_CHANGED",
 }
 

@@ -1125,7 +1125,7 @@ class TestAcknowledgedMessageTypes:
         batch.messages = [msg]
         return batch
 
-    @pytest.mark.parametrize("msg_type", [82, 83, 100])
+    @pytest.mark.parametrize("msg_type", [82, 83, 84, 85, 86, 98, 99, 100])
     async def test_known_ignored_types_do_not_warn(
         self, config: Config, caplog: pytest.LogCaptureFixture, msg_type: int
     ) -> None:
