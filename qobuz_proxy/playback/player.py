@@ -20,6 +20,8 @@ from qobuz_proxy.backends import (
 )
 from qobuz_proxy.connect.join_state import JoinSnapshot
 
+from qobuz_proxy.timing import slow_step
+
 from .queue import QobuzQueue, QueueTrack, RepeatMode
 from .metadata import MetadataService
 
@@ -1627,7 +1629,8 @@ class QobuzPlayer:
 
         # Stop current playback if playing
         if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-            await self.backend.stop()
+            with slow_step(logger, "stopping the device before a load"):
+                await self.backend.stop()
             self._state = PlaybackState.STOPPED
             # End the outgoing track's play report now that it's being replaced.
             # Pause no longer ends the session, so a load-only track change (no
@@ -1676,7 +1679,8 @@ class QobuzPlayer:
         # play() time (see _start_playback), since the format decision
         # needs device capabilities this method has no reason to know.
         try:
-            meta = await self.queue.get_track_metadata(self._current_track)
+            with slow_step(logger, f"loading the metadata of track {track_id}"):
+                meta = await self.queue.get_track_metadata(self._current_track)
             if meta:
                 self._current_duration_ms = self._current_track.duration_ms
 
@@ -1873,7 +1877,8 @@ class QobuzPlayer:
 
             # Start playback on backend — resolves the actual streaming
             # URL/format itself and hands back what it actually served.
-            result = await self.backend.play(backend_meta)
+            with slow_step(logger, f"starting track {track.track_id} on the device"):
+                result = await self.backend.play(backend_meta)
             self._backend_engaged = True
             self.queue.set_track_stream_info(track, result.blob, result.format_id)
 

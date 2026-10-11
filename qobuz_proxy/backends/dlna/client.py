@@ -27,6 +27,9 @@ UPNP_CONNECTION_MANAGER = "urn:schemas-upnp-org:service:ConnectionManager:1"
 
 # Retry configuration
 MAX_RETRIES = 3
+
+# A SOAP call that waits or runs longer than this is logged (see timing.py).
+SLOW_SOAP_SECONDS = 1.5
 RETRY_DELAY_SECONDS = 2.0
 REQUEST_TIMEOUT_SECONDS = 10.0
 
@@ -770,10 +773,21 @@ class DLNAClient:
         Returns:
             SoapResult with success/failure info and UPnP error codes
         """
+        waiting_since = time.monotonic()
         async with self._call_lock:
-            return await self._soap_action_locked(
-                url, service, action, args, max_retries, retry_upnp_errors
-            )
+            running_since = time.monotonic()
+            try:
+                return await self._soap_action_locked(
+                    url, service, action, args, max_retries, retry_upnp_errors
+                )
+            finally:
+                waited = running_since - waiting_since
+                took = time.monotonic() - running_since
+                if waited > SLOW_SOAP_SECONDS or took > SLOW_SOAP_SECONDS:
+                    logger.info(
+                        f"Slow step: SOAP {action} to {self.ip} waited {waited:.1f}s for the "
+                        f"device's other calls, then took {took:.1f}s"
+                    )
 
     async def _soap_action_locked(
         self,

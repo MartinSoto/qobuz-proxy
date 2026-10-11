@@ -21,6 +21,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import urlsplit
 
+from qobuz_proxy.timing import slow_step
 from qobuz_proxy.backends.types import (
     AdoptedPlayback,
     BackendTrackMetadata,
@@ -479,7 +480,8 @@ class SonosQueueBackend(SonosBackend):
         self._published_generation = generation
         runner.request_load(desired, key, on_start_ready=begin)
         try:
-            return await asyncio.wait_for(started, START_TIMEOUT_SECONDS)
+            with slow_step(logger, f"publishing the first entries and starting {key.track_id}"):
+                return await asyncio.wait_for(started, START_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             logger.warning(f"[{self.name}] starting the queue took over {START_TIMEOUT_SECONDS}s")
             self._published_generation = None
