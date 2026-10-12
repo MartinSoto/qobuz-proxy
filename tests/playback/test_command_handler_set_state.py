@@ -222,3 +222,109 @@ class TestNoTrackSentinel:
         assert handler.get_next_track_info() is not None
         assert handler.get_next_track_info()["trackId"] == "1002"
         on_changed.assert_not_awaited()
+
+
+def _bare_set_state(
+    *,
+    playing_state: int | None = None,
+    position_ms: int | None = None,
+    next_item: tuple[int, int] | None = None,
+):
+    """A SET_STATE that names no current item (the 2026-10-12 first-join case)."""
+    msg = pb.QConnectMessage()
+    msg.messageType = 41
+    st = msg.srvrRndrSetState
+    if playing_state is not None:
+        st.playingState = playing_state
+    if position_ms is not None:
+        st.currentPosition = position_ms
+    if next_item is not None:
+        st.nextQueueItem.queueItemId = next_item[0]
+        st.nextQueueItem.trackId = next_item[1]
+    return msg
+
+
+class TestFirstJoinOfAFreshSession:
+    """The app announced its queue with a snapshot only, then sent a seek, a
+    pause and a bare play, none naming the current track: the player used to
+    answer 'nothing loaded' to all of them and the app sat on 'playing' with no
+    sound until the user tapped another track."""
+
+    async def _handler(self):  # type: ignore[no-untyped-def]
+        from qobuz_proxy.playback.queue import QobuzQueue
+
+        player, backend = _make_player()
+        queue = QobuzQueue()
+        await queue.apply_snapshot([(0, "9000"), (1, "9001"), (2, "9002")])
+        handler = PlaybackCommandHandler(player, queue=queue)
+        player.queue = queue  # the one the snapshot went into
+        return handler, player, backend
+
+    async def test_a_bare_play_starts_the_first_track_of_the_queue(self) -> None:
+        handler, player, backend = await self._handler()
+
+        await handler._handle_set_state(_bare_set_state(playing_state=2))
+
+        assert player.current_track is not None
+        assert (player.current_track.track_id, player.current_track.queue_item_id) == ("9000", 0)
+        assert backend.played == ["9000"]
+
+    async def test_the_next_pointer_says_where_the_queue_stands(self) -> None:
+        handler, player, backend = await self._handler()
+
+        await handler._handle_set_state(_bare_set_state(playing_state=2, next_item=(2, 9002)))
+
+        assert player.current_track is not None
+        assert player.current_track.queue_item_id == 1  # the entry before the next one
+        assert backend.played == ["9001"]
+
+    async def test_a_position_alone_loads_the_track_held_at_that_position(self) -> None:
+        handler, player, backend = await self._handler()
+
+        await handler._handle_set_state(_bare_set_state(position_ms=137_069))
+
+        assert player.current_track is not None and player.current_track.track_id == "9000"
+        assert backend.played == []  # nothing plays on a scrub
+        assert player.state == PlaybackState.PAUSED
+        assert player.current_position_ms == 137_069
+
+    async def test_the_seek_pause_play_sequence_plays_from_where_it_was_scrubbed(self) -> None:
+        handler, player, backend = await self._handler()
+
+        await handler._handle_set_state(_bare_set_state(position_ms=137_069))
+        await handler._handle_set_state(_bare_set_state(playing_state=3))
+        await handler._handle_set_state(_bare_set_state(playing_state=2))
+
+        assert backend.played == ["9000"]
+        assert player.state == PlaybackState.PLAYING
+
+    async def test_a_stop_or_the_no_track_restore_loads_nothing(self) -> None:
+        handler, player, backend = await self._handler()
+        restore = _bare_set_state(playing_state=1)
+        restore.srvrRndrSetState.currentQueueItem.queueItemId = 0xFFFFFFFFFFFFFFFF
+        restore.srvrRndrSetState.currentQueueItem.trackId = 0xFFFFFFFF
+
+        await handler._handle_set_state(_bare_set_state(playing_state=1))
+        await handler._handle_set_state(restore)
+
+        assert player.current_track is None and backend.played == []
+
+    async def test_an_empty_queue_has_nothing_to_take(self) -> None:
+        from qobuz_proxy.playback.queue import QobuzQueue
+
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player, queue=QobuzQueue())
+        player.queue = handler.queue
+
+        await handler._handle_set_state(_bare_set_state(playing_state=2))
+
+        assert player.current_track is None and backend.played == []
+
+    async def test_a_loaded_track_is_left_alone(self) -> None:
+        handler, player, backend = await self._handler()
+        await handler._handle_set_state(_set_state_msg(track_id=9001, queue_item_id=1))
+        backend.played.clear()
+
+        await handler._handle_set_state(_bare_set_state(playing_state=2))
+
+        assert player.current_track is not None and player.current_track.track_id == "9001"

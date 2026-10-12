@@ -329,17 +329,68 @@ class PlaybackCommandHandler:
         # a stale track. apply_remote_state() applies the whole sequence under one
         # lock acquisition + generation check (newest SET_STATE wins as a unit),
         # and also handles the stale session-restore snapshot detection.
+        track_id_arg = str(current_track_id) if current_item else None
+        item_id_arg = current_queue_item_id
+        playing_state_arg = state.playingState if state.HasField("playingState") else None
+        position_arg = state.currentPosition if state.HasField("currentPosition") else None
+
+        # A session that starts with a queue the app only *announced* (a snapshot,
+        # no load) is told to seek, pause and play without ever being told which
+        # track is current: nothing is loaded here and the message names none.
+        inferred = await self._infer_current_item(state, current_item is not None)
+        if inferred is not None:
+            track_id_arg, item_id_arg = inferred
+            if playing_state_arg is None:
+                playing_state_arg = 3  # a position alone: hold the track at it, not playing
+
         await self.player.apply_remote_state(
-            track_id=str(current_track_id) if current_item else None,
-            queue_item_id=current_queue_item_id,
-            position_ms=state.currentPosition if state.HasField("currentPosition") else None,
-            playing_state=state.playingState if state.HasField("playingState") else None,
+            track_id=track_id_arg,
+            queue_item_id=item_id_arg,
+            position_ms=position_arg,
+            playing_state=playing_state_arg,
             context_uuid=current_context_uuid,
         )
 
         # Notify gapless system about next track change (after state handling)
         if next_track_changed and self._on_next_track_changed:
             await self._on_next_track_changed()
+
+    async def _infer_current_item(
+        self, state: Any, has_current_item: bool
+    ) -> Optional[tuple[str, int]]:
+        """(track id, queue item id) of the track a SET_STATE means when it names
+        none and nothing is loaded, or None when it does not apply.
+
+        Seen on a fresh Connect session (2026-10-12, the "first join" case): the
+        app announced its queue with a snapshot (no load), then sent a seek, a
+        pause and a bare play, and the player answered 'nothing loaded' to each
+        until the user tapped another track. The server's next pointer says where
+        the queue stands (the current one is the entry before it); with none, a
+        fresh session starts at the first entry of the play order."""
+        if has_current_item or state.HasField("currentQueueItem"):
+            return None  # it names one (or says explicitly there is none)
+        if self.player.current_track is not None:
+            return None
+        asks_for_something = state.HasField("currentPosition") or (
+            state.HasField("playingState") and state.playingState in (2, 3)
+        )
+        if not asks_for_something:
+            return None
+        order = await self.queue.play_order()
+        if not order:
+            return None
+        entry = order[0]
+        if state.HasField("nextQueueItem") and not _is_no_track_sentinel(state.nextQueueItem):
+            ids = [e.queue_item_id for e in order]
+            if state.nextQueueItem.queueItemId in ids:
+                at = ids.index(state.nextQueueItem.queueItemId)
+                if at > 0:
+                    entry = order[at - 1]
+        logger.info(
+            f"SET_STATE names no current track and nothing is loaded: taking track "
+            f"{entry.track_id} (queue item {entry.queue_item_id}) of the announced queue"
+        )
+        return str(entry.track_id), entry.queue_item_id
 
     async def _handle_queue_tracks_loaded(self, message: Any) -> None:
         """
