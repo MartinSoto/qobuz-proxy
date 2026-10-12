@@ -652,6 +652,24 @@ so it is not chased again. Re-tapping the playing track restarted it as intended
    Independently of that, every command that cannot be honored must be
    answered with a state report so the app's optimistic UI is corrected.
 
+### O25 — First join of a fresh session: a snapshot, then a seek, a pause and a bare play (2026-10-12)
+The same case as O3, seen again on the NAS (session `bd06bdb0`, a session id the
+proxy had not seen before). Join at 05:56:30: `SET_ACTIVE true`, a `SET_STATE`
+with `queueVersion {}` (0.0), a stopped state and the no-track sentinel as current
+and next, then a `QUEUE_STATE` with 0 tracks. Our stopped report (item id 0 against
+an empty queue) is answered with the error "Current track not found in queue nor
+autoplay". 05:56:33 a `QUEUE_STATE` v1.1 with 6 tracks, **no load and no
+`SET_STATE` naming a current item**. 05:57:11 `SET_STATE { currentPosition: 137069 }`
+(the user scrubbed the bar), 05:57:22 `{ playingState: PAUSED }`, 05:57:26
+`{ playingState: PLAYING }`, each without `currentQueueItem`; the proxy answered
+"Cannot seek / No track to play - nothing loaded", reported stopped, and the app sat
+on "playing" with no sound. 05:57:26.98 the server's reply to our report carried
+`nextQueueItem { 1 }`: the current one is the entry before it (item 0, the first).
+05:57:30 the user tapped a track: `QUEUE_TRACKS_LOADED` v2.1, which played. Fix:
+with nothing loaded and no current item in the message, take the entry before the
+next pointer (else the first of the play order); a position alone holds that track
+paused at the position (`PlaybackCommandHandler._infer_current_item`).
+
 ## Capture log
 
 | # | Scenario | Date | Result |
