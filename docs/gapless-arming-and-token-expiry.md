@@ -483,14 +483,14 @@ Two things in the design above went wrong in use.
 
 Now: `Player` keeps a last-activity time (`note_activity()`), and
 `is_worth_keeping_ws_alive()` is true while playing (it also restarts that
-clock, so it runs from when playback stopped) and for 90 minutes after the last
+clock, so it runs from when playback stopped) and for 120 minutes after the last
 activity. Activity is: playing, the app opening a connection (`Speaker`), and the
 app's commands to the room (`counts_as_activity`: a `SET_STATE` carrying a play
 state, a position or a track; the volume command; queue loads and edits), not the
 server's own traffic (restore and heartbeat echoes, broadcasts). Once idle past
 that, renewal is withheld and the connection lapses with its token (nothing is
 closed by us): tokens last about an hour and are renewed shortly before expiring,
-so that happens between 90 minutes and two and a half hours after the last
+so that happens between two and three hours after the last
 activity. The active close, the minimum age and the "refuse to reconnect with the
 token we closed over" gate are gone. The 1001 session handling stays.
 

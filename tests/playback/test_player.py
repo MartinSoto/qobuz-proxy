@@ -579,8 +579,8 @@ class TestIsWorthKeepingWsAlive:
     def _idle_for(player, seconds: float) -> None:  # type: ignore[no-untyped-def]
         player._last_activity_at = time.monotonic() - seconds
 
-    def test_the_idle_limit_is_ninety_minutes(self) -> None:
-        assert player_module._WS_IDLE_TIMEOUT_SECONDS == 5400.0
+    def test_the_idle_limit_is_two_hours(self) -> None:
+        assert player_module._WS_IDLE_TIMEOUT_SECONDS == 7200.0
 
     def test_playing_is_always_worth_it(self) -> None:
         player, _backend = _make_player()
@@ -615,7 +615,7 @@ class TestIsWorthKeepingWsAlive:
         for state in (PlaybackState.PAUSED, PlaybackState.STOPPED):
             player, _backend = _make_player()
             player._state = state
-            self._idle_for(player, 5399.0)
+            self._idle_for(player, 7199.0)
 
             assert player.is_worth_keeping_ws_alive() is True, state
 
@@ -623,7 +623,7 @@ class TestIsWorthKeepingWsAlive:
         for state in (PlaybackState.PAUSED, PlaybackState.STOPPED):
             player, _backend = _make_player()
             player._state = state
-            self._idle_for(player, 5401.0)
+            self._idle_for(player, 7201.0)
 
             assert player.is_worth_keeping_ws_alive() is False, state
 
