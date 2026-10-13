@@ -83,8 +83,7 @@ _ADOPTION_WINDOW_SECONDS = 30.0
 # refreshing forever in the background with nobody listening. Tokens last
 # about an hour and are renewed shortly before they expire, so a connection
 # lapses between this long and this long plus one token life after the last
-# activity: 90 minutes means at least that, and two hours in the worst case
-# of a renewal just before the limit.
+# activity: with 90 minutes, between 1.5 and 2.5 hours.
 _WS_IDLE_TIMEOUT_SECONDS = 5400.0
 
 # How long the command queue's consumer waits for the backend to become
