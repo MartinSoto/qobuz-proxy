@@ -82,6 +82,30 @@ _SENTINEL_QUEUE_ITEM_ID = 0xFFFFFFFFFFFFFFFF
 _PLAYING_STATE_PLAYING = 2
 
 
+# Messages that show somebody is using the room (see counts_as_activity). Queue
+# loads and edits, and the volume command; SET_STATE is judged by its content.
+_ACTIVITY_MESSAGE_TYPES = frozenset({42, 89, 91, 92, 93, 94, 95, 96})
+
+
+def counts_as_activity(msg_type: int, message: Any) -> bool:
+    """Whether an inbound message is the app doing something with this room (a
+    seek, play/pause, a volume change, a queue load or edit) rather than the
+    server's own traffic: restore and heartbeat echoes of our reports, which
+    arrive as SET_STATE carrying only the queue version and next pointer, and
+    broadcasts, must not keep an unused session alive. Restarts the idle clock
+    (Player.note_activity)."""
+    if msg_type == MSG_TYPE_SET_STATE:
+        if not message.HasField("srvrRndrSetState"):
+            return False
+        state = message.srvrRndrSetState
+        return bool(
+            state.HasField("playingState")
+            or state.HasField("currentPosition")
+            or state.HasField("currentQueueItem")
+        )
+    return msg_type in _ACTIVITY_MESSAGE_TYPES
+
+
 def _is_no_track_sentinel(ref: Any) -> bool:
     """Whether a QueueTrackRef is the server's "no track" marker."""
     return bool(ref.trackId == _SENTINEL_TRACK_ID or ref.queueItemId == _SENTINEL_QUEUE_ITEM_ID)

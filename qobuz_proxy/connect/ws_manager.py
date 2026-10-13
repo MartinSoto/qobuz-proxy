@@ -43,24 +43,6 @@ SELF_REFRESH_RETRY_SECONDS = 30.0
 # normal reconnect cycle resume — see its docstring.
 HIJACK_RECONNECT_HOLD_SECONDS = 8.0
 
-# Minimum age a connection must reach before the receive loop's proactive
-# idle-close (see IdleShutdownRequired) is allowed to fire. Player.
-# is_worth_keeping_ws_alive() tracks *cumulative* non-playing time since
-# playback last actually ran — it is never reset just because the app
-# handed over a fresh session (only a transition to PLAYING resets it; see
-# that method's own docstring). So once a device has sat paused for longer
-# than its idle window in total, a brand new connection the app just
-# opened would otherwise already read as "not worth keeping" on the very
-# first RECV_TIMEOUT tick and get closed within about a second of
-# connecting — before the app can receive state or send anything at all.
-# From the app's side this looks indistinguishable from the proxy
-# rejecting the connection outright (confirmed live 2026-09-16: connect,
-# fully authenticate, then self-close ~1.1s later). This grace period
-# gives a freshly (re)established connection a real window to be used —
-# e.g. for the app to resume playback, which flips
-# is_worth_keeping_ws_alive() back to True — before the idle-close check
-# is honored again.
-MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS = 30.0
 
 # A SRVR_CTRL_ADD_RENDERER entry for a Sonos-backed speaker used to never
 # get reaped once its WS connection ended (2026-09-12 investigation,
@@ -183,14 +165,6 @@ class TokenRefreshRequired(Exception):
     """Raised when the WebSocket must wait for refreshed tokens from the app."""
 
 
-class IdleShutdownRequired(Exception):
-    """Raised from within an open connection's receive loop once playback
-    has been idle past Player.is_worth_keeping_ws_alive()'s window — see
-    that method and _WS_IDLE_TIMEOUT_SECONDS. Closes the socket ourselves
-    instead of holding it open until the token happens to lapse on its
-    own (which, with self-refresh, could otherwise be never)."""
-
-
 class WsManager:
     """
     Manages WebSocket connection to Qobuz servers.
@@ -241,9 +215,6 @@ class WsManager:
         self._session_uuid: Optional[bytes] = None
         self._is_connected = False
         self._should_run = False
-        # monotonic() timestamp of when the current connection finished
-        # authenticating — see MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS.
-        self._connected_at: Optional[float] = None
 
         # Reconnection state
         self._reconnect_delay = INITIAL_RECONNECT_DELAY
@@ -251,9 +222,6 @@ class WsManager:
         # Token refresh state
         self._token_update_event = asyncio.Event()
         self._token_version = 0
-        # Set to the _token_version in effect at the moment IdleShutdownRequired
-        # closed the connection — see _wait_for_valid_token's use of it.
-        self._idle_closed_token_version: Optional[int] = None
 
         # Message handlers: message_type -> handler
         self._handlers: Dict[int, MessageHandler] = {}
@@ -651,7 +619,7 @@ class WsManager:
             should_backoff = True
             try:
                 await self._connect_and_run()
-            except (TokenRefreshRequired, IdleShutdownRequired):
+            except TokenRefreshRequired:
                 should_backoff = False
             except Exception as e:
                 logger.error(f"Connection error: {e}")
@@ -714,7 +682,6 @@ class WsManager:
                 await self._send_ask_for_queue_state()
 
                 self._is_connected = True
-                self._connected_at = time.monotonic()
                 self._reconnect_delay = INITIAL_RECONNECT_DELAY  # Reset backoff
                 logger.info("Connected and authenticated")
 
@@ -728,7 +695,7 @@ class WsManager:
                 # Message receive loop
                 await self._receive_loop()
 
-        except (TokenRefreshRequired, IdleShutdownRequired):
+        except TokenRefreshRequired:
             raise
         except websockets.ConnectionClosed as e:
             logger.warning(f"Connection closed: {e.code} {e.reason}")
@@ -737,7 +704,6 @@ class WsManager:
         finally:
             self._is_connected = False
             self._ws = None
-            self._connected_at = None
 
     async def _authenticate(self) -> bool:
         """Send AUTHENTICATE message."""
@@ -928,38 +894,6 @@ class WsManager:
                 if self._ws_token and self._ws_token.is_expired(TOKEN_REFRESH_BUFFER):
                     logger.warning("Token expiring soon, need refresh")
                     raise TokenRefreshRequired()
-                # Check whether playback is still worth holding this
-                # connection open for — see IdleShutdownRequired. Only
-                # relevant once a connection actually exists to close
-                # (e.g. self-refresh had kept it alive for under an hour
-                # before playback stopped) — _wait_for_valid_token's own
-                # is_worth_keeping_alive() check (in _refresh_token_from_api)
-                # already stops a *new* connection from opening in the same
-                # situation, so this is purely about tearing down one that's
-                # already open and no longer earning its keep.
-                connection_age = (
-                    time.monotonic() - self._connected_at
-                    if self._connected_at is not None
-                    else MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS
-                )
-                if (
-                    self._is_worth_keeping_alive is not None
-                    and not self._is_worth_keeping_alive()
-                    and connection_age >= MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS
-                ):
-                    logger.info(
-                        "Playback idle past the keep-alive window — closing the "
-                        "control WebSocket ourselves instead of holding it open unused"
-                    )
-                    # Stamped so _wait_for_valid_token can tell "the token
-                    # I'm holding is the exact one I just proactively closed
-                    # over" (refuse to reconnect with it — see its
-                    # docstring) apart from "something has since changed"
-                    # (a fresh set_tokens() from the app, or a successful
-                    # self-refresh once playback resumes — both bump
-                    # _token_version, which is exactly what unblocks it).
-                    self._idle_closed_token_version = self._token_version
-                    raise IdleShutdownRequired()
 
             except websockets.ConnectionClosed:
                 raise
@@ -1039,23 +973,10 @@ class WsManager:
         failing.
 
         Also refuses to report a token "valid" — even one that hasn't
-        technically expired — while either of these hold, in both cases
-        deliberately falling into the same wait-for-the-app loop used
-        when there's no token at all rather than opening a connection
-        that can only fail or immediately need closing again:
-        - the *exact* token IdleShutdownRequired just proactively closed
-          over is still the current one, with nothing having changed
-          since (see _idle_closed_token_version) — reconnecting with it
-          immediately would just undo that close. This deliberately does
-          NOT check is_worth_keeping_alive() directly: that would block
-          every future reconnect attempt too, including the app
-          explicitly handing over a fresh session specifically so the
-          user can select something new to play — is_worth_keeping_alive()
-          only ever goes back to true once something is already playing,
-          which can't happen before the app can reach us at all. A fresh
-          set_tokens() call (the app reconnecting) or a successful
-          self-refresh (playback resumed on the device's own controls)
-          both bump _token_version, which is exactly what lifts this.
+        technically expired — while the Connect session identity is
+        invalidated, deliberately falling into the same wait-for-the-app
+        loop used when there's no token at all rather than opening a
+        connection that can only fail:
         - the Connect session identity was invalidated (see
           invalidate_session()) — reconnecting with no session_uuid at
           all fails _subscribe()/_send_join_session() outright, and
@@ -1066,8 +987,7 @@ class WsManager:
 
         while self._should_run:
             if (
-                self._token_version != self._idle_closed_token_version
-                and self._session_uuid is not None
+                self._session_uuid is not None
                 and self._ws_token
                 and self._ws_token.is_valid()
                 and not self._ws_token.is_expired(buffer_s)
@@ -1080,11 +1000,6 @@ class WsManager:
             if not logged_wait:
                 if self._session_uuid is None:
                     logger.warning("No valid Connect session — waiting for the app to reconnect")
-                elif self._token_version == self._idle_closed_token_version:
-                    logger.info(
-                        "Just closed for being idle — waiting for the app or a resumed "
-                        "playback before reconnecting"
-                    )
                 else:
                     logger.warning("Token expired, waiting for refreshed token from Qobuz app")
                 logged_wait = True

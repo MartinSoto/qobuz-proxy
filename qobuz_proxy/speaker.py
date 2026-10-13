@@ -9,7 +9,7 @@ run concurrently, one per physical audio device.
 import asyncio
 import functools
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 from aiohttp import web
 
@@ -36,7 +36,11 @@ from qobuz_proxy.playback import (
     StateReporter,
     VolumeCommandHandler,
 )
-from qobuz_proxy.playback.command_handler import MSG_TYPE_QUEUE_TRACKS_LOADED, MSG_TYPE_SET_STATE
+from qobuz_proxy.playback.command_handler import (
+    MSG_TYPE_QUEUE_TRACKS_LOADED,
+    MSG_TYPE_SET_STATE,
+    counts_as_activity,
+)
 from qobuz_proxy.playback.player import VOLUME_COALESCE_GROUP
 from qobuz_proxy.backends import AudioBackend, BackendFactory, PlaybackState
 from qobuz_proxy.playback.play_reporter import PlayReporter
@@ -623,6 +627,31 @@ class Speaker:
         """Return current effective quality (may change after auto-detection or app request)."""
         return self._effective_quality
 
+    @staticmethod
+    def _dispatch_playback(
+        player: QobuzPlayer, handler: PlaybackCommandHandler, msg_type: int, message: Any
+    ) -> None:
+        """Queue a playback message on the player's command queue, noting first
+        whether it shows the app is using the room (see counts_as_activity)."""
+        if counts_as_activity(msg_type, message):
+            player.note_activity()
+        player.enqueue(
+            functools.partial(handler.handle_message, msg_type, message),
+            coalesce=(msg_type in (MSG_TYPE_SET_STATE, MSG_TYPE_QUEUE_TRACKS_LOADED)),
+        )
+
+    @staticmethod
+    def _dispatch_volume(
+        player: QobuzPlayer, handler: VolumeCommandHandler, msg_type: int, message: Any
+    ) -> None:
+        if counts_as_activity(msg_type, message):
+            player.note_activity()
+        player.enqueue(
+            functools.partial(handler.handle_message, msg_type, message),
+            coalesce=True,
+            coalesce_group=VOLUME_COALESCE_GROUP,
+        )
+
     def _on_app_connected(self, tokens: ConnectTokens) -> None:
         """Callback invoked by DiscoveryService when the Qobuz app provides tokens."""
         logger.info(f"[{self.name}] Qobuz app connected, setting up WebSocket...")
@@ -646,6 +675,9 @@ class Speaker:
                 return
         assert self._queue is not None
         assert self._player is not None
+        # The app opening a connection is somebody using the room: restarts the
+        # idle clock, so a long-idle room is not judged idle on the first check.
+        self._player.note_activity()
 
         # The session names the queue generation stream URLs are tagged with
         # (see QobuzQueue.generation); known as soon as the tokens are.
@@ -733,10 +765,7 @@ class Speaker:
                         # the two message types are just two different ways
                         # the app signals "play this track now" (see
                         # MSG_TYPE_QUEUE_TRACKS_LOADED's own comment).
-                        lambda mt, msg: player.enqueue(
-                            functools.partial(playback_handler.handle_message, mt, msg),
-                            coalesce=(mt in (MSG_TYPE_SET_STATE, MSG_TYPE_QUEUE_TRACKS_LOADED)),
-                        ),
+                        lambda mt, msg: self._dispatch_playback(player, playback_handler, mt, msg),
                     )
 
                 for msg_type in volume_handler.get_message_types():
@@ -752,11 +781,7 @@ class Speaker:
                         # from playback-directing commands: an unrelated
                         # pending volume adjustment must never supersede (or
                         # be superseded by) a queued track change.
-                        lambda mt, msg: player.enqueue(
-                            functools.partial(volume_handler.handle_message, mt, msg),
-                            coalesce=True,
-                            coalesce_group=VOLUME_COALESCE_GROUP,
-                        ),
+                        lambda mt, msg: self._dispatch_volume(player, volume_handler, mt, msg),
                     )
 
                 # Register error handler (message type 1 = MESSAGE_TYPE_ERROR)

@@ -1164,3 +1164,72 @@ class TestStopsDeviceOnShutdown:
         speaker = self._speaker(active=True, keeps_playing=False)
         speaker._backend = None
         assert speaker.stops_device_on_shutdown
+
+
+class TestActivityNoted:
+    """The app using a room restarts the idle clock (Player.note_activity): its
+    connecting, and its commands, not the server's own traffic."""
+
+    async def test_the_app_connecting_is_activity(self):
+        speaker = Speaker(
+            config=_make_speaker_config(),
+            api_client=_make_api_client(),
+            app_id="app-id",
+            stream_resolver=_make_stream_resolver(),
+        )
+        speaker._queue = MagicMock()
+        player = MagicMock()
+        player.start = AsyncMock()
+        player.get_volume = AsyncMock(return_value=50)
+        speaker._player = player
+        tokens = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(jwt="jwt", exp=9999999999, endpoint="wss://test.qobuz.com/ws"),
+        )
+
+        with (
+            patch("qobuz_proxy.speaker.WsManager") as mock_ws_cls,
+            patch("qobuz_proxy.speaker.StateReporter") as mock_sr_cls,
+        ):
+            mock_ws = mock_ws_cls.return_value
+            mock_ws.start = AsyncMock()
+            mock_ws.send_volume_changed = AsyncMock()
+            mock_sr_cls.return_value.start = AsyncMock()
+
+            await speaker._setup_websocket(tokens)
+
+        player.note_activity.assert_called()
+
+    def test_a_command_from_the_app_is_activity_and_is_still_queued(self):
+        from qobuz_proxy.proto import qconnect_payload_pb2 as pb
+
+        player, handler = MagicMock(), MagicMock()
+        msg = pb.QConnectMessage()
+        msg.messageType = 41
+        msg.srvrRndrSetState.playingState = 2
+
+        Speaker._dispatch_playback(player, handler, 41, msg)
+
+        player.note_activity.assert_called_once()
+        player.enqueue.assert_called_once()
+
+    def test_the_servers_own_traffic_is_not(self):
+        from qobuz_proxy.proto import qconnect_payload_pb2 as pb
+
+        player, handler = MagicMock(), MagicMock()
+        msg = pb.QConnectMessage()
+        msg.messageType = 41
+        msg.srvrRndrSetState.nextQueueItem.queueItemId = 5  # the echo of one of our reports
+
+        Speaker._dispatch_playback(player, handler, 41, msg)
+
+        player.note_activity.assert_not_called()
+        player.enqueue.assert_called_once()  # but it is still handled
+
+    def test_the_volume_command_is_activity(self):
+        player, handler = MagicMock(), MagicMock()
+
+        Speaker._dispatch_volume(player, handler, 42, MagicMock())
+        Speaker._dispatch_volume(player, handler, 87, MagicMock())  # the broadcast: not
+
+        assert player.note_activity.call_count == 1

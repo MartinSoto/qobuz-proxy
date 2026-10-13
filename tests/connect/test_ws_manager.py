@@ -20,7 +20,6 @@ from qobuz_proxy.connect.ws_manager import (
     INITIAL_RECONNECT_DELAY,
     MAX_RECONNECT_DELAY,
     RECONNECT_BACKOFF_MULTIPLIER,
-    IdleShutdownRequired,
     TokenRefreshRequired,
     WsManager,
     _log_raw_frame,
@@ -302,38 +301,19 @@ class TestSelfRefreshWsToken:
 
 
 class TestWaitForValidTokenGating:
-    """_wait_for_valid_token's eager "already good, connect now" check.
+    """_wait_for_valid_token's eager "already good, connect now" check: only
+    an invalidated Connect session holds a still-valid token back. (An idle
+    room does not: nothing closes a connection for being idle any more, so
+    there is no idle state to refuse a reconnect from.)"""
 
-    Regression covered here (confirmed live 2026-09-15, overnight log):
-    an earlier version of this gate checked is_worth_keeping_alive()
-    directly instead of _idle_closed_token_version, which meant that once
-    playback had been idle long enough to trigger IdleShutdownRequired,
-    *no* future reconnect could ever succeed — not even the app
-    explicitly handing over a brand new session_uuid — because nothing
-    can flip is_worth_keeping_alive() back to true before the app can
-    reach the renderer at all (it only tracks Player's own playing/paused
-    state). A real household got stuck exactly like this: one speaker's
-    control WebSocket never came back after an idle close despite five
-    separate app reconnect attempts, while a different, never-idled
-    speaker connected normally. These tests pin the fix: only the
-    *specific* token IdleShutdownRequired closed over is refused —
-    anything that bumps _token_version (set_tokens() from the app, or a
-    successful self-refresh once playback resumes) lifts it immediately.
-    """
-
-    async def test_reconnecting_with_the_same_token_right_after_an_idle_close_is_refused(
+    async def test_a_valid_token_connects_at_once(
         self, config: Config, valid_tokens: ConnectTokens
     ) -> None:
-        ws_manager = WsManager(config)
+        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
         ws_manager.set_tokens(valid_tokens)
         ws_manager._should_run = True
-        ws_manager._idle_closed_token_version = ws_manager._token_version  # simulates the raise
 
-        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
-        await asyncio.sleep(0)
-
-        assert wait_task.done() is False
-        wait_task.cancel()
+        assert await asyncio.wait_for(ws_manager._wait_for_valid_token(buffer_s=60), 1.0) is True
 
     async def test_invalidated_session_blocks_even_with_a_valid_token(
         self, config: Config, valid_tokens: ConnectTokens
@@ -349,72 +329,16 @@ class TestWaitForValidTokenGating:
         assert wait_task.done() is False
         wait_task.cancel()
 
-    async def test_the_app_reconnecting_unblocks_an_idle_close_immediately(
-        self, config: Config, valid_tokens: ConnectTokens
-    ) -> None:
-        """The regression case: the app hands over a session while
-        playback is still idle (is_worth_keeping_alive() would still say
-        False) — must reconnect anyway, since only the app itself can
-        ever get us out of this state at all."""
-        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
-        ws_manager.set_tokens(valid_tokens)
-        ws_manager._should_run = True
-        ws_manager._idle_closed_token_version = ws_manager._token_version
 
-        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
-        await asyncio.sleep(0)
-        assert wait_task.done() is False
-
-        ws_manager.set_tokens(valid_tokens)  # the app reconnects — still not "worth it" itself
-
-        assert await asyncio.wait_for(wait_task, timeout=1.0) is True
-
-    async def test_a_resume_that_self_refreshes_unblocks_an_idle_close(
-        self, config: Config, valid_tokens: ConnectTokens, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The other recovery path: nobody touched the app, but the
-        device's own controls resumed playback (is_worth_keeping_alive()
-        flips true) — the next periodic self-refresh retry inside this
-        same loop succeeds and bumps _token_version on its own, no
-        set_tokens() call needed. Real recovery still takes up to
-        SELF_REFRESH_RETRY_SECONDS to notice (nothing wakes this loop
-        early just because Player's state changed) — shortened here so
-        the test doesn't have to actually wait 30s for it."""
-        monkeypatch.setattr(ws_manager_module, "SELF_REFRESH_RETRY_SECONDS", 0.01)
-        worth_it = False
-        api_client = AsyncMock()
-        api_client.get_ws_token = AsyncMock(
-            return_value={"jwt": "self-refreshed", "exp": 9999999999, "endpoint": "wss://x/ws"}
-        )
-        ws_manager = WsManager(
-            config, api_client=api_client, is_worth_keeping_alive=lambda: worth_it
-        )
-        ws_manager.set_tokens(valid_tokens)
-        ws_manager._should_run = True
-        ws_manager._idle_closed_token_version = ws_manager._token_version
-
-        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
-        await asyncio.sleep(0)
-        assert wait_task.done() is False
-
-        worth_it = True  # e.g. a device-side resume, with nobody touching the app
-
-        assert await asyncio.wait_for(wait_task, timeout=1.0) is True
-
-
-class TestReceiveLoopIdleShutdown:
-    """_receive_loop's own idle check — the counterpart to
-    _wait_for_valid_token's gating above. An *already open* connection
-    only ever finds out playback went idle by hitting this check on its
-    next receive-timeout tick, since nothing else interrupts a live
-    connection just because Player's state changed underneath it."""
+class TestReceiveLoopNeverClosesForIdleness:
+    """An open connection is never closed because the room is idle: idleness
+    only withholds the token's renewal (see _refresh_token_from_api), and the
+    connection lapses when the token does. (An active close, added in
+    September, closed a connection the app had opened 31 s earlier because
+    the room had not played for hours.)"""
 
     @staticmethod
     def _make_timing_out_ws() -> AsyncMock:
-        """recv() that never returns — the real target of _receive_loop's
-        asyncio.wait_for(..., timeout=RECV_TIMEOUT), so the TimeoutError
-        branch under test fires deterministically instead of racing a
-        short real message."""
         ws = AsyncMock()
 
         async def hang_forever() -> bytes:
@@ -426,44 +350,12 @@ class TestReceiveLoopIdleShutdown:
 
     @pytest.fixture(autouse=True)
     def fast_recv_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Every test in this class hits the TimeoutError branch on
-        purpose — no need to actually burn RECV_TIMEOUT's real second
-        getting there."""
         monkeypatch.setattr(ws_manager_module, "RECV_TIMEOUT", 0.01)
 
-    async def test_raises_when_idle_past_the_keep_alive_window(
+    async def test_an_idle_room_does_not_end_the_receive_loop(
         self, config: Config, valid_tokens: ConnectTokens
     ) -> None:
         ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
-        ws_manager.set_tokens(valid_tokens)
-        ws_manager._should_run = True
-        ws_manager._ws = self._make_timing_out_ws()
-
-        with pytest.raises(IdleShutdownRequired):
-            await ws_manager._receive_loop()
-
-    async def test_stamps_idle_closed_token_version_for_wait_for_valid_token(
-        self, config: Config, valid_tokens: ConnectTokens
-    ) -> None:
-        """See TestWaitForValidTokenGating — this stamp is the only thing
-        that stops the very next _wait_for_valid_token call from
-        reconnecting immediately with the same token and undoing this
-        close."""
-        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
-        ws_manager.set_tokens(valid_tokens)
-        ws_manager._should_run = True
-        ws_manager._ws = self._make_timing_out_ws()
-        assert ws_manager._idle_closed_token_version is None
-
-        with pytest.raises(IdleShutdownRequired):
-            await ws_manager._receive_loop()
-
-        assert ws_manager._idle_closed_token_version == ws_manager._token_version
-
-    async def test_does_not_raise_while_still_worth_keeping_alive(
-        self, config: Config, valid_tokens: ConnectTokens
-    ) -> None:
-        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: True)
         ws_manager.set_tokens(valid_tokens)
         ws_manager._should_run = True
         ws_manager._ws = self._make_timing_out_ws()
@@ -473,66 +365,7 @@ class TestReceiveLoopIdleShutdown:
         assert task.done() is False
         task.cancel()
 
-    async def test_no_callback_never_raises_idle_shutdown(
-        self, config: Config, valid_tokens: ConnectTokens
-    ) -> None:
-        """None (no policy wired up) must keep the pre-existing
-        behavior — never proactively closing — exactly like
-        _refresh_token_from_api's own no-callback case."""
-        ws_manager = WsManager(config)
-        ws_manager.set_tokens(valid_tokens)
-        ws_manager._should_run = True
-        ws_manager._ws = self._make_timing_out_ws()
-
-        task = asyncio.create_task(ws_manager._receive_loop())
-        await asyncio.sleep(0.05)
-        assert task.done() is False
-        task.cancel()
-
-    async def test_does_not_raise_for_a_freshly_connected_socket(
-        self, config: Config, valid_tokens: ConnectTokens
-    ) -> None:
-        """Regression for a live 2026-09-16 case: a device that had sat
-        paused long enough to already exceed Player's cumulative idle
-        window (is_worth_keeping_alive() == False) got its WS closed by
-        this check within about a second of the app freshly reconnecting
-        — before the app had any chance to do anything with it, which
-        looked indistinguishable from the proxy rejecting the connection
-        outright. _connected_at (set once _connect_and_run finishes
-        authenticating) must hold this check off until
-        MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS has actually passed,
-        even though is_worth_keeping_alive() already says False."""
-        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
-        ws_manager.set_tokens(valid_tokens)
-        ws_manager._should_run = True
-        ws_manager._ws = self._make_timing_out_ws()
-        ws_manager._connected_at = time.monotonic()
-
-        task = asyncio.create_task(ws_manager._receive_loop())
-        await asyncio.sleep(0.05)
-        assert task.done() is False
-        task.cancel()
-
-    async def test_raises_once_a_freshly_connected_socket_ages_past_the_grace_period(
-        self, config: Config, valid_tokens: ConnectTokens
-    ) -> None:
-        ws_manager = WsManager(config, is_worth_keeping_alive=lambda: False)
-        ws_manager.set_tokens(valid_tokens)
-        ws_manager._should_run = True
-        ws_manager._ws = self._make_timing_out_ws()
-        ws_manager._connected_at = (
-            time.monotonic() - ws_manager_module.MIN_CONNECTION_AGE_FOR_IDLE_CLOSE_SECONDS
-        )
-
-        with pytest.raises(IdleShutdownRequired):
-            await ws_manager._receive_loop()
-
-    async def test_token_expiry_takes_priority_over_idle_shutdown(self, config: Config) -> None:
-        """Both conditions can be true on the same tick (a long-expired
-        token on a connection that also happens to be idle) —
-        TokenRefreshRequired must win so self-refresh still gets a
-        chance rather than the connection being written off as merely
-        idle."""
+    async def test_the_token_expiring_still_ends_it(self, config: Config) -> None:
         expiring_tokens = ConnectTokens(
             session_id=str(uuid.uuid4()),
             ws_token=JWTConnectToken(jwt="expiring", exp=1, endpoint="wss://x/ws"),

@@ -74,15 +74,18 @@ _POSITION_JUMP_MS = 2500
 # answered by carrying on with what the device is already playing.
 _ADOPTION_WINDOW_SECONDS = 30.0
 
-# How long playback can sit PAUSED or STOPPED before it's no longer worth
-# proactively keeping the control WebSocket alive for (see
-# is_worth_keeping_ws_alive(), queried by WsManager's own self-refresh —
-# docs/gapless-arming-and-token-expiry.md). Deliberately generous: this
-# only ever lets an *idle* session's WS lapse naturally (falling back to
-# the pre-self-refresh behavior of waiting for the app) rather than
-# refreshing forever in the background with nobody listening — a normal
-# listening pause (stepped away, a phone call) must never trip this.
-_WS_IDLE_TIMEOUT_SECONDS = 3600.0
+# How long nothing can happen (nothing playing, no app joining, no command
+# from the app) before it's no longer worth proactively keeping the control
+# WebSocket alive for (see is_worth_keeping_ws_alive(), queried by WsManager's
+# own self-refresh — docs/gapless-arming-and-token-expiry.md). Deliberately
+# generous: this only ever lets an *idle* session's WS lapse naturally (the
+# token is simply not renewed; nothing closes the connection) rather than
+# refreshing forever in the background with nobody listening. Tokens last
+# about an hour and are renewed shortly before they expire, so a connection
+# lapses between this long and this long plus one token life after the last
+# activity: 90 minutes means at least that, and two hours in the worst case
+# of a renewal just before the limit.
+_WS_IDLE_TIMEOUT_SECONDS = 5400.0
 
 # How long the command queue's consumer waits for the backend to become
 # attached again (see set_backend_attached()) before dispatching a
@@ -232,9 +235,10 @@ class QobuzPlayer:
         # What the device was found playing when we claimed it (see claim_device).
         self._adoptable: Optional[AdoptedPlayback] = None
 
-        # When the state last left PLAYING (PAUSED or STOPPED), or None while
-        # actually PLAYING — see is_worth_keeping_ws_alive().
-        self._non_playing_since: Optional[float] = None
+        # When anything last happened that shows somebody is using this room
+        # (monotonic): playing, the app joining, a command from the app — see
+        # note_activity() and is_worth_keeping_ws_alive(). Starting up counts.
+        self._last_activity_at: float = time.monotonic()
 
         # Whether the backend is currently reachable — see
         # set_backend_attached(). True for the vast majority of backends,
@@ -870,28 +874,32 @@ class QobuzPlayer:
             task.cancel()
         self._pending_deactivation_task = None
 
+    def note_activity(self) -> None:
+        """Something happened that shows the room is in use: the app joined, or
+        sent a command (seek, volume, a queue load or edit, play/pause).
+        Restarts the idle clock — see is_worth_keeping_ws_alive()."""
+        self._last_activity_at = time.monotonic()
+
     def is_worth_keeping_ws_alive(self) -> bool:
         """Whether the control WebSocket is currently worth proactively
         keeping alive via self-refresh — polled periodically by WsManager
         (see WsManager._refresh_token_from_api,
-        docs/gapless-arming-and-token-expiry.md).
+        docs/gapless-arming-and-token-expiry.md) and by the Sonos backend to
+        slow its poll while idle.
 
-        PLAYING always counts. PAUSED/STOPPED count too, but only for up to
-        _WS_IDLE_TIMEOUT_SECONDS of continuous non-playing time — genuinely
-        idle (nobody's about to resume) shouldn't keep refreshing a session
-        forever in the background. Once that grace runs out we simply stop
-        renewing and let the current token lapse naturally, exactly like
-        before self-refresh existed; a resume from either side (the app, or
-        the device's own controls — see _handle_unprompted_state_change)
-        flips the state back to PLAYING and this starts counting again from
-        scratch.
+        Playing (or about to: LOADING) always counts and keeps the idle clock
+        at now, so it starts running from when playback stopped. Otherwise it
+        is worth it for _WS_IDLE_TIMEOUT_SECONDS after the last activity — the
+        app joining, a command from the app, or playback. Once that grace runs
+        out we simply stop renewing and let the current token lapse
+        naturally; nothing closes the connection. A resume from either side
+        (the app, or the device's own controls — see
+        _handle_unprompted_state_change) counts as activity again.
         """
-        if self._state == PlaybackState.PLAYING:
-            self._non_playing_since = None
+        if self._state in (PlaybackState.PLAYING, PlaybackState.LOADING):
+            self._last_activity_at = time.monotonic()
             return True
-        if self._non_playing_since is None:
-            self._non_playing_since = time.monotonic()
-        return time.monotonic() - self._non_playing_since < _WS_IDLE_TIMEOUT_SECONDS
+        return time.monotonic() - self._last_activity_at < _WS_IDLE_TIMEOUT_SECONDS
 
     # =========================================================================
     # Seek Control
