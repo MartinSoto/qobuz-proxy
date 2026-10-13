@@ -465,6 +465,35 @@ playback regardless of who asked for it, which is exactly the signal
 device-initiated case, it falls out of machinery that already existed for
 an unrelated reason (recovering from a transient unprompted pause/stop).
 
+### Revised 2026-10-13: idle means nothing happened, and nothing closes the connection
+
+Two things in the design above went wrong in use.
+
+- **The idle clock only knew about playing.** `_non_playing_since` measured how
+  long the *room* had not played and was cleared only by playing. A join did not
+  touch it, so a long-idle room that the app had just reconnected to was judged
+  idle at once.
+- **A later addition closed the open connection itself** (`IdleShutdownRequired`,
+  2026-09-14), against the original "never force-disconnect". Its first version
+  closed a connection about a second after the app opened it (2026-09-16); the
+  patch for that was a 30 s minimum connection age, which only moved the same
+  failure: on 2026-10-13 a fresh join of a room idle for hours was closed 31 s
+  later while the user was starting an album, and the commands sent in that
+  window were lost.
+
+Now: `Player` keeps a last-activity time (`note_activity()`), and
+`is_worth_keeping_ws_alive()` is true while playing (it also restarts that
+clock, so it runs from when playback stopped) and for 90 minutes after the last
+activity. Activity is: playing, the app opening a connection (`Speaker`), and the
+app's commands to the room (`counts_as_activity`: a `SET_STATE` carrying a play
+state, a position or a track; the volume command; queue loads and edits), not the
+server's own traffic (restore and heartbeat echoes, broadcasts). Once idle past
+that, renewal is withheld and the connection lapses with its token (nothing is
+closed by us): tokens last about an hour and are renewed shortly before expiring,
+so that happens between 90 minutes and two and a half hours after the last
+activity. The active close, the minimum age and the "refuse to reconnect with the
+token we closed over" gate are gone. The 1001 session handling stays.
+
 ## Stale Sonos queue entry replayed after an album finished (2026-09-07)
 
 Reported live: after an album played through in full — no repeat, no
