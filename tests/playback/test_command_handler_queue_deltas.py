@@ -7,6 +7,7 @@ queue.py's QueueMembership) — the one consumer today is Sonos's
 approximated-album-gain grouping.
 """
 
+from qobuz_proxy.backends import PlaybackState
 from qobuz_proxy.playback.command_handler import PlaybackCommandHandler
 from qobuz_proxy.playback.queue import QobuzQueue
 from qobuz_proxy.proto import qconnect_payload_pb2 as pb
@@ -56,14 +57,39 @@ class TestQueueState:
 
         assert await queue.current_track_ids() == frozenset({"3001", "3002"})
 
-    async def test_does_not_drive_playback(self) -> None:
-        """Confirmed live: unlike QUEUE_TRACKS_LOADED, QUEUE_STATE never
-        carries a queuePosition and never selects a track to play."""
+    async def test_join_time_snapshot_does_not_drive_playback(self) -> None:
+        """Join/reconnect snapshots carry an empty actionUuid in every log."""
         player, _backend = _make_player()
         player._is_active_renderer = True
         queue = QobuzQueue()
         handler = PlaybackCommandHandler(player, queue=queue)
         msg = _msg_with_tracks(90, "srvrCtrlQueueState", [(1, 3001)])
+
+        await handler._handle_queue_state(msg)
+
+        assert player.current_track is None
+
+    async def test_snapshot_naming_an_action_plays_from_the_first_entry(self) -> None:
+        """Experimental: a type 90 with an actionUuid while stopped is a play request."""
+        player, _backend = _make_player()
+        player._is_active_renderer = True
+        queue = QobuzQueue()
+        handler = PlaybackCommandHandler(player, queue=queue)
+        msg = _msg_with_tracks(90, "srvrCtrlQueueState", [(0, 3001), (1, 3002)])
+        msg.srvrCtrlQueueState.actionUuid = b"\x01" * 16
+
+        await handler._handle_queue_state(msg)
+
+        assert player.current_track is not None
+        assert player.current_track.track_id == "3001"
+
+    async def test_snapshot_naming_an_action_leaves_playing_music_alone(self) -> None:
+        player, _backend = _make_player()
+        player._is_active_renderer = True
+        player._state = PlaybackState.PLAYING
+        handler = PlaybackCommandHandler(player, queue=QobuzQueue())
+        msg = _msg_with_tracks(90, "srvrCtrlQueueState", [(0, 3001)])
+        msg.srvrCtrlQueueState.actionUuid = b"\x01" * 16
 
         await handler._handle_queue_state(msg)
 

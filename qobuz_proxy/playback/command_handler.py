@@ -8,6 +8,8 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
+from qobuz_proxy.backends import PlaybackState
+
 from .queue import QueueVersion
 
 if TYPE_CHECKING:
@@ -461,25 +463,36 @@ class PlaybackCommandHandler:
             logger.debug("Not the active renderer, ignoring QUEUE_TRACKS_LOADED")
             return
 
-        position = loaded.queuePosition  # absent reads as 0, the server's convention
-        if not (0 <= position < len(loaded.tracks)):
+        await self._start_from_tracks(
+            loaded.tracks,
+            loaded.queuePosition,  # absent reads as 0, the server's convention
+            loaded.contextUuid,
+            "QUEUE_TRACKS_LOADED",
+        )
+
+    async def _start_from_tracks(
+        self, tracks: Any, position: int, message_context_uuid: Any, source: str
+    ) -> None:
+        """Start playing `tracks[position]` as a new queue generation and arm
+        the entry after it for gapless."""
+        loaded_tracks = tracks
+        if not (0 <= position < len(loaded_tracks)):
             logger.warning(
-                f"QUEUE_TRACKS_LOADED: queuePosition={position} out of range "
-                f"for {len(loaded.tracks)} track(s)"
+                f"{source}: queuePosition={position} out of range for {len(loaded_tracks)} track(s)"
             )
             return
 
-        track_ref = loaded.tracks[position]
+        track_ref = loaded_tracks[position]
         # Per-track contextUuid, falling back to the message-level one —
         # mirrors currentQueueItem.contextUuid's own fallback in
         # _handle_set_state above.
         context_uuid = (
             track_ref.contextUuid
             if track_ref.contextUuid
-            else (loaded.contextUuid if loaded.contextUuid else None)
+            else (message_context_uuid if message_context_uuid else None)
         )
 
-        logger.info(f"QUEUE_TRACKS_LOADED selects position {position}: trackId={track_ref.trackId}")
+        logger.info(f"{source} selects position {position}: trackId={track_ref.trackId}")
 
         # Tapping a track plays it, full stop — no follow-up SrvrRndrSetState
         # should be assumed to ever arrive to say so explicitly (confirmed
@@ -501,8 +514,8 @@ class PlaybackCommandHandler:
         # nextQueueItem does — we already have the whole queue right here.
         next_position = position + 1
         next_track_changed = False
-        if next_position < len(loaded.tracks):
-            next_ref = loaded.tracks[next_position]
+        if next_position < len(loaded_tracks):
+            next_ref = loaded_tracks[next_position]
             next_context_uuid = next_ref.contextUuid if next_ref.contextUuid else context_uuid
             new_next_info = {
                 "queueItemId": next_ref.queueItemId,
@@ -560,6 +573,22 @@ class PlaybackCommandHandler:
         )
         if self._on_queue_changed:
             await self._on_queue_changed()
+        if self._is_play_request_snapshot(state):
+            await self._start_from_tracks(state.tracks, 0, b"", "QUEUE_STATE")
+
+    def _is_play_request_snapshot(self, state: Any) -> bool:
+        """Experimental reading of a type-90 snapshot as "play this queue from
+        its first entry" (the user's hypothesis, not confirmed by any spec).
+        Join-time and reconnect snapshots carry an empty actionUuid in every
+        log we have; a snapshot that names an action, arrives while nothing is
+        playing and carries tracks is treated as the play request that never
+        came as a type 91 (2026-10-14 fresh-session glitch)."""
+        return bool(
+            state.actionUuid
+            and len(state.tracks) > 0
+            and self.player.is_active_renderer
+            and self.player.state == PlaybackState.STOPPED
+        )
 
     async def _handle_queue_tracks_added(self, message: Any) -> None:
         """Handle SrvrCtrlQueueTracksAdded (type 93) — a genuine
