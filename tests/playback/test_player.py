@@ -582,6 +582,27 @@ class TestIsWorthKeepingWsAlive:
     def test_the_idle_limit_is_two_hours(self) -> None:
         assert player_module._WS_IDLE_TIMEOUT_SECONDS == 7200.0
 
+    def test_the_restore_after_our_own_join_is_not_activity(self) -> None:
+        """The hourly token-refresh reconnect gets a restore SET_STATE back; counting
+        it kept an unused room alive forever (2026-10-15)."""
+        player, _backend = _make_player()
+        self._idle_for(player, 10_000)
+        player.note_ws_joined()
+
+        player.note_activity()
+
+        assert player.is_worth_keeping_ws_alive() is False
+
+    def test_a_command_after_the_join_window_is_activity(self) -> None:
+        player, _backend = _make_player()
+        self._idle_for(player, 10_000)
+        player.note_ws_joined()
+        player._ignore_activity_until = time.monotonic() - 0.1
+
+        player.note_activity()
+
+        assert player.is_worth_keeping_ws_alive() is True
+
     def test_playing_is_always_worth_it(self) -> None:
         player, _backend = _make_player()
         player._state = PlaybackState.PLAYING

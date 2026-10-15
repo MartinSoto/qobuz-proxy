@@ -94,8 +94,9 @@ def counts_as_activity(msg_type: int, message: Any) -> bool:
     seek, play/pause, a volume change, a queue load or edit) rather than the
     server's own traffic: restore and heartbeat echoes of our reports, which
     arrive as SET_STATE carrying only the queue version and next pointer, and
-    broadcasts, must not keep an unused session alive. Restarts the idle clock
-    (Player.note_activity)."""
+    broadcasts, must not keep an unused session alive. The restore that follows
+    our own (re)join does carry a state; Player.note_ws_joined() masks it.
+    Restarts the idle clock (Player.note_activity)."""
     if msg_type == MSG_TYPE_SET_STATE:
         if not message.HasField("srvrRndrSetState"):
             return False

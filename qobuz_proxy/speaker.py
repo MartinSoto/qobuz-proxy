@@ -704,6 +704,7 @@ class Speaker:
                 )
                 self._ws_manager.set_tokens(tokens)
                 self._ws_manager.set_max_audio_quality(self._effective_quality)
+                self._ws_manager.on_connected(self._player.note_ws_joined)
 
                 # Create handlers
                 self._playback_handler = PlaybackCommandHandler(

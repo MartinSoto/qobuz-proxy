@@ -1199,6 +1199,7 @@ class TestActivityNoted:
             await speaker._setup_websocket(tokens)
 
         player.note_activity.assert_called()
+        mock_ws.on_connected.assert_called_once_with(player.note_ws_joined)
 
     def test_a_command_from_the_app_is_activity_and_is_still_queued(self):
         from qobuz_proxy.proto import qconnect_payload_pb2 as pb

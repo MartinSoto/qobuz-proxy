@@ -86,6 +86,10 @@ _ADOPTION_WINDOW_SECONDS = 30.0
 # activity: with 120 minutes, between 2 and 3 hours.
 _WS_IDLE_TIMEOUT_SECONDS = 7200.0
 
+# After our own (re)join the server answers with a restore SET_STATE that carries
+# a playing state and a position: the server talking, not the app being used.
+_JOIN_RESTORE_WINDOW_SECONDS = 3.0
+
 # How long the command queue's consumer waits for the backend to become
 # attached again (see set_backend_attached()) before dispatching a
 # playback-directing item anyway. Mirrors DLNABackend's own
@@ -238,6 +242,7 @@ class QobuzPlayer:
         # (monotonic): playing, the app joining, a command from the app — see
         # note_activity() and is_worth_keeping_ws_alive(). Starting up counts.
         self._last_activity_at: float = time.monotonic()
+        self._ignore_activity_until: float = 0.0
 
         # Whether the backend is currently reachable — see
         # set_backend_attached(). True for the vast majority of backends,
@@ -876,8 +881,20 @@ class QobuzPlayer:
     def note_activity(self) -> None:
         """Something happened that shows the room is in use: the app joined, or
         sent a command (seek, volume, a queue load or edit, play/pause).
-        Restarts the idle clock — see is_worth_keeping_ws_alive()."""
-        self._last_activity_at = time.monotonic()
+        Restarts the idle clock — see is_worth_keeping_ws_alive(). Ignored for a
+        moment after our own control connection (re)joins, see note_ws_joined()."""
+        now = time.monotonic()
+        if now < self._ignore_activity_until:
+            return
+        self._last_activity_at = now
+
+    def note_ws_joined(self) -> None:
+        """The control connection has just (re)joined the session: the restore
+        the server sends back is not the app using the room, so for a few
+        seconds it must not restart the idle clock. Without this every hourly
+        token-refresh reconnect would count as activity and the connection
+        would never be allowed to lapse."""
+        self._ignore_activity_until = time.monotonic() + _JOIN_RESTORE_WINDOW_SECONDS
 
     def is_worth_keeping_ws_alive(self) -> bool:
         """Whether the control WebSocket is currently worth proactively
